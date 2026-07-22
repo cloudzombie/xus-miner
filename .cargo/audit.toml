@@ -1,0 +1,5 @@
+# Standalone-miner cargo-audit policy. Vulnerabilities and yanked crates fail;
+# no advisory is waived.
+
+[advisories]
+ignore = []

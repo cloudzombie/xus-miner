@@ -1,0 +1,26 @@
+[package]
+name = "xus-miner"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Standalone SOV/XUS Stratum CPU miner"
+
+[[bin]]
+name = "xus-miner"
+path = "src/main.rs"
+
+[dependencies]
+# Keep the native surface intentionally narrow: renderer + fonts and the two
+# Linux window backends. The broad eframe defaults pull accessibility,
+# clipboard, browser, and WGPU trees this miner never uses.
+eframe = { version = "=0.35.0", default-features = false, features = ["default_fonts", "glow", "x11"] }
+blake3 = "=1.8.5"
+borsh = { version = "=1.8.0", features = ["derive"] }
+hex = "=0.4.3"
+randomx-rs = "=1.4.1"
+serde_json = "=1.0.151"
+sha2 = "=0.11.0"
+
+[lints.rust]
+unsafe_code = "forbid"

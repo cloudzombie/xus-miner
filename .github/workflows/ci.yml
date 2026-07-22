@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  chaincode-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prove repository isolation
+        run: python3 scripts/check_chaincode_boundary.py
+
+  supply-chain:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned RustSec scanner
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Reject advisories and yanked crates
+        run: cargo audit --deny warnings
+
+  native-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust checks
+        run: rustup component add rustfmt clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test engine and GUI
+        run: cargo test --locked --bin xus-miner
+      - name: Test external mining protocol
+        run: cargo test --locked --test miner_protocol
+      - name: Build release
+        run: cargo build --locked --release

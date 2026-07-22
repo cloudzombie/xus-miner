@@ -1,0 +1,15 @@
+/target/
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Credentials and local runtime material never belong in this repository.
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.seed
+gui-settings.json
