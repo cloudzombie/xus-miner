@@ -122,44 +122,105 @@ workflow_dir = ROOT / ".github" / "workflows"
 workflows = sorted((*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")))
 for workflow in workflows:
     text = workflow.read_text(encoding="utf-8")
-    if not re.search(r"(?m)^permissions:\s*\n\s+contents:\s*read\s*$", text):
-        fail(f"workflow lacks top-level contents: read permission: {workflow.name}")
-    if re.search(r"(?mi)^\s*permissions:\s*(?:write-all|\{[^\n]*write)", text):
-        fail(f"workflow uses broad or inline write permissions: {workflow.name}")
-    writes = list(
-        re.finditer(r"(?mi)^\s+([a-z0-9_-]+):\s*write\s*(?:#.*)?$", text)
-    )
-    if writes:
-        if workflow.name != "release.yml":
-            fail(f"non-release workflow requests write permission: {workflow.name}")
-        jobs_match = re.search(r"(?m)^jobs:\s*$", text)
-        if jobs_match is None:
-            fail("release workflow has no jobs mapping")
-        job_headers = list(
-            re.finditer(
-                r"(?m)^  (?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_-]+)):\s*$",
-                text[jobs_match.end() :],
-            )
+    jobs_match = re.search(r"(?m)^jobs:\s*$", text)
+    if jobs_match is None:
+        fail(f"workflow has no jobs mapping: {workflow.name}")
+    job_headers = list(
+        re.finditer(
+            r"(?m)^  (?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_-]+)):\s*$",
+            text[jobs_match.end() :],
         )
-        job_ranges: list[tuple[str, int, int]] = []
-        for index, header in enumerate(job_headers):
-            name = next(group for group in header.groups() if group is not None)
-            start = jobs_match.end() + header.start()
-            end = (
-                jobs_match.end() + job_headers[index + 1].start()
-                if index + 1 < len(job_headers)
-                else len(text)
-            )
-            job_ranges.append((name, start, end))
-        allowed = {"contents", "id-token", "attestations"}
-        write_names = set()
-        for match in writes:
-            owners = [name for name, start, end in job_ranges if start <= match.start() < end]
-            if owners != ["publish"]:
-                fail("release write permission exists outside jobs.publish")
-            write_names.add(match.group(1))
-        if write_names != allowed:
-            fail("jobs.publish must request exactly contents/id-token/attestations write")
+    )
+    job_ranges: list[tuple[str, int, int]] = []
+    for index, header in enumerate(job_headers):
+        name = next(group for group in header.groups() if group is not None)
+        start = jobs_match.end() + header.start()
+        end = (
+            jobs_match.end() + job_headers[index + 1].start()
+            if index + 1 < len(job_headers)
+            else len(text)
+        )
+        job_ranges.append((name, start, end))
+
+    # Parse permission mappings conservatively instead of searching for only the
+    # spelling `contents: write`. YAML permits quoted keys, aliases, inline maps,
+    # and duplicate mappings; accepting any of those here would make a textual
+    # guard easy to bypass. Release workflows intentionally use one tiny,
+    # canonical subset that this parser can prove unambiguous.
+    lines = text.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    permission_blocks: list[tuple[int, int, dict[str, str]]] = []
+    scalar_indent: int | None = None
+    key_line = re.compile(
+        r"^( *)(?:(\"[^\"]+\"|'[^']+'|[A-Za-z0-9_-]+)):\s*(.*?)\s*(?:#.*)?(?:\r?\n)?$"
+    )
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if scalar_indent is not None:
+            if not stripped or indent > scalar_indent:
+                continue
+            scalar_indent = None
+        match = key_line.match(line)
+        if match is None:
+            continue
+        raw_key = match.group(2)
+        value = match.group(3).strip()
+        if value in {"|", ">", "|-", ">-", "|+", ">+"}:
+            scalar_indent = len(match.group(1))
+            continue
+        key = raw_key[1:-1] if raw_key[:1] in {"'", '"'} else raw_key
+        if key != "permissions":
+            continue
+        if raw_key != "permissions":
+            fail(f"quoted permissions key is not allowed: {workflow.name}")
+        if value:
+            fail(f"inline, aliased, or broad permissions are not allowed: {workflow.name}")
+
+        entries: dict[str, str] = {}
+        for child in lines[index + 1 :]:
+            child_stripped = child.strip()
+            child_indent = len(child) - len(child.lstrip(" "))
+            if not child_stripped or child_stripped.startswith("#"):
+                continue
+            if child_indent <= indent:
+                break
+            child_match = key_line.match(child)
+            if child_indent != indent + 2 or child_match is None:
+                fail(f"ambiguous permissions mapping is not allowed: {workflow.name}")
+            child_raw_key = child_match.group(2)
+            child_value = child_match.group(3).strip()
+            if child_raw_key[:1] in {"'", '"'}:
+                fail(f"quoted permission key is not allowed: {workflow.name}")
+            if child_value not in {"read", "write"}:
+                fail(f"permission value must be literal read/write: {workflow.name}")
+            if child_raw_key in entries:
+                fail(f"duplicate permission key is not allowed: {workflow.name}")
+            entries[child_raw_key] = child_value
+        permission_blocks.append((indent, offsets[index], entries))
+
+    top_level = [entries for indent, _, entries in permission_blocks if indent == 0]
+    if top_level != [{"contents": "read"}]:
+        fail(f"workflow must have exactly top-level contents: read: {workflow.name}")
+    job_level = [block for block in permission_blocks if block[0] != 0]
+    if workflow.name == "release.yml":
+        if len(job_level) != 1:
+            fail("release workflow must have exactly one job permission override")
+        indent, position, entries = job_level[0]
+        owners = [name for name, start, end in job_ranges if start <= position < end]
+        expected = {
+            "contents": "write",
+            "id-token": "write",
+            "attestations": "write",
+        }
+        if indent != 4 or owners != ["publish"] or entries != expected:
+            fail("only jobs.publish may request the exact release write permissions")
+    elif job_level:
+        fail(f"non-release workflow requests job permissions: {workflow.name}")
     if "pull_request_target" in text:
         fail(f"pull_request_target is not allowed: {workflow.name}")
     if re.search(r"(?mi)runs-on:.*self-hosted", text):
