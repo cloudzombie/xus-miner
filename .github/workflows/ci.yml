@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -9,10 +11,19 @@ permissions:
   contents: read
 
 jobs:
-  chaincode-boundary:
-    runs-on: ubuntu-latest
+  version-contract:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prove application/version contract
+        run: python3 scripts/check_version.py
+
+  chaincode-boundary:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Prove repository isolation
@@ -21,7 +32,7 @@ jobs:
   supply-chain:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install pinned RustSec scanner
@@ -33,10 +44,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
+        os: [ubuntu-24.04, macos-15, macos-15-intel, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install Rust checks

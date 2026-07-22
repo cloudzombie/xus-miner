@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -34,6 +36,22 @@ if (ROOT / "build.rs").exists() or "build" in manifest_data.get("package", {}):
 for cargo_config in (ROOT / ".cargo" / "config", ROOT / ".cargo" / "config.toml"):
     if cargo_config.exists():
         fail(f"Cargo source/runner configuration is not allowed: {cargo_config.name}")
+
+target_sections: list[tuple[str, object]] = []
+if "lib" in manifest_data:
+    target_sections.append(("lib", manifest_data["lib"]))
+for section in ("bin", "test", "example", "bench"):
+    for index, target in enumerate(manifest_data.get(section, [])):
+        target_sections.append((f"{section}[{index}]", target))
+for name, target in target_sections:
+    if not isinstance(target, dict):
+        fail(f"invalid Cargo target table: {name}")
+    raw_path = target.get("path")
+    if raw_path is None:
+        continue
+    target_path = (ROOT / raw_path).resolve()
+    if not target_path.is_relative_to(ROOT) or not target_path.is_file():
+        fail(f"Cargo target escapes or is missing from repository: {name}.path")
 
 
 def dependency_tables(value: object, location: str = "Cargo.toml"):
@@ -92,20 +110,23 @@ for path in ROOT.rglob("*"):
 
 for source in [ROOT / "src", ROOT / "tests", ROOT / "scripts"]:
     for path in source.rglob("*"):
-        if not path.is_file() or path == Path(__file__):
+        if not path.is_file() or path == Path(__file__).resolve():
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "../chain" in text or "../sov" in text or "/Users/josh/github/sov" in text:
             fail(f"source references a local SOV checkout: {path.relative_to(ROOT)}")
+        if path.suffix == ".rs" and re.search(
+            r"\b(?:include|include_str|include_bytes)!\s*\(", text
+        ):
+            fail(f"compile-time file inclusion is not allowed: {path.relative_to(ROOT)}")
 
-workflow_dir = ROOT / ".github" / "workflows"
-for workflow in workflow_dir.glob("*.yml"):
-    text = workflow.read_text(encoding="utf-8")
-    if not re.search(r"(?m)^permissions:\s*\n\s+contents:\s*read\s*$", text):
-        fail(f"workflow lacks top-level contents: read permission: {workflow.name}")
-    if re.search(r"(?m)^\s+[a-z-]+:\s*write\s*$", text):
-        fail(f"workflow requests write permission: {workflow.name}")
-    if "persist-credentials: false" not in text:
-        fail(f"workflow persists checkout credentials: {workflow.name}")
+ruby = shutil.which("ruby")
+if ruby is None:
+    fail("Ruby with its standard Psych YAML parser is required for workflow validation")
+workflow_check = subprocess.run(
+    [ruby, str(ROOT / "scripts" / "check_workflows.rb")], check=False
+)
+if workflow_check.returncode != 0:
+    raise SystemExit(workflow_check.returncode)
 
 print("chaincode boundary: clean")

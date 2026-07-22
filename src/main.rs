@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use wire::{template_id_for_blob, validate_account_id, BlockHeaderWire};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_BLOB_BYTES: usize = 1024 * 1024;
 const WORK_BATCH: u64 = 256;
@@ -63,6 +63,7 @@ fn usage() -> &'static str {
        --workers <n>            Mining threads [1; each may use ~2.3 GiB]\n\
        --reconnect-secs <n>     Delay after disconnect [5]\n\
        --report-secs <n>        Hashrate reporting interval [10]\n\
+       --version                Print the exact application/release version\n\
        --help                   Show this help\n\n\
      No wallet seed or private key is used by this program."
 }
@@ -113,6 +114,10 @@ where
             }
             "--help" | "-h" => {
                 println!("{}", usage());
+                process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("xus-miner {VERSION}");
                 process::exit(0);
             }
             other => {

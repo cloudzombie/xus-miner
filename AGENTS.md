@@ -18,6 +18,8 @@ This repository owns only the standalone XUS Miner client.
   from this repository.
 
 Run `python3 scripts/check_chaincode_boundary.py` before publishing changes.
+Read `RELEASING.md` before changing `Cargo.toml` package version or creating a
+tag. Never create, move, or delete a release tag outside that procedure.
 
 ## Build and validation quick reference
 
@@ -28,6 +30,7 @@ The required pre-publish sequence is:
 
 ```sh
 python3 scripts/check_chaincode_boundary.py
+python3 scripts/check_version.py
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --bin xus-miner

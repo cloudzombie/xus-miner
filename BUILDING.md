@@ -10,9 +10,16 @@
   checksummed and frozen by exact direct versions plus `Cargo.lock`
 - Approximately 4 GiB free disk space for a clean debug plus release build
 - At least 3 GiB free RAM per full-dataset RandomX worker
+- Maintainer validation only: Python 3.11+ and Ruby with its standard Psych YAML
+  parser. Neither is linked into or required to run the miner binary.
 
 The miner has no SOV source dependency, does not require a SOV checkout, and
 must not be built as part of one.
+
+For the strongest isolation, use an attested GitHub release built on an
+ephemeral hosted runner where SOV is absent. A local Cargo build executes locked
+third-party build scripts with your account's permissions; use a separate
+unprivileged build account/container if you require an OS-enforced boundary.
 
 ## macOS
 
@@ -62,6 +69,7 @@ Then build with `cargo build --locked --release`.
 
 ```sh
 python3 scripts/check_chaincode_boundary.py
+python3 scripts/check_version.py
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --bin xus-miner
@@ -82,6 +90,7 @@ cargo test --locked --release randomx_mainnet_job_uses_the_exact_sov_mining_seal
 
 Do not use `cargo update` casually. Preserve `Cargo.lock`, review every changed
 package, rerun the complete validation sequence, and confirm native CI on Linux,
-macOS, and Windows. There is no SOV revision or SOV source dependency to update.
+Apple Silicon macOS, Intel macOS, and Windows. There is no SOV revision or SOV
+source dependency to update.
 SOV compatibility changes update client protocol code and fixed fixtures here;
 they never patch or import the SOV repository.

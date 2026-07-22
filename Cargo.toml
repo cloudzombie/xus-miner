@@ -11,9 +11,9 @@ name = "xus-miner"
 path = "src/main.rs"
 
 [dependencies]
-# Keep the native surface intentionally narrow: renderer + fonts and the two
-# Linux window backends. The broad eframe defaults pull accessibility,
-# clipboard, browser, and WGPU trees this miner never uses.
+# Keep the native surface intentionally narrower than eframe defaults: OpenGL,
+# bundled fonts, and X11 only. eframe still requires its clipboard/link support;
+# that unavoidable surface is tracked by Cargo.lock and the RustSec gate.
 eframe = { version = "=0.35.0", default-features = false, features = ["default_fonts", "glow", "x11"] }
 blake3 = "=1.8.5"
 borsh = { version = "=1.8.0", features = ["derive"] }

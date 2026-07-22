@@ -5,19 +5,26 @@ use eframe::egui::{
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::env;
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{self, Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WINDOW_TITLE: &str = "XUS Miner";
 const DEFAULT_POOL: &str = "127.0.0.1:3333";
 const DEFAULT_USER: &str = "xus-miner";
 const MAX_LOG_LINES: usize = 500;
 const MAX_METER_SAMPLES: usize = 180;
+const SETTINGS_DIRECTORY: &str = ".xus-miner";
+const SETTINGS_FILE: &str = "gui-settings.json";
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const BG: Color32 = Color32::from_rgb(9, 11, 18);
 const PANEL: Color32 = Color32::from_rgb(15, 18, 29);
@@ -213,32 +220,272 @@ fn settings_path() -> Option<PathBuf> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .map(|home| home.join(".xus-miner").join("gui-settings.json"))
+        .map(|home| home.join(SETTINGS_DIRECTORY).join(SETTINGS_FILE))
+}
+
+fn metadata_is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn verify_settings_directory(directory: &Path) -> Result<fs::Metadata, String> {
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("cannot inspect settings directory: {error}"))?;
+    if metadata_is_link(&metadata) {
+        return Err("settings directory is a symbolic link or reparse point".into());
+    }
+    if !metadata.is_dir() {
+        return Err("settings path parent is not a directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = directory
+            .parent()
+            .ok_or_else(|| "settings directory has no parent".to_string())?;
+        let parent_metadata = fs::metadata(parent)
+            .map_err(|error| format!("cannot inspect settings directory parent: {error}"))?;
+        if metadata.uid() != parent_metadata.uid() {
+            return Err("settings directory is not owned by the home-directory owner".into());
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err("settings directory is writable by another account".into());
+        }
+    }
+    Ok(metadata)
+}
+
+fn ensure_settings_directory(directory: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(directory) {
+        Ok(_) => return verify_settings_directory(directory).map(drop),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect settings directory: {error}")),
+    }
+
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    match builder.create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("cannot create settings directory: {error}")),
+    }
+    verify_settings_directory(directory).map(drop)
+}
+
+fn inspect_settings_file(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect settings file: {error}")),
+    };
+    if metadata_is_link(&metadata) {
+        return Err("settings file is a symbolic link or reparse point".into());
+    }
+    if !metadata.is_file() {
+        return Err("settings file is not a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let directory = path
+            .parent()
+            .ok_or_else(|| "settings file has no parent".to_string())?;
+        let directory_metadata = verify_settings_directory(directory)?;
+        if metadata.uid() != directory_metadata.uid() {
+            return Err("settings file is not owned by the settings-directory owner".into());
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err("settings file is writable by another account".into());
+        }
+    }
+    Ok(Some(metadata))
 }
 
 fn load_settings() -> Settings {
-    let Some(path) = settings_path() else {
-        return Settings::default();
-    };
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .as_ref()
-        .map(Settings::from_json)
+    settings_path()
+        .and_then(|path| load_settings_at(&path).ok())
         .unwrap_or_default()
+}
+
+fn load_settings_at(path: &Path) -> Result<Settings, String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "settings file has no parent".to_string())?;
+    verify_settings_directory(directory)?;
+    #[cfg(windows)]
+    recover_windows_settings(path)?;
+    let initial =
+        inspect_settings_file(path)?.ok_or_else(|| "settings file does not exist".to_string())?;
+    if initial.len() > MAX_SETTINGS_BYTES {
+        return Err("settings file is unexpectedly large".into());
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("cannot open settings: {error}"))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect opened settings: {error}"))?;
+    if metadata_is_link(&opened) || !opened.is_file() || opened.len() > MAX_SETTINGS_BYTES {
+        return Err("opened settings path is not a bounded regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if initial.dev() != opened.dev() || initial.ino() != opened.ino() {
+            return Err("settings file changed while it was being opened".into());
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_SETTINGS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read settings: {error}"))?;
+    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err("settings file is unexpectedly large".into());
+    }
+    serde_json::from_slice::<Value>(&bytes)
+        .map(|value| Settings::from_json(&value))
+        .map_err(|error| format!("cannot decode settings: {error}"))
 }
 
 fn save_settings(settings: &Settings) -> Result<(), String> {
     let Some(path) = settings_path() else {
         return Ok(());
     };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create settings directory: {error}"))?;
-    }
+    save_settings_at(&path, settings)
+}
+
+fn save_settings_at(path: &Path, settings: &Settings) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "settings file has no parent".to_string())?;
+    ensure_settings_directory(directory)?;
+    #[cfg(windows)]
+    recover_windows_settings(path)?;
+    inspect_settings_file(path)?;
+
     let bytes = serde_json::to_vec_pretty(&settings.persisted_json())
         .map_err(|error| format!("cannot encode settings: {error}"))?;
-    fs::write(path, bytes).map_err(|error| format!("cannot save settings: {error}"))
+    let mut temporary = None;
+    for attempt in 0..32_u64 {
+        let sequence = SETTINGS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let candidate = directory.join(format!(
+            ".gui-settings.{}.{nonce}.{sequence}.{attempt}.tmp",
+            process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("cannot create temporary settings: {error}")),
+        }
+    }
+    let (temporary_path, mut temporary_file) =
+        temporary.ok_or_else(|| "cannot create unique temporary settings".to_string())?;
+    temporary_file
+        .write_all(&bytes)
+        .and_then(|()| temporary_file.sync_all())
+        .map_err(|error| format!("cannot write temporary settings: {error}"))?;
+    drop(temporary_file);
+
+    // Recheck after creating the sibling file. rename never opens the existing
+    // destination for writing, so a symlink target is not followed.
+    verify_settings_directory(directory)?;
+    inspect_settings_file(path)?;
+    replace_settings_file(path, &temporary_path)?;
+
+    #[cfg(unix)]
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("cannot sync settings directory: {error}"))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_settings_file(path: &Path, temporary: &Path) -> Result<(), String> {
+    fs::rename(temporary, path)
+        .map_err(|error| format!("cannot install settings atomically: {error}"))
+}
+
+#[cfg(windows)]
+fn replace_settings_file(path: &Path, temporary: &Path) -> Result<(), String> {
+    // std has no atomic replace primitive on Windows. A deterministic backup
+    // makes either possible crash point recoverable on the next load/save.
+    recover_windows_settings(path)?;
+    let backup = windows_settings_backup(path);
+    if inspect_settings_file(path)?.is_some() {
+        fs::rename(path, &backup).map_err(|error| format!("cannot stage old settings: {error}"))?;
+    }
+    match fs::rename(temporary, path) {
+        Ok(()) => {
+            if backup.exists() {
+                fs::remove_file(backup)
+                    .map_err(|error| format!("cannot remove old settings backup: {error}"))?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&backup, path);
+            Err(format!("cannot install settings: {error}"))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_settings_backup(path: &Path) -> PathBuf {
+    path.with_file_name(format!(".{SETTINGS_FILE}.backup"))
+}
+
+#[cfg(windows)]
+fn recover_windows_settings(path: &Path) -> Result<(), String> {
+    let backup = windows_settings_backup(path);
+    let current = inspect_settings_file(path)?;
+    let staged = inspect_settings_file(&backup)?;
+    match (current.is_some(), staged.is_some()) {
+        (false, true) => fs::rename(&backup, path)
+            .map_err(|error| format!("cannot recover staged settings: {error}")),
+        (true, true) => fs::remove_file(&backup)
+            .map_err(|error| format!("cannot remove recovered settings backup: {error}")),
+        _ => Ok(()),
+    }
 }
 
 enum ProcessMessage {
@@ -1657,7 +1904,7 @@ impl eframe::App for MinerApp {
                             .color(GREEN),
                     );
                     ui.label(
-                        RichText::new(format!("xus-miner v{}", env!("CARGO_PKG_VERSION")))
+                        RichText::new(format!("xus-miner v{}", crate::VERSION))
                             .size(10.0)
                             .color(MUTED),
                     );
@@ -2236,6 +2483,36 @@ pub fn run() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    struct TestSettingsHome(PathBuf);
+
+    impl TestSettingsHome {
+        fn new(label: &str) -> Self {
+            for attempt in 0..32_u64 {
+                let sequence = SETTINGS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let path = env::temp_dir().join(format!(
+                    "xus-miner-{label}-{}-{sequence}-{attempt}",
+                    process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("cannot create test settings home: {error}"),
+                }
+            }
+            panic!("cannot allocate test settings home");
+        }
+
+        fn settings_path(&self) -> PathBuf {
+            self.0.join(SETTINGS_DIRECTORY).join(SETTINGS_FILE)
+        }
+    }
+
+    impl Drop for TestSettingsHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn accepts_supported_pool_forms() {
         assert!(validate_pool("127.0.0.1:3333").is_ok());
@@ -2264,6 +2541,115 @@ mod tests {
         let encoded = settings.persisted_json().to_string();
         assert!(!encoded.contains("super-secret"));
         assert!(encoded.contains(DEFAULT_POOL));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_settings_file_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let home = TestSettingsHome::new("file-link");
+        let path = home.settings_path();
+        ensure_settings_directory(path.parent().unwrap()).unwrap();
+        let target = home.0.join("must-not-change");
+        fs::write(&target, b"chain source").unwrap();
+        symlink(&target, &path).unwrap();
+
+        let error = save_settings_at(&path, &Settings::default()).unwrap_err();
+        assert!(error.contains("symbolic link"));
+        assert_eq!(fs::read(&target).unwrap(), b"chain source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_symlink_or_non_directory_settings_parent() {
+        use std::os::unix::fs::symlink;
+
+        let linked_home = TestSettingsHome::new("directory-link");
+        let linked_path = linked_home.settings_path();
+        let target_directory = linked_home.0.join("target");
+        fs::create_dir(&target_directory).unwrap();
+        symlink(&target_directory, linked_path.parent().unwrap()).unwrap();
+        let error = save_settings_at(&linked_path, &Settings::default()).unwrap_err();
+        assert!(error.contains("symbolic link"));
+
+        let file_home = TestSettingsHome::new("parent-file");
+        let file_path = file_home.settings_path();
+        fs::write(file_path.parent().unwrap(), b"not a directory").unwrap();
+        let error = save_settings_at(&file_path, &Settings::default()).unwrap_err();
+        assert!(error.contains("not a directory"));
+    }
+
+    #[test]
+    fn settings_save_is_bounded_atomic_and_password_free() {
+        let home = TestSettingsHome::new("atomic");
+        let path = home.settings_path();
+        let mut settings = Settings {
+            pool: "pool.example:4444".into(),
+            password: "never-persist-this".into(),
+            ..Settings::default()
+        };
+        save_settings_at(&path, &settings).unwrap();
+
+        settings.pool = "new.example:5555".into();
+        save_settings_at(&path, &settings).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("new.example:5555"));
+        assert!(!saved.contains("never-persist-this"));
+        assert_eq!(load_settings_at(&path).unwrap().pool, "new.example:5555");
+        assert!(!fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        fs::write(&path, vec![b'x'; MAX_SETTINGS_BYTES as usize + 1]).unwrap();
+        assert!(load_settings_at(&path)
+            .err()
+            .unwrap()
+            .contains("unexpectedly large"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_settings_recovers_both_replace_crash_points() {
+        let home = TestSettingsHome::new("windows-recovery");
+        let path = home.settings_path();
+        let settings = Settings {
+            pool: "recover.example:4444".into(),
+            ..Settings::default()
+        };
+        save_settings_at(&path, &settings).unwrap();
+
+        let backup = windows_settings_backup(&path);
+        fs::rename(&path, &backup).unwrap();
+        assert_eq!(load_settings_at(&path).unwrap().pool, settings.pool);
+        assert!(path.is_file());
+        assert!(!backup.exists());
+
+        fs::copy(&path, &backup).unwrap();
+        assert_eq!(load_settings_at(&path).unwrap().pool, settings.pool);
+        assert!(path.is_file());
+        assert!(!backup.exists());
     }
 
     #[test]
