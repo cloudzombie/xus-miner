@@ -40,12 +40,12 @@ Build and open the operator console:
 ```sh
 git clone https://github.com/cloudzombie/xus-miner.git
 cd xus-miner
-cargo build --release
+cargo build --locked --release
 ./target/release/xus-miner
 ```
 
 On 64-bit Windows, install Rust, CMake, and the Visual Studio C++ Build Tools,
-then run `cargo build --release`; the executable is
+then run `cargo build --locked --release`; the executable is
 `target\release\xus-miner.exe`. Native macOS and Windows builds are exercised by
 CI.
 
@@ -135,10 +135,12 @@ Stratum password out of the process list.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --bin xus-miner
+cargo test --locked --test miner_protocol
 python3 scripts/check_chaincode_boundary.py
 cargo audit --deny warnings
+cargo build --locked --release
 ```
 
 The integration test launches the real headless engine used by the GUI against

@@ -4,8 +4,8 @@ Before working in this repository, read these root documents in order:
 
 1. `AGENTS.md` — mandatory repository and chaincode boundary.
 2. `BUILDING.md` — toolchains, platform packages, commands, and memory costs.
-3. `SOV_COMPATIBILITY.md` — the exact SOV crates and network contracts consumed
-   by the miner.
+3. `SOV_COMPATIBILITY.md` — the exact network contract implemented independently
+   by the miner; no SOV crate or source tree is consumed.
 
 This is the standalone XUS Miner repository. Do not edit or invoke write tools
 against `cloudzombie/sov`, a local SOV checkout, chain state, or wallet data from

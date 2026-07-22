@@ -82,6 +82,6 @@ cargo test --locked --release randomx_mainnet_job_uses_the_exact_sov_mining_seal
 
 Do not use `cargo update` casually. Preserve `Cargo.lock`, review every changed
 package, rerun the complete validation sequence, and confirm native CI on Linux,
-macOS, and Windows. Updating the SOV revision must follow the procedure in
-`SOV_COMPATIBILITY.md`. SOV compatibility changes update client protocol code
-and fixed fixtures here; they never patch or import the SOV repository.
+macOS, and Windows. There is no SOV revision or SOV source dependency to update.
+SOV compatibility changes update client protocol code and fixed fixtures here;
+they never patch or import the SOV repository.
