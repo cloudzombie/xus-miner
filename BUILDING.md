@@ -10,6 +10,8 @@
   checksummed and frozen by exact direct versions plus `Cargo.lock`
 - Approximately 4 GiB free disk space for a clean debug plus release build
 - At least 3 GiB free RAM per full-dataset RandomX worker
+- Maintainer validation only: Python 3.11+ and Ruby with its standard Psych YAML
+  parser. Neither is linked into or required to run the miner binary.
 
 The miner has no SOV source dependency, does not require a SOV checkout, and
 must not be built as part of one.

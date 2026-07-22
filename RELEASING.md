@@ -36,4 +36,5 @@ is published. The release is assembled as a draft and published only after every
 asset is attached, allowing GitHub's repository-level immutable-release policy
 to lock the final tag and assets and issue its release attestation. A tag-push CI
 check independently rejects any version mismatch for tags created outside the
-release workflow.
+release workflow. If publishing is interrupted, a rerun may replace only the
+matching incomplete draft; it still refuses any already-published release.

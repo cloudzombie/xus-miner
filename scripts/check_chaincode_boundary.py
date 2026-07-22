@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -118,168 +120,13 @@ for source in [ROOT / "src", ROOT / "tests", ROOT / "scripts"]:
         ):
             fail(f"compile-time file inclusion is not allowed: {path.relative_to(ROOT)}")
 
-workflow_dir = ROOT / ".github" / "workflows"
-workflows = sorted((*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")))
-for workflow in workflows:
-    text = workflow.read_text(encoding="utf-8")
-    jobs_match = re.search(r"(?m)^jobs:\s*$", text)
-    if jobs_match is None:
-        fail(f"workflow has no jobs mapping: {workflow.name}")
-    job_headers = list(
-        re.finditer(
-            r"(?m)^  (?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_-]+)):\s*$",
-            text[jobs_match.end() :],
-        )
-    )
-    job_ranges: list[tuple[str, int, int]] = []
-    for index, header in enumerate(job_headers):
-        name = next(group for group in header.groups() if group is not None)
-        start = jobs_match.end() + header.start()
-        end = (
-            jobs_match.end() + job_headers[index + 1].start()
-            if index + 1 < len(job_headers)
-            else len(text)
-        )
-        job_ranges.append((name, start, end))
-
-    # Parse permission mappings conservatively instead of searching for only the
-    # spelling `contents: write`. YAML permits quoted keys, aliases, inline maps,
-    # and duplicate mappings; accepting any of those here would make a textual
-    # guard easy to bypass. Release workflows intentionally use one tiny,
-    # canonical subset that this parser can prove unambiguous.
-    lines = text.splitlines(keepends=True)
-    offsets: list[int] = []
-    offset = 0
-    for line in lines:
-        offsets.append(offset)
-        offset += len(line)
-    permission_blocks: list[tuple[int, int, dict[str, str]]] = []
-    scalar_indent: int | None = None
-    key_line = re.compile(
-        r"^( *)(?:(\"[^\"]+\"|'[^']+'|[A-Za-z0-9_-]+)):\s*(.*?)\s*(?:#.*)?(?:\r?\n)?$"
-    )
-
-    def unquoted_yaml_surface(line: str) -> str:
-        """Return YAML syntax outside quotes/comments, preserving positions."""
-        result: list[str] = []
-        quote: str | None = None
-        escaped = False
-        for position, character in enumerate(line):
-            if quote == '"':
-                result.append(" ")
-                if escaped:
-                    escaped = False
-                elif character == "\\":
-                    escaped = True
-                elif character == quote:
-                    quote = None
-                continue
-            if quote == "'":
-                result.append(" ")
-                if character == quote:
-                    quote = None
-                continue
-            if character in {'"', "'"}:
-                quote = character
-                result.append(" ")
-                continue
-            if character == "#" and (position == 0 or line[position - 1].isspace()):
-                result.extend(" " for _ in line[position:])
-                break
-            result.append(character)
-        return "".join(result)
-
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        indent = len(line) - len(line.lstrip(" "))
-        if scalar_indent is not None:
-            if not stripped or indent > scalar_indent:
-                continue
-            scalar_indent = None
-        surface = unquoted_yaml_surface(line)
-        if re.search(r"(?m)^\s*(?:%|\?|<<\s*:|[*!][A-Za-z0-9_-]+\s*:)", surface):
-            fail(f"advanced YAML keys/directives are not allowed: {workflow.name}")
-        if re.search(r"(?<![A-Za-z0-9_./-])[&*][A-Za-z0-9_-]+", surface):
-            fail(f"YAML anchors and aliases are not allowed: {workflow.name}")
-        if re.search(r"(?:^|[\s\[{,:-])!(?:!|<|[A-Za-z])", surface):
-            fail(f"YAML tags are not allowed: {workflow.name}")
-        match = key_line.match(line)
-        if match is None:
-            continue
-        raw_key = match.group(2)
-        value = match.group(3).strip()
-        if value in {"|", ">", "|-", ">-", "|+", ">+"}:
-            scalar_indent = len(match.group(1))
-            continue
-        if raw_key[:1] in {"'", '"'}:
-            fail(f"quoted workflow mapping keys are not allowed: {workflow.name}")
-        key = raw_key[1:-1] if raw_key[:1] in {"'", '"'} else raw_key
-        if key != "permissions":
-            continue
-        if value:
-            fail(f"inline, aliased, or broad permissions are not allowed: {workflow.name}")
-
-        entries: dict[str, str] = {}
-        for child in lines[index + 1 :]:
-            child_stripped = child.strip()
-            child_indent = len(child) - len(child.lstrip(" "))
-            if not child_stripped or child_stripped.startswith("#"):
-                continue
-            if child_indent <= indent:
-                break
-            child_match = key_line.match(child)
-            if child_indent != indent + 2 or child_match is None:
-                fail(f"ambiguous permissions mapping is not allowed: {workflow.name}")
-            child_raw_key = child_match.group(2)
-            child_value = child_match.group(3).strip()
-            if child_value not in {"read", "write"}:
-                fail(f"permission value must be literal read/write: {workflow.name}")
-            if child_raw_key in entries:
-                fail(f"duplicate permission key is not allowed: {workflow.name}")
-            entries[child_raw_key] = child_value
-        permission_blocks.append((indent, offsets[index], entries))
-
-    top_level = [entries for indent, _, entries in permission_blocks if indent == 0]
-    if top_level != [{"contents": "read"}]:
-        fail(f"workflow must have exactly top-level contents: read: {workflow.name}")
-    job_level = [block for block in permission_blocks if block[0] != 0]
-    if workflow.name == "release.yml":
-        if len(job_level) != 1:
-            fail("release workflow must have exactly one job permission override")
-        indent, position, entries = job_level[0]
-        owners = [name for name, start, end in job_ranges if start <= position < end]
-        expected = {
-            "contents": "write",
-            "id-token": "write",
-            "attestations": "write",
-        }
-        if indent != 4 or owners != ["publish"] or entries != expected:
-            fail("only jobs.publish may request the exact release write permissions")
-    elif job_level:
-        fail(f"non-release workflow requests job permissions: {workflow.name}")
-    if "pull_request_target" in text:
-        fail(f"pull_request_target is not allowed: {workflow.name}")
-    if re.search(r"(?mi)runs-on:.*self-hosted", text):
-        fail(f"self-hosted runners are not allowed: {workflow.name}")
-    if "cloudzombie/sov" in text or "/github/sov" in text:
-        fail(f"workflow references the SOV repository: {workflow.name}")
-
-    remote_uses = re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", text)
-    for action in remote_uses:
-        if action.startswith("./"):
-            continue
-        if re.fullmatch(r"[^/@\s]+/[^/@\s]+@[0-9a-f]{40}", action) is None:
-            fail(f"workflow action is not pinned to a full commit: {workflow.name}: {action}")
-
-    checkout_blocks = re.findall(
-        r"(?ms)^\s*-\s+uses:\s*actions/checkout@[0-9a-f]{40}.*?"
-        r"(?=^\s*-\s+(?:uses|name):|\Z)",
-        text,
-    )
-    if not checkout_blocks:
-        fail(f"workflow has no pinned checkout step: {workflow.name}")
-    for block in checkout_blocks:
-        if not re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", block):
-            fail(f"checkout persists credentials: {workflow.name}")
+ruby = shutil.which("ruby")
+if ruby is None:
+    fail("Ruby with its standard Psych YAML parser is required for workflow validation")
+workflow_check = subprocess.run(
+    [ruby, str(ROOT / "scripts" / "check_workflows.rb")], check=False
+)
+if workflow_check.returncode != 0:
+    raise SystemExit(workflow_check.returncode)
 
 print("chaincode boundary: clean")

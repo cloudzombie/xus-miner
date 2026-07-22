@@ -34,10 +34,19 @@ jobs:
         shell: bash
         run: |
           tag="v${{ steps.version.outputs.version }}"
-          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "release ${tag} already exists and cannot be reused" >&2
-            exit 1
-          fi
+          release_state="$(gh release list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --limit 1000 \
+            --json tagName,isDraft \
+            --jq ".[] | select(.tagName == \"${tag}\") | .isDraft")"
+          case "${release_state}" in
+            "") ;;
+            true) echo "Recovering incomplete draft release ${tag}." ;;
+            *)
+              echo "published or ambiguous release ${tag} already exists and cannot be reused" >&2
+              exit 1
+              ;;
+          esac
           if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
             type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.type)"
             sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.sha)"
@@ -147,6 +156,19 @@ jobs:
           tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.sha)"
           test "${tag_type}" = commit
           test "${tag_sha}" = "${GITHUB_SHA}"
+          release_state="$(gh release list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --limit 1000 \
+            --json tagName,isDraft \
+            --jq ".[] | select(.tagName == \"${tag}\") | .isDraft")"
+          case "${release_state}" in
+            "") ;;
+            true) gh release delete "${tag}" --repo "${GITHUB_REPOSITORY}" --yes ;;
+            *)
+              echo "refusing to replace published or ambiguous release ${tag}" >&2
+              exit 1
+              ;;
+          esac
           gh release create "v${VERSION}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
