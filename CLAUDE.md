@@ -6,6 +6,7 @@ Before working in this repository, read these root documents in order:
 2. `BUILDING.md` — toolchains, platform packages, commands, and memory costs.
 3. `SOV_COMPATIBILITY.md` — the exact network contract implemented independently
    by the miner; no SOV crate or source tree is consumed.
+4. `RELEASING.md` — mandatory single-source version and immutable-tag procedure.
 
 This is the standalone XUS Miner repository. Do not edit or invoke write tools
 against `cloudzombie/sov`, a local SOV checkout, chain state, or wallet data from

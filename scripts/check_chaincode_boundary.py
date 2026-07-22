@@ -35,6 +35,22 @@ for cargo_config in (ROOT / ".cargo" / "config", ROOT / ".cargo" / "config.toml"
     if cargo_config.exists():
         fail(f"Cargo source/runner configuration is not allowed: {cargo_config.name}")
 
+target_sections: list[tuple[str, object]] = []
+if "lib" in manifest_data:
+    target_sections.append(("lib", manifest_data["lib"]))
+for section in ("bin", "test", "example", "bench"):
+    for index, target in enumerate(manifest_data.get(section, [])):
+        target_sections.append((f"{section}[{index}]", target))
+for name, target in target_sections:
+    if not isinstance(target, dict):
+        fail(f"invalid Cargo target table: {name}")
+    raw_path = target.get("path")
+    if raw_path is None:
+        continue
+    target_path = (ROOT / raw_path).resolve()
+    if not target_path.is_relative_to(ROOT) or not target_path.is_file():
+        fail(f"Cargo target escapes or is missing from repository: {name}.path")
+
 
 def dependency_tables(value: object, location: str = "Cargo.toml"):
     """Yield every direct, dev, build, and target-specific dependency table."""
@@ -92,20 +108,57 @@ for path in ROOT.rglob("*"):
 
 for source in [ROOT / "src", ROOT / "tests", ROOT / "scripts"]:
     for path in source.rglob("*"):
-        if not path.is_file() or path == Path(__file__):
+        if not path.is_file() or path == Path(__file__).resolve():
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "../chain" in text or "../sov" in text or "/Users/josh/github/sov" in text:
             fail(f"source references a local SOV checkout: {path.relative_to(ROOT)}")
+        if path.suffix == ".rs" and re.search(
+            r"\b(?:include|include_str|include_bytes)!\s*\(", text
+        ):
+            fail(f"compile-time file inclusion is not allowed: {path.relative_to(ROOT)}")
 
 workflow_dir = ROOT / ".github" / "workflows"
-for workflow in workflow_dir.glob("*.yml"):
+workflows = sorted((*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")))
+for workflow in workflows:
     text = workflow.read_text(encoding="utf-8")
     if not re.search(r"(?m)^permissions:\s*\n\s+contents:\s*read\s*$", text):
         fail(f"workflow lacks top-level contents: read permission: {workflow.name}")
-    if re.search(r"(?m)^\s+[a-z-]+:\s*write\s*$", text):
-        fail(f"workflow requests write permission: {workflow.name}")
-    if "persist-credentials: false" not in text:
-        fail(f"workflow persists checkout credentials: {workflow.name}")
+    if re.search(r"(?mi)^\s*permissions:\s*(?:write-all|\{[^\n]*write)", text):
+        fail(f"workflow uses broad or inline write permissions: {workflow.name}")
+    writes = list(re.finditer(r"(?mi)^\s+([a-z0-9_-]+):\s*write\s*$", text))
+    if writes:
+        if workflow.name != "release.yml":
+            fail(f"non-release workflow requests write permission: {workflow.name}")
+        publish_start = text.find("\n  publish:\n")
+        allowed = {"contents", "id-token", "attestations"}
+        if publish_start < 0 or any(
+            match.start() < publish_start or match.group(1) not in allowed for match in writes
+        ):
+            fail("release write permission exists outside the final publish job")
+    if "pull_request_target" in text:
+        fail(f"pull_request_target is not allowed: {workflow.name}")
+    if re.search(r"(?mi)runs-on:.*self-hosted", text):
+        fail(f"self-hosted runners are not allowed: {workflow.name}")
+    if "cloudzombie/sov" in text or "/github/sov" in text:
+        fail(f"workflow references the SOV repository: {workflow.name}")
+
+    remote_uses = re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", text)
+    for action in remote_uses:
+        if action.startswith("./"):
+            continue
+        if re.fullmatch(r"[^/@\s]+/[^/@\s]+@[0-9a-f]{40}", action) is None:
+            fail(f"workflow action is not pinned to a full commit: {workflow.name}: {action}")
+
+    checkout_blocks = re.findall(
+        r"(?ms)^\s*-\s+uses:\s*actions/checkout@[0-9a-f]{40}.*?"
+        r"(?=^\s*-\s+(?:uses|name):|\Z)",
+        text,
+    )
+    if not checkout_blocks:
+        fail(f"workflow has no pinned checkout step: {workflow.name}")
+    for block in checkout_blocks:
+        if not re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", block):
+            fail(f"checkout persists credentials: {workflow.name}")
 
 print("chaincode boundary: clean")

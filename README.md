@@ -9,6 +9,11 @@ This is an independent repository. It is not part of the SOV workspace and has
 no local path into chaincode. See [CHAINCODE_BOUNDARY.md](CHAINCODE_BOUNDARY.md)
 for the enforced dependency and GitHub-permission boundary.
 
+For maximum build isolation, use a GitHub release: its binaries are compiled on
+ephemeral hosted runners with no SOV checkout, then checksummed and given GitHub
+build-provenance attestations. Verify a downloaded asset with
+`gh attestation verify <asset> --repo cloudzombie/xus-miner` before unpacking it.
+
 For direct solo mining, enter the node endpoint and your **public account ID**:
 
 ```text
@@ -139,9 +144,14 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --bin xus-miner
 cargo test --locked --test miner_protocol
 python3 scripts/check_chaincode_boundary.py
+python3 scripts/check_version.py
 cargo audit --deny warnings
 cargo build --locked --release
 ```
+
+Application versions and GitHub releases follow the non-negotiable contract in
+[RELEASING.md](RELEASING.md): application `X.Y.Z` is released only as immutable
+tag `vX.Y.Z`, and CI rejects any mismatch before publishing.
 
 The integration test launches the real headless engine used by the GUI against
 a mock Stratum server. It verifies password delivery over stdin, the structured

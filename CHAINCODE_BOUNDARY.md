@@ -8,8 +8,10 @@ The repository enforces that separation in four ways:
 2. It has no SOV source dependency: no Git dependency, local path, symlink,
    submodule, or workspace relationship. Compatibility is checked with fixed
    wire/cryptographic vectors captured from the public node protocol.
-3. GitHub Actions receives `contents: read`, disables persisted checkout
-   credentials, and therefore has no repository token capable of writing SOV.
+3. Every source checkout and build job receives `contents: read` and disables
+   persisted checkout credentials. Only the final tag-release publishing job
+   receives `contents: write`, scoped by GitHub to `cloudzombie/xus-miner`; it
+   has no source checkout and cannot write the SOV repository.
 4. The running miner communicates with a node only through JSON-RPC or Stratum.
    It writes its own GUI preferences under the user's profile and never opens a
    chain source or node-data path.
@@ -22,4 +24,7 @@ Repository separation is not an operating-system sandbox: any deliberately
 malicious program run under a user account inherits that account's filesystem
 permissions. For a machine-level guarantee, run the released miner under a
 separate unprivileged OS account or application sandbox that cannot write the
-SOV checkout. The maintained miner itself contains no such write path.
+SOV checkout. Official release binaries are compiled on ephemeral GitHub-hosted
+runners where no SOV checkout exists; local Cargo builds do not provide that
+machine boundary because third-party build scripts run with the invoking user's
+permissions. The maintained miner itself contains no chaincode write path.

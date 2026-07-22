@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read exact application version from its single source
+        id: version
+        shell: bash
+        run: |
+          test "${GITHUB_REF}" = "refs/heads/main"
+          version="$(python3 scripts/check_version.py)"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      - name: Prove repository isolation
+        run: python3 scripts/check_chaincode_boundary.py
+      - name: Refuse a reused version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "release tag already exists and cannot be reused" >&2
+            exit 1
+          fi
+      - name: Install pinned RustSec scanner
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Reject advisories and yanked crates
+        run: cargo audit --deny warnings
+
+  build:
+    needs: verify-version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, macos-15-intel, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test locked release source
+        run: cargo test --locked --bin xus-miner
+      - name: Test external mining protocol
+        run: cargo test --locked --test miner_protocol
+      - name: Build locked release binary
+        run: cargo build --locked --release
+      - name: Confirm embedded application version
+        shell: bash
+        run: |
+          actual="$(./target/release/xus-miner --version)"
+          test "${actual}" = "xus-miner ${{ needs.verify-version.outputs.version }}"
+        if: runner.os != 'Windows'
+      - name: Confirm embedded application version (Windows)
+        shell: pwsh
+        run: |
+          $actual = & .\target\release\xus-miner.exe --version
+          if ($actual -ne "xus-miner ${{ needs.verify-version.outputs.version }}") {
+            throw "embedded version mismatch: $actual"
+          }
+        if: runner.os == 'Windows'
+      - name: Package release (Unix)
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          mkdir -p dist
+          platform="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m)"
+          tar -czf "dist/xus-miner-v${VERSION}-${platform}-${arch}.tar.gz" \
+            -C target/release xus-miner
+        if: runner.os != 'Windows'
+      - name: Package release (Windows)
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $arch = if ($env:RUNNER_ARCH -eq "X64") { "x86_64" } else { $env:RUNNER_ARCH.ToLowerInvariant() }
+          Compress-Archive -Path target\release\xus-miner.exe `
+            -DestinationPath "dist\xus-miner-v$env:VERSION-windows-$arch.zip"
+        if: runner.os == 'Windows'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [verify-version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        shell: bash
+        run: (cd dist && sha256sum * > SHA256SUMS)
+      - name: Attest release provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*
+      - name: Publish immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        shell: bash
+        run: |
+          current_main="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          test "${current_main}" = "${GITHUB_SHA}"
+          gh release create "v${VERSION}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "XUS Miner v${VERSION}" \
+            --generate-notes
