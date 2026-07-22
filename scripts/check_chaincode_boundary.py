@@ -158,6 +158,37 @@ for workflow in workflows:
     key_line = re.compile(
         r"^( *)(?:(\"[^\"]+\"|'[^']+'|[A-Za-z0-9_-]+)):\s*(.*?)\s*(?:#.*)?(?:\r?\n)?$"
     )
+
+    def unquoted_yaml_surface(line: str) -> str:
+        """Return YAML syntax outside quotes/comments, preserving positions."""
+        result: list[str] = []
+        quote: str | None = None
+        escaped = False
+        for position, character in enumerate(line):
+            if quote == '"':
+                result.append(" ")
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if quote == "'":
+                result.append(" ")
+                if character == quote:
+                    quote = None
+                continue
+            if character in {'"', "'"}:
+                quote = character
+                result.append(" ")
+                continue
+            if character == "#" and (position == 0 or line[position - 1].isspace()):
+                result.extend(" " for _ in line[position:])
+                break
+            result.append(character)
+        return "".join(result)
+
     for index, line in enumerate(lines):
         stripped = line.strip()
         indent = len(line) - len(line.lstrip(" "))
@@ -165,6 +196,13 @@ for workflow in workflows:
             if not stripped or indent > scalar_indent:
                 continue
             scalar_indent = None
+        surface = unquoted_yaml_surface(line)
+        if re.search(r"(?m)^\s*(?:%|\?|<<\s*:|[*!][A-Za-z0-9_-]+\s*:)", surface):
+            fail(f"advanced YAML keys/directives are not allowed: {workflow.name}")
+        if re.search(r"(?<![A-Za-z0-9_./-])[&*][A-Za-z0-9_-]+", surface):
+            fail(f"YAML anchors and aliases are not allowed: {workflow.name}")
+        if re.search(r"(?:^|[\s\[{,:-])!(?:!|<|[A-Za-z])", surface):
+            fail(f"YAML tags are not allowed: {workflow.name}")
         match = key_line.match(line)
         if match is None:
             continue
@@ -173,11 +211,11 @@ for workflow in workflows:
         if value in {"|", ">", "|-", ">-", "|+", ">+"}:
             scalar_indent = len(match.group(1))
             continue
+        if raw_key[:1] in {"'", '"'}:
+            fail(f"quoted workflow mapping keys are not allowed: {workflow.name}")
         key = raw_key[1:-1] if raw_key[:1] in {"'", '"'} else raw_key
         if key != "permissions":
             continue
-        if raw_key != "permissions":
-            fail(f"quoted permissions key is not allowed: {workflow.name}")
         if value:
             fail(f"inline, aliased, or broad permissions are not allowed: {workflow.name}")
 
@@ -194,8 +232,6 @@ for workflow in workflows:
                 fail(f"ambiguous permissions mapping is not allowed: {workflow.name}")
             child_raw_key = child_match.group(2)
             child_value = child_match.group(3).strip()
-            if child_raw_key[:1] in {"'", '"'}:
-                fail(f"quoted permission key is not allowed: {workflow.name}")
             if child_value not in {"read", "write"}:
                 fail(f"permission value must be literal read/write: {workflow.name}")
             if child_raw_key in entries:
