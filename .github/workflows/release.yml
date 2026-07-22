@@ -150,5 +150,9 @@ jobs:
           gh release create "v${VERSION}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
+            --draft \
             --title "XUS Miner v${VERSION}" \
             --generate-notes
+          gh release edit "v${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false

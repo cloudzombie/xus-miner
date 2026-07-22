@@ -32,4 +32,8 @@ create the matching tag, checksums, provenance attestations, and GitHub release.
 Only that final source-free publish job receives a repository-scoped write
 token; all source/build jobs remain read-only. The tag reference is created
 atomically at the already-verified `main` SHA and read back before the release
-is published; a tag-push CI check independently rejects any version mismatch.
+is published. The release is assembled as a draft and published only after every
+asset is attached, allowing GitHub's repository-level immutable-release policy
+to lock the final tag and assets and issue its release attestation. A tag-push CI
+check independently rejects any version mismatch for tags created outside the
+release workflow.
