@@ -86,7 +86,7 @@ end
 
 def validate_workflow!(path)
   source = path.read
-  stream = Psych.parse_stream(source, path.to_s)
+  stream = Psych.parse_stream(source, filename: path.to_s)
   unless stream.children.length == 1 && stream.children.first.root
     violation(path, "workflow must contain exactly one YAML document")
   end
