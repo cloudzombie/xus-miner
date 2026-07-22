@@ -5,7 +5,9 @@ use eframe::egui::{
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
@@ -268,12 +270,15 @@ fn ensure_settings_directory(directory: &Path) -> Result<(), String> {
         Err(error) => return Err(format!("cannot inspect settings directory: {error}")),
     }
 
-    let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
     match builder.create(directory) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
