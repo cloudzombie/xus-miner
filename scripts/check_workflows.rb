@@ -24,7 +24,7 @@ RELEASE_PERMISSIONS = {
   "attestations" => "write"
 }.freeze
 PINNED_ACTION = %r{\A[^/@\s]+/[^/@\s]+@[0-9a-f]{40}\z}.freeze
-PINNED_CHECKOUT = %r{\Aactions/checkout@[0-9a-f]{40}\z}.freeze
+PINNED_CHECKOUT = %r{\Aactions/checkout@[0-9a-f]{40}\z}i.freeze
 
 class WorkflowViolation < StandardError; end
 
@@ -60,7 +60,8 @@ def validate_ast!(path, node)
     if node.value == "pull_request_target"
       violation(path, "pull_request_target is not allowed")
     end
-    if node.value.include?("cloudzombie/sov") || node.value.include?("/github/sov")
+    normalized = node.value.downcase
+    if normalized.include?("cloudzombie/sov") || normalized.include?("/github/sov")
       violation(path, "workflow references the SOV repository")
     end
   end
@@ -74,7 +75,8 @@ def validate_runner!(path, job_name, job)
     strategy = job["strategy"]
     matrix = strategy.is_a?(Hash) ? strategy["matrix"] : nil
     operating_systems = matrix.is_a?(Hash) ? matrix["os"] : nil
-    unless operating_systems.is_a?(Array) && !operating_systems.empty? &&
+    unless matrix.is_a?(Hash) && matrix.keys == ["os"] &&
+           operating_systems.is_a?(Array) && !operating_systems.empty? &&
            operating_systems.all? { |item| HOSTED_RUNNERS.include?(item) }
       violation(path, "job #{job_name.inspect} has an unbounded OS matrix")
     end
@@ -187,6 +189,12 @@ def run_regression_checks!
         steps:
           - "uses": actions/checkout@0000000000000000000000000000000000000000
     YAML
+    "mixed-case checkout" => <<~YAML,
+      evil:
+        runs-on: ubuntu-24.04
+        steps:
+          - uses: ACTIONS/CHECKOUT@0000000000000000000000000000000000000000
+    YAML
     "flow unpinned action" => <<~YAML,
       evil:
         runs-on: ubuntu-24.04
@@ -198,12 +206,27 @@ def run_regression_checks!
         permissions: &danger {contents: write}
         steps: [{run: "true"}]
     YAML
-    "duplicate decoded permission key" => <<~YAML
+    "duplicate decoded permission key" => <<~YAML,
       evil:
         runs-on: ubuntu-24.04
         permissions: {contents: read}
         "permissi\\u006fns": {contents: write}
         steps: [{run: "true"}]
+    YAML
+    "matrix include runner" => <<~YAML,
+      evil:
+        strategy:
+          matrix:
+            os: [ubuntu-24.04]
+            include: [{os: self-hosted}]
+        runs-on: ${{ matrix.os }}
+        steps: [{run: "true"}]
+    YAML
+    "mixed-case SOV reference" => <<~YAML
+      evil:
+        runs-on: ubuntu-24.04
+        steps:
+          - run: git clone https://github.com/CloudZombie/SOV
     YAML
   }
 
