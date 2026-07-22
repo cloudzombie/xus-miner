@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: xus-miner-release
+  cancel-in-progress: false
+
 jobs:
   verify-version:
     runs-on: ubuntu-24.04
@@ -24,14 +28,22 @@ jobs:
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
       - name: Prove repository isolation
         run: python3 scripts/check_chaincode_boundary.py
-      - name: Refuse a reused version
+      - name: Refuse a reused release or wrong existing tag
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-            echo "release tag already exists and cannot be reused" >&2
+          tag="v${{ steps.version.outputs.version }}"
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "release ${tag} already exists and cannot be reused" >&2
             exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.type)"
+            sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.sha)"
+            test "${type}" = commit
+            test "${sha}" = "${GITHUB_SHA}"
+            echo "Recovering exact orphaned ${tag} tag from a prior publish attempt."
           fi
       - name: Install pinned RustSec scanner
         run: cargo install cargo-audit --locked --version 0.22.2
@@ -125,8 +137,18 @@ jobs:
         run: |
           current_main="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
           test "${current_main}" = "${GITHUB_SHA}"
+          tag="v${VERSION}"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${tag}" \
+              -f sha="${GITHUB_SHA}" >/dev/null
+          fi
+          tag_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.type)"
+          tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.sha)"
+          test "${tag_type}" = commit
+          test "${tag_sha}" = "${GITHUB_SHA}"
           gh release create "v${VERSION}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
+            --verify-tag \
             --title "XUS Miner v${VERSION}" \
             --generate-notes

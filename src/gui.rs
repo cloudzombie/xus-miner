@@ -327,6 +327,8 @@ fn load_settings_at(path: &Path) -> Result<Settings, String> {
         .parent()
         .ok_or_else(|| "settings file has no parent".to_string())?;
     verify_settings_directory(directory)?;
+    #[cfg(windows)]
+    recover_windows_settings(path)?;
     let initial =
         inspect_settings_file(path)?.ok_or_else(|| "settings file does not exist".to_string())?;
     if initial.len() > MAX_SETTINGS_BYTES {
@@ -383,6 +385,8 @@ fn save_settings_at(path: &Path, settings: &Settings) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "settings file has no parent".to_string())?;
     ensure_settings_directory(directory)?;
+    #[cfg(windows)]
+    recover_windows_settings(path)?;
     inspect_settings_file(path)?;
 
     let bytes = serde_json::to_vec_pretty(&settings.persisted_json())
@@ -443,9 +447,10 @@ fn replace_settings_file(path: &Path, temporary: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn replace_settings_file(path: &Path, temporary: &Path) -> Result<(), String> {
-    // std has no atomic replace primitive on Windows. Preserve the old file
-    // across the smallest possible rename gap, without ever writing through it.
-    let backup = temporary.with_extension("old");
+    // std has no atomic replace primitive on Windows. A deterministic backup
+    // makes either possible crash point recoverable on the next load/save.
+    recover_windows_settings(path)?;
+    let backup = windows_settings_backup(path);
     if inspect_settings_file(path)?.is_some() {
         fs::rename(path, &backup).map_err(|error| format!("cannot stage old settings: {error}"))?;
     }
@@ -461,6 +466,25 @@ fn replace_settings_file(path: &Path, temporary: &Path) -> Result<(), String> {
             let _ = fs::rename(&backup, path);
             Err(format!("cannot install settings: {error}"))
         }
+    }
+}
+
+#[cfg(windows)]
+fn windows_settings_backup(path: &Path) -> PathBuf {
+    path.with_file_name(format!(".{SETTINGS_FILE}.backup"))
+}
+
+#[cfg(windows)]
+fn recover_windows_settings(path: &Path) -> Result<(), String> {
+    let backup = windows_settings_backup(path);
+    let current = inspect_settings_file(path)?;
+    let staged = inspect_settings_file(&backup)?;
+    match (current.is_some(), staged.is_some()) {
+        (false, true) => fs::rename(&backup, path)
+            .map_err(|error| format!("cannot recover staged settings: {error}")),
+        (true, true) => fs::remove_file(&backup)
+            .map_err(|error| format!("cannot remove recovered settings backup: {error}")),
+        _ => Ok(()),
     }
 }
 
@@ -2603,6 +2627,29 @@ mod tests {
             .err()
             .unwrap()
             .contains("unexpectedly large"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_settings_recovers_both_replace_crash_points() {
+        let home = TestSettingsHome::new("windows-recovery");
+        let path = home.settings_path();
+        let settings = Settings {
+            pool: "recover.example:4444".into(),
+            ..Settings::default()
+        };
+        save_settings_at(&path, &settings).unwrap();
+
+        let backup = windows_settings_backup(&path);
+        fs::rename(&path, &backup).unwrap();
+        assert_eq!(load_settings_at(&path).unwrap().pool, settings.pool);
+        assert!(path.is_file());
+        assert!(!backup.exists());
+
+        fs::copy(&path, &backup).unwrap();
+        assert_eq!(load_settings_at(&path).unwrap().pool, settings.pool);
+        assert!(path.is_file());
+        assert!(!backup.exists());
     }
 
     #[test]

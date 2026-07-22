@@ -4,9 +4,12 @@
 `CARGO_PKG_VERSION`; the GUI footer and `xus-miner --version` use that same
 constant. `Cargo.lock` and a release tag must agree exactly.
 
-The only valid tag for application version `X.Y.Z` is `vX.Y.Z`. Tags are never
-reused, moved, or deleted. If a release is wrong, fix it and increment the patch
-version; never rewrite a published version.
+The only valid tag for application version `X.Y.Z` is `vX.Y.Z`. The release
+tooling accepts no tag/version input and maintainers must never create `v*` tags
+by hand. Repository rules block all `v*` tag movement/deletion with no bypass,
+and tag-push CI rejects a version mismatch. Tags are never reused. If a release
+is wrong, fix it and increment the patch version; never rewrite a published
+version.
 
 ## Release procedure
 
@@ -27,4 +30,6 @@ on Linux, Apple Silicon macOS, Intel macOS, and Windows, and confirms each
 compiled binary reports the exact same version. Only after those gates does it
 create the matching tag, checksums, provenance attestations, and GitHub release.
 Only that final source-free publish job receives a repository-scoped write
-token; all source/build jobs remain read-only.
+token; all source/build jobs remain read-only. The tag reference is created
+atomically at the already-verified `main` SHA and read back before the release
+is published; a tag-push CI check independently rejects any version mismatch.

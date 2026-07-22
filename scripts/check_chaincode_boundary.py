@@ -126,16 +126,40 @@ for workflow in workflows:
         fail(f"workflow lacks top-level contents: read permission: {workflow.name}")
     if re.search(r"(?mi)^\s*permissions:\s*(?:write-all|\{[^\n]*write)", text):
         fail(f"workflow uses broad or inline write permissions: {workflow.name}")
-    writes = list(re.finditer(r"(?mi)^\s+([a-z0-9_-]+):\s*write\s*$", text))
+    writes = list(
+        re.finditer(r"(?mi)^\s+([a-z0-9_-]+):\s*write\s*(?:#.*)?$", text)
+    )
     if writes:
         if workflow.name != "release.yml":
             fail(f"non-release workflow requests write permission: {workflow.name}")
-        publish_start = text.find("\n  publish:\n")
+        jobs_match = re.search(r"(?m)^jobs:\s*$", text)
+        if jobs_match is None:
+            fail("release workflow has no jobs mapping")
+        job_headers = list(
+            re.finditer(
+                r"(?m)^  (?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_-]+)):\s*$",
+                text[jobs_match.end() :],
+            )
+        )
+        job_ranges: list[tuple[str, int, int]] = []
+        for index, header in enumerate(job_headers):
+            name = next(group for group in header.groups() if group is not None)
+            start = jobs_match.end() + header.start()
+            end = (
+                jobs_match.end() + job_headers[index + 1].start()
+                if index + 1 < len(job_headers)
+                else len(text)
+            )
+            job_ranges.append((name, start, end))
         allowed = {"contents", "id-token", "attestations"}
-        if publish_start < 0 or any(
-            match.start() < publish_start or match.group(1) not in allowed for match in writes
-        ):
-            fail("release write permission exists outside the final publish job")
+        write_names = set()
+        for match in writes:
+            owners = [name for name, start, end in job_ranges if start <= match.start() < end]
+            if owners != ["publish"]:
+                fail("release write permission exists outside jobs.publish")
+            write_names.add(match.group(1))
+        if write_names != allowed:
+            fail("jobs.publish must request exactly contents/id-token/attestations write")
     if "pull_request_target" in text:
         fail(f"pull_request_target is not allowed: {workflow.name}")
     if re.search(r"(?mi)runs-on:.*self-hosted", text):
