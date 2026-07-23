@@ -60,5 +60,7 @@ jobs:
         run: cargo test --locked --bin xus-miner
       - name: Test external mining protocol
         run: cargo test --locked --test miner_protocol
+      - name: Test SOV 0.1.99 direct RPC contract
+        run: cargo test --locked --test rpc_0199_protocol
       - name: Build release
         run: cargo build --locked --release
