@@ -9,13 +9,22 @@
 - Internet access during the first dependency fetch; third-party crates are
   checksummed and frozen by exact direct versions plus `Cargo.lock`
 - Approximately 4 GiB free disk space for a clean debug plus release build
-- Approximately 2.3 GiB available RAM per full-dataset RandomX worker, plus the
-  miner's conservative OS/application reserve (at least 1.5 GiB)
+- Approximately 2.3 GiB available RAM for one shared full RandomX dataset, plus
+  a conservative 32 MiB allowance per worker and the miner's OS/application
+  reserve (at least 1.5 GiB)
 - Maintainer validation only: Python 3.11+ and Ruby with its standard Psych YAML
   parser. Neither is linked into or required to run the miner binary.
 
 The miner has no SOV source dependency, does not require a SOV checkout, and
 must not be built as part of one.
+
+The exact `randomx-rs` crate supplies the checksummed native RandomX library,
+but XUS Miner does not use its unchecked VM constructor. All native ownership is
+confined to `src/randomx_native.rs`: cache, dataset, and VM pointers are
+null-checked, backing memory outlives every VM, output is written only into a
+mutable 32-byte buffer, and dataset initialization completes synchronously
+before the dataset can be shared. Rust unsafe code remains denied everywhere
+else in the application.
 
 At runtime the GUI refreshes only the operating system's RAM counters every ten
 seconds and immediately before Start. The isolated/headless engine checks the

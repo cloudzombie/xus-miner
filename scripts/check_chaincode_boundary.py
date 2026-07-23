@@ -33,6 +33,8 @@ if "patch" in manifest_data or "replace" in manifest_data:
     fail("Cargo source overrides are not allowed")
 if (ROOT / "build.rs").exists() or "build" in manifest_data.get("package", {}):
     fail("repository build scripts are not allowed")
+if manifest_data.get("lints", {}).get("rust", {}).get("unsafe_code") != "deny":
+    fail("Rust unsafe code must remain denied by default")
 for cargo_config in (ROOT / ".cargo" / "config", ROOT / ".cargo" / "config.toml"):
     if cargo_config.exists():
         fail(f"Cargo source/runner configuration is not allowed: {cargo_config.name}")
@@ -108,6 +110,13 @@ for path in ROOT.rglob("*"):
     if path.is_symlink():
         fail(f"repository symlink is not allowed: {path.relative_to(ROOT)}")
 
+native_boundary = (ROOT / "src" / "randomx_native.rs").resolve()
+main_source = (ROOT / "src" / "main.rs").resolve()
+if not native_boundary.is_file():
+    fail("the isolated RandomX native ownership module is missing")
+if "#![deny(unsafe_code)]" not in main_source.read_text(encoding="utf-8"):
+    fail("the application crate does not deny unsafe code by default")
+
 for source in [ROOT / "src", ROOT / "tests", ROOT / "scripts"]:
     for path in source.rglob("*"):
         if not path.is_file() or path == Path(__file__).resolve():
@@ -119,6 +128,16 @@ for source in [ROOT / "src", ROOT / "tests", ROOT / "scripts"]:
             r"\b(?:include|include_str|include_bytes)!\s*\(", text
         ):
             fail(f"compile-time file inclusion is not allowed: {path.relative_to(ROOT)}")
+        if path.suffix == ".rs" and path.resolve() != native_boundary and re.search(
+            r"\bunsafe\s+(?:extern|impl|fn|trait)\b|\bunsafe\s*\{", text
+        ):
+            fail(f"unsafe Rust escaped the RandomX native boundary: {path.relative_to(ROOT)}")
+        if (
+            path.suffix == ".rs"
+            and "#[allow(unsafe_code)]" in text
+            and path.resolve() != main_source
+        ):
+            fail(f"unexpected unsafe-code allowance: {path.relative_to(ROOT)}")
 
 ruby = shutil.which("ruby")
 if ruby is None:

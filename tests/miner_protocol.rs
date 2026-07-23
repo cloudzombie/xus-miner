@@ -184,6 +184,16 @@ fn external_process_logs_in_hashes_and_submits_a_valid_share() {
         event_names,
         ["startup", "connecting", "pool_connected", "job"]
     );
+    let worker_ready = loop {
+        let event = telemetry_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("SHA-256d worker readiness telemetry");
+        if event["event"] == "worker_ready" {
+            break event;
+        }
+    };
+    assert_eq!(worker_ready["worker"], json!(0));
+    assert_eq!(worker_ready["mode"], json!("sha256d"));
     // Until the pool answers, the one-worker client must not queue a second
     // share. This is the backpressure that prevents stale-share floods.
     reader

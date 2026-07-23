@@ -7,8 +7,9 @@ node database, wallet file, seed phrase, or private key.
 
 There is no SOV source dependency. `Cargo.toml` contains no SOV Git package,
 local path, workspace member, submodule, or symlink. Client-side sealing uses
-the locked upstream `randomx-rs` and `sha2` crates; block-template identity uses
-locked `blake3`; and the minimal read-only header wire structure uses `borsh`.
+the locked upstream `randomx-rs` native library through the miner's isolated
+allocation-checked adapter, plus `sha2`; block-template identity uses locked
+`blake3`; and the minimal read-only header wire structure uses `borsh`.
 
 The repository carries fixed templates and expected identifiers captured from a
 real SOV node. They prove the independent wire implementation remains compatible
@@ -19,7 +20,7 @@ separate, explicitly authorized SOV task.
 
 ## Direct-node JSON-RPC contract
 
-The XUS Miner 0.1.1 compatibility baseline is the current SOV
+XUS Miner 0.1.2 retains the 0.1.1 compatibility baseline for the current SOV
 `release/v0.1.99` branch at
 `752b75bb9dcfa6392136fae3faad1ec515719c2a`. At validation time that SOV branch
 had not yet been published as an immutable `v0.1.99` tag. Its mining RPC and

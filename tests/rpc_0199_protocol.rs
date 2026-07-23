@@ -18,6 +18,8 @@ const VERSION_BITS: u32 = 0b11;
 // Canonical compact form of 00_ff_ff_00...00.
 const BITS: u32 = 0x2000_ffff;
 const POW_KEY: &str = "cb0272ff88e64c18cde0257f7fae1c8236b02651f10cc7a02456fd682ee2e72d";
+const PROCESS_LOG_TAIL_BYTES: usize = 64 * 1024;
+const TELEMETRY_QUEUE_CAPACITY: usize = 256;
 
 #[derive(BorshSerialize)]
 struct BlockHeaderFixture {
@@ -90,6 +92,12 @@ impl TemplateFixture {
             response,
         }
     }
+
+    fn sov_0_1_99_randomx() -> Self {
+        let mut fixture = Self::sov_0_1_99();
+        fixture.response["powAlgo"] = json!("RandomX");
+        fixture
+    }
 }
 
 #[derive(Debug)]
@@ -158,6 +166,122 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+fn append_bounded_log_tail(tail: &mut String, line: &str) {
+    tail.push_str(line);
+    tail.push('\n');
+    if tail.len() > PROCESS_LOG_TAIL_BYTES {
+        let mut start = tail.len() - PROCESS_LOG_TAIL_BYTES;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail.drain(..start);
+    }
+}
+
+fn process_log_tails(stdout_tail: &Arc<Mutex<String>>, stderr_tail: &Arc<Mutex<String>>) -> String {
+    let stdout = stdout_tail
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let stderr = stderr_tail
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    format!(
+        "miner stdout tail:\n{}\nminer stderr tail:\n{}",
+        if stdout.is_empty() {
+            "<empty>"
+        } else {
+            &stdout
+        },
+        if stderr.is_empty() {
+            "<empty>"
+        } else {
+            &stderr
+        }
+    )
+}
+
+fn observe_randomx_telemetry(
+    line: &str,
+    fast_shared_ready: &mut [bool; 2],
+    saw_positive_hashrate: &mut bool,
+) -> Result<(), String> {
+    let Ok(event) = serde_json::from_str::<Value>(line) else {
+        return Ok(());
+    };
+    match event.get("event").and_then(Value::as_str) {
+        Some("worker_ready") => {
+            let worker = event["worker"].as_u64().ok_or_else(|| {
+                format!("RandomX worker_ready telemetry omitted a numeric worker: {event}")
+            })?;
+            if worker >= fast_shared_ready.len() as u64 {
+                return Err(format!(
+                    "RandomX worker_ready telemetry reported unexpected worker {worker}"
+                ));
+            }
+            if event["mode"].as_str() != Some("fast-shared") {
+                return Err(format!(
+                    "RandomX worker {worker} reported mode={} instead of mode=\"fast-shared\"",
+                    event["mode"]
+                ));
+            }
+            fast_shared_ready[worker as usize] = true;
+        }
+        Some("metrics") if event["hashrate"].as_f64().is_some_and(|rate| rate > 0.0) => {
+            *saw_positive_hashrate = true;
+        }
+        Some("worker_error") => {
+            return Err(format!(
+                "RandomX worker {} reported an engine error: {}",
+                event["worker"], event["message"]
+            ));
+        }
+        Some("session_error") => {
+            return Err(format!(
+                "two-worker RandomX RPC session failed: {}",
+                event["message"]
+            ));
+        }
+        Some("engine_fatal") => {
+            return Err(format!(
+                "two-worker RandomX engine reported a fatal error: {}",
+                event["message"]
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn receive_randomx_telemetry(
+    telemetry_rx: &mpsc::Receiver<String>,
+    timeout: Duration,
+    fast_shared_ready: &mut [bool; 2],
+    saw_positive_hashrate: &mut bool,
+) -> Result<(), String> {
+    let first = match telemetry_rx.recv_timeout(timeout) {
+        Ok(line) => line,
+        Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("two-worker RandomX telemetry stream disconnected".into());
+        }
+    };
+    observe_randomx_telemetry(&first, fast_shared_ready, saw_positive_hashrate)?;
+    for _ in 0..TELEMETRY_QUEUE_CAPACITY {
+        match telemetry_rx.try_recv() {
+            Ok(line) => {
+                observe_randomx_telemetry(&line, fast_shared_ready, saw_positive_hashrate)?;
+            }
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err("two-worker RandomX telemetry stream disconnected".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sha256d(input: &[u8]) -> [u8; 32] {
@@ -321,6 +445,8 @@ fn handle_rpc_connection(
             }
         }),
         "sov_submitBlock" => {
+            let is_sha_fixture =
+                fixture.response.get("powAlgo").and_then(Value::as_str) == Some("Sha256d");
             let template_matches = params.get("templateId").and_then(Value::as_str)
                 == Some(fixture.template_id.as_str());
             let timestamp_matches =
@@ -335,7 +461,7 @@ fn handle_rpc_connection(
                     hex::encode(blake3::hash(&sealed_blob).as_bytes()),
                 )
             });
-            if template_matches && timestamp_matches && seal_matches {
+            if is_sha_fixture && template_matches && timestamp_matches && seal_matches {
                 json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -530,4 +656,223 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
         sha256d(&sealed_blob) <= fixture.target,
         "submitted nonce must meet the full big-endian SOV target"
     );
+}
+
+#[test]
+#[ignore = "long soak for RandomX worker startup and engine stability"]
+fn headless_randomx_direct_rpc_engine_stays_alive_for_short_window() {
+    let fixture = TemplateFixture::sov_0_1_99_randomx();
+    // Keep the event receiver alive: the mock deliberately refuses to answer
+    // after its observer disconnects.
+    let (mock_node, request_rx) = MockNode::start(fixture.clone());
+    let endpoint = format!("rpc://{}", mock_node.address);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xus-miner"))
+        .args([
+            "--headless",
+            "--json-events",
+            "--pool",
+            &endpoint,
+            "--user",
+            COINBASE,
+            "--workers",
+            "2",
+            "--reconnect-secs",
+            "1",
+            "--report-secs",
+            "1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn headless xus-miner");
+
+    let stdout = child.stdout.take().expect("miner telemetry stdout");
+    let (telemetry_tx, telemetry_rx) = mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
+    let telemetry_overflowed = Arc::new(AtomicBool::new(false));
+    let overflow_sink = Arc::clone(&telemetry_overflowed);
+    let stdout_tail = Arc::new(Mutex::new(String::new()));
+    let stdout_sink = Arc::clone(&stdout_tail);
+    let stdout_reader = thread::spawn(move || {
+        for result in BufReader::new(stdout).lines() {
+            match result {
+                Ok(line) => {
+                    append_bounded_log_tail(
+                        &mut stdout_sink.lock().expect("stdout tail lock"),
+                        &line,
+                    );
+                    match telemetry_tx.try_send(line) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(_)) => {
+                            overflow_sink.store(true, Ordering::Release);
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    }
+                }
+                Err(error) => {
+                    append_bounded_log_tail(
+                        &mut stdout_sink.lock().expect("stdout tail lock"),
+                        &format!("failed to read miner stdout: {error}"),
+                    );
+                    break;
+                }
+            }
+        }
+    });
+
+    let stderr = child.stderr.take().expect("miner diagnostic stderr");
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    let stderr_sink = Arc::clone(&stderr_tail);
+    let stderr_reader = thread::spawn(move || {
+        for result in BufReader::new(stderr).lines() {
+            match result {
+                Ok(line) => append_bounded_log_tail(
+                    &mut stderr_sink.lock().expect("stderr tail lock"),
+                    &line,
+                ),
+                Err(error) => {
+                    append_bounded_log_tail(
+                        &mut stderr_sink.lock().expect("stderr tail lock"),
+                        &format!("failed to read miner stderr: {error}"),
+                    );
+                    break;
+                }
+            }
+        }
+    });
+    let mut child = ChildGuard(child);
+
+    let mut fast_shared_ready = [false; 2];
+    let mut saw_positive_hashrate = false;
+    let mut failure = None;
+    let startup_deadline = Instant::now() + Duration::from_secs(240);
+    while Instant::now() < startup_deadline
+        && !(fast_shared_ready.iter().all(|value| *value) && saw_positive_hashrate)
+    {
+        if telemetry_overflowed.load(Ordering::Acquire) {
+            failure = Some(format!(
+                "two-worker RandomX telemetry exceeded the bounded queue capacity of \
+                 {TELEMETRY_QUEUE_CAPACITY}"
+            ));
+            break;
+        }
+        match child.0.try_wait() {
+            Ok(Some(status)) => {
+                failure = Some(format!(
+                    "two-worker RandomX child exited during startup: {status}"
+                ));
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                failure = Some(format!(
+                    "failed to poll two-worker RandomX child during startup: {error}"
+                ));
+                break;
+            }
+        }
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if let Err(error) = receive_randomx_telemetry(
+            &telemetry_rx,
+            remaining.min(Duration::from_millis(500)),
+            &mut fast_shared_ready,
+            &mut saw_positive_hashrate,
+        ) {
+            failure = Some(error);
+            break;
+        }
+    }
+    if failure.is_none() && !fast_shared_ready.iter().all(|value| *value) {
+        failure =
+            Some("both RandomX workers must explicitly report mode=\"fast-shared\"".to_owned());
+    }
+    if failure.is_none() && !saw_positive_hashrate {
+        failure = Some("two-worker RandomX engine never reported positive hashrate".to_owned());
+    }
+
+    let mut saw_stability_hashrate = false;
+    if failure.is_none() {
+        // Clear any startup telemetry before requiring a fresh stability sample.
+        if let Err(error) = receive_randomx_telemetry(
+            &telemetry_rx,
+            Duration::ZERO,
+            &mut fast_shared_ready,
+            &mut saw_positive_hashrate,
+        ) {
+            failure = Some(error);
+        }
+    }
+    if failure.is_none() {
+        let stability_deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < stability_deadline {
+            if telemetry_overflowed.load(Ordering::Acquire) {
+                failure = Some(format!(
+                    "two-worker RandomX telemetry exceeded the bounded queue capacity of \
+                     {TELEMETRY_QUEUE_CAPACITY} during the stability window"
+                ));
+                break;
+            }
+            match child.0.try_wait() {
+                Ok(Some(status)) => {
+                    failure = Some(format!(
+                        "two-worker RandomX child terminated during stability window: {status}"
+                    ));
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failure = Some(format!(
+                        "failed to poll two-worker RandomX child during stability window: {error}"
+                    ));
+                    break;
+                }
+            }
+            let remaining = stability_deadline.saturating_duration_since(Instant::now());
+            if let Err(error) = receive_randomx_telemetry(
+                &telemetry_rx,
+                remaining.min(Duration::from_millis(250)),
+                &mut fast_shared_ready,
+                &mut saw_stability_hashrate,
+            ) {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+
+    let _ = child.0.kill();
+    if let Err(error) = child.0.wait() {
+        failure.get_or_insert_with(|| format!("failed to reap two-worker RandomX child: {error}"));
+    }
+    if stdout_reader.join().is_err() {
+        failure.get_or_insert_with(|| "miner stdout reader thread panicked".to_owned());
+    }
+    if stderr_reader.join().is_err() {
+        failure.get_or_insert_with(|| "miner stderr reader thread panicked".to_owned());
+    }
+    drop(request_rx);
+
+    for line in telemetry_rx.try_iter() {
+        if let Err(error) =
+            observe_randomx_telemetry(&line, &mut fast_shared_ready, &mut saw_stability_hashrate)
+        {
+            failure.get_or_insert(error);
+        }
+    }
+    if telemetry_overflowed.load(Ordering::Acquire) {
+        failure.get_or_insert_with(|| {
+            format!(
+                "two-worker RandomX telemetry exceeded the bounded queue capacity of \
+                 {TELEMETRY_QUEUE_CAPACITY}"
+            )
+        });
+    }
+    if failure.is_none() && !saw_stability_hashrate {
+        failure =
+            Some("two-worker RandomX engine reported no positive hashrate during stability".into());
+    }
+    if let Some(error) = failure {
+        panic!("{error}\n{}", process_log_tails(&stdout_tail, &stderr_tail));
+    }
 }
