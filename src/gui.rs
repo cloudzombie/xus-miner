@@ -2,23 +2,23 @@
 use crate::gib_to_bytes;
 use crate::{
     memory_headroom_bytes, randomx_memory_bytes, BYTES_PER_GIB, MIN_MEMORY_HEADROOM_GIB,
-    RANDOMX_GIB_PER_WORKER,
+    RANDOMX_DATASET_GIB, RANDOMX_WORKER_MIB,
 };
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke,
     Vec2,
 };
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Child, Command, Stdio};
+use std::process::{self, Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{MemoryRefreshKind, System};
@@ -27,9 +27,18 @@ const WINDOW_TITLE: &str = "XUS Miner";
 const DEFAULT_POOL: &str = "127.0.0.1:3333";
 const DEFAULT_USER: &str = "xus-miner";
 const MAX_LOG_LINES: usize = 500;
+const MAX_CHILD_LINE_BYTES: usize = 8 * 1024;
+const MAX_STORED_LOG_BYTES: usize = 8 * 1024;
+const CHILD_OUTPUT_QUEUE_CAPACITY: usize = 256;
+const MAX_PROCESS_MESSAGES_PER_FRAME: usize = 64;
+const OUTPUT_DISCONNECT_GRACE: Duration = Duration::from_millis(500);
+const OBSERVATION_FAILURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const MAX_CRASH_REPORT_BYTES: usize = 128 * 1024;
+const MAX_CRASH_REPORT_LOG_LINES: usize = 100;
 const MAX_METER_SAMPLES: usize = 180;
 const SETTINGS_DIRECTORY: &str = ".xus-miner";
 const SETTINGS_FILE: &str = "gui-settings.json";
+const CRASH_REPORT_PREFIX: &str = "crash-report";
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 const MEMORY_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const BLOCK_FOUND_HIGHLIGHT: Duration = Duration::from_secs(30);
@@ -38,6 +47,7 @@ const WAITING_FOR_WORK: &str = "Waiting for work";
 const ACTIVITY_CELL_SUMMARY: &str =
     "Each cell is one telemetry time slice—not an incoming job or an individual hash. Up to 48 cells summarize recent telemetry history.";
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CRASH_REPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const BG: Color32 = Color32::from_rgb(9, 11, 18);
 const PANEL: Color32 = Color32::from_rgb(15, 18, 29);
@@ -163,7 +173,7 @@ impl Settings {
     fn persisted_json(&self) -> Value {
         json!({
             "reward_route": self.reward_route.persisted(),
-            "pool": self.pool.trim(),
+            "pool": sanitize_endpoint(self.pool.trim()),
             "user": self.user.trim(),
             "workers": self.workers,
             "reconnect_secs": self.reconnect_secs,
@@ -202,6 +212,12 @@ fn validate_pool(raw: &str) -> Result<(), String> {
         .unwrap_or(raw.trim());
     if address.is_empty() || address.chars().any(char::is_whitespace) {
         return Err("Endpoint must be a host and port, such as 192.168.0.244:8645.".into());
+    }
+    if address.contains('@') {
+        return Err(
+            "Endpoint credentials are not allowed. Enter only the host and port; use the separate password field."
+                .into(),
+        );
     }
     let (host, port) = address
         .rsplit_once(':')
@@ -501,9 +517,296 @@ fn recover_windows_settings(path: &Path) -> Result<(), String> {
     }
 }
 
+const TRUNCATED_LINE_SUFFIX: &str = " … [line truncated at 8 KiB]";
+const TRUNCATED_REPORT_SUFFIX: &str = "\n[crash report truncated]\n";
+
+fn bounded_text(raw: &str, max_bytes: usize, suffix: &str, force_suffix: bool) -> String {
+    if !force_suffix && raw.len() <= max_bytes {
+        return raw.to_owned();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if suffix.len() >= max_bytes {
+        let mut keep = max_bytes.min(suffix.len());
+        while !suffix.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        return suffix[..keep].to_owned();
+    }
+
+    let mut keep = max_bytes - suffix.len();
+    keep = keep.min(raw.len());
+    while !raw.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut bounded = String::with_capacity(max_bytes);
+    bounded.push_str(&raw[..keep]);
+    bounded.push_str(suffix);
+    bounded
+}
+
+/// Reads one logical child-process line without ever retaining more than 8 KiB.
+///
+/// Oversized input is drained through the terminating newline so the following
+/// JSON/log event starts at a clean boundary.
+fn read_bounded_child_line<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut captured = Vec::with_capacity(MAX_CHILD_LINE_BYTES);
+    let mut saw_bytes = false;
+    let mut truncated = false;
+    let mut reached_line_end = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        saw_bytes = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let remaining = MAX_CHILD_LINE_BYTES.saturating_sub(captured.len());
+        let retained = content_len.min(remaining);
+        captured.extend_from_slice(&available[..retained]);
+        truncated |= retained < content_len;
+
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            reached_line_end = true;
+            break;
+        }
+    }
+
+    if !saw_bytes {
+        return Ok(None);
+    }
+    if reached_line_end && !truncated && captured.last() == Some(&b'\r') {
+        captured.pop();
+    }
+    let decoded = String::from_utf8_lossy(&captured);
+    Ok(Some(bounded_text(
+        &decoded,
+        MAX_CHILD_LINE_BYTES,
+        TRUNCATED_LINE_SUFFIX,
+        truncated || decoded.len() > MAX_CHILD_LINE_BYTES,
+    )))
+}
+
+#[cfg(windows)]
+fn windows_ntstatus_description(code: u32) -> Option<&'static str> {
+    match code {
+        0xC000_0005 => Some("access violation (native memory fault)"),
+        0xC000_0017 => Some("not enough virtual memory"),
+        0xC000_001D => Some("illegal CPU instruction"),
+        0xC000_00FD => Some("stack overflow"),
+        0xC000_0135 => Some("required DLL was not found"),
+        0xC000_0374 => Some("heap corruption"),
+        0xC000_0409 => Some("fail-fast termination or stack buffer overrun"),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn describe_exit_status(status: &ExitStatus) -> String {
+    match status.code() {
+        Some(code) => {
+            let raw = code as u32;
+            windows_ntstatus_description(raw).map_or_else(
+                || format!("Windows exit code {code} (0x{raw:08X})"),
+                |meaning| format!("Windows exception 0x{raw:08X}: {meaning}"),
+            )
+        }
+        None => "Windows terminated the engine without an exit code".into(),
+    }
+}
+
+#[cfg(unix)]
+fn describe_exit_status(status: &ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(signal) = status.signal() {
+        return format!("signal {signal}");
+    }
+    status
+        .code()
+        .map_or_else(|| status.to_string(), |code| format!("exit code {code}"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn describe_exit_status(status: &ExitStatus) -> String {
+    status
+        .code()
+        .map_or_else(|| status.to_string(), |code| format!("exit code {code}"))
+}
+
+#[cfg(unix)]
+fn exit_status_matches_requested_stop(status: &ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    // `Child::kill` is SIGKILL on Unix. Checking the reaped status closes the
+    // race where kill succeeds for a child that already exited as a zombie.
+    status.signal() == Some(9)
+}
+
+#[cfg(windows)]
+fn exit_status_matches_requested_stop(status: &ExitStatus) -> bool {
+    // The standard library's Windows `Child::kill` uses TerminateProcess with
+    // exit code 1. TerminateProcess fails for an already-terminated process,
+    // so a successful kill plus this status identifies the requested stop.
+    status.code().is_some_and(|code| code as u32 == 1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn exit_status_matches_requested_stop(_status: &ExitStatus) -> bool {
+    false
+}
+
+/// Attempts termination and only performs a blocking reap after termination is
+/// confirmed. If termination fails, a single non-blocking observation can
+/// still prove that the child already exited; otherwise waiting is deliberately
+/// skipped so GUI cleanup cannot hang on a process that may remain live.
+fn terminate_and_reap_child(child: &mut Child) -> Result<ExitStatus, String> {
+    match child.kill() {
+        Ok(()) => child
+            .wait()
+            .map_err(|error| format!("termination succeeded but reaping failed: {error}")),
+        Err(kill_error) => match child.try_wait() {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => Err(format!(
+                "termination failed: {kill_error}; child still appears live, so blocking reap was skipped"
+            )),
+            Err(observe_error) => Err(format!(
+                "termination failed: {kill_error}; exit could not be verified: {observe_error}; blocking reap was skipped"
+            )),
+        },
+    }
+}
+
+fn sanitize_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some((scheme, remainder)) = trimmed.split_once("://") {
+        let authority_end = remainder.find('/').unwrap_or(remainder.len());
+        let (authority, tail) = remainder.split_at(authority_end);
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        return format!("{scheme}://{host}{tail}");
+    }
+    trimmed
+        .rsplit_once('@')
+        .map_or_else(|| trimmed.to_owned(), |(_, host)| host.to_owned())
+}
+
+fn endpoint_userinfo(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let remainder = trimmed
+        .split_once("://")
+        .map_or(trimmed, |(_, remainder)| remainder);
+    let authority_end = remainder.find('/').unwrap_or(remainder.len());
+    remainder[..authority_end]
+        .rsplit_once('@')
+        .map(|(userinfo, _)| userinfo)
+        .filter(|userinfo| !userinfo.is_empty())
+}
+
+fn redact_secret(raw: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        raw.to_owned()
+    } else {
+        let replacement = if "[REDACTED]".contains(secret) {
+            ""
+        } else {
+            "[REDACTED]"
+        };
+        if secret.chars().count() > 2 {
+            return raw.replace(secret, replacement);
+        }
+
+        // Very short credentials (including the conventional Stratum "x")
+        // must still be removed when reflected as a token, without erasing the
+        // same character from ordinary words such as "exit" or "xus-miner".
+        let mut redacted = String::with_capacity(raw.len());
+        let mut copied_until = 0;
+        for (start, _) in raw.match_indices(secret) {
+            let end = start + secret.len();
+            let before_is_word = raw[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+            let after_is_word = raw[end..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+            if before_is_word || after_is_word {
+                continue;
+            }
+            redacted.push_str(&raw[copied_until..start]);
+            redacted.push_str(replacement);
+            copied_until = end;
+        }
+        redacted.push_str(&raw[copied_until..]);
+        redacted
+    }
+}
+
+fn write_crash_report_at(directory: &Path, report: &str) -> Result<PathBuf, String> {
+    ensure_settings_directory(directory)?;
+    let report = bounded_text(
+        report,
+        MAX_CRASH_REPORT_BYTES,
+        TRUNCATED_REPORT_SUFFIX,
+        report.len() > MAX_CRASH_REPORT_BYTES,
+    );
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..32_u64 {
+        let sequence = CRASH_REPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            "{CRASH_REPORT_PREFIX}-{timestamp}-{}-{sequence}-{attempt}.log",
+            process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                let metadata = file
+                    .metadata()
+                    .map_err(|error| format!("cannot inspect crash report: {error}"))?;
+                if metadata_is_link(&metadata) || !metadata.is_file() {
+                    return Err("created crash report is not a regular file".into());
+                }
+                verify_settings_directory(directory)?;
+                file.write_all(report.as_bytes())
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| format!("cannot write crash report: {error}"))?;
+                #[cfg(unix)]
+                File::open(directory)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|error| format!("cannot sync crash report directory: {error}"))?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("cannot create crash report: {error}")),
+        }
+    }
+    Err("cannot create a unique crash report".into())
+}
+
+#[derive(Debug)]
 enum ProcessMessage {
     Telemetry(Value),
     Log(String),
+}
+
+struct PendingObservationFailure {
+    report_detail: String,
+    drain_deadline: Instant,
 }
 
 struct LogLine {
@@ -531,7 +834,12 @@ struct MinerApp {
     settings: Settings,
     phase: Phase,
     child: Option<Child>,
+    quarantined_child: Option<Child>,
+    pending_exit: Option<ExitStatus>,
+    pending_observation_failure: Option<PendingObservationFailure>,
     receiver: Option<Receiver<ProcessMessage>>,
+    reader_threads: Vec<thread::JoinHandle<()>>,
+    output_disconnected_at: Option<Instant>,
     requested_stop: bool,
     started_at: Option<Instant>,
     hashrate: f64,
@@ -561,11 +869,16 @@ struct MinerApp {
     meter_history: VecDeque<MeterSample>,
     last_metrics_at: Option<Instant>,
     ready_workers: u64,
+    ready_worker_ids: BTreeSet<u64>,
+    worker_errors: BTreeMap<u64, String>,
+    worker_error_can_restore_mining: bool,
+    engine_fatal_seen: bool,
     reveal_password: bool,
     memory_acknowledged: bool,
     memory_system: System,
     memory_snapshot: Option<MemorySnapshot>,
     last_memory_refresh: Option<Instant>,
+    node_link_live: bool,
 }
 
 impl Default for MinerApp {
@@ -576,7 +889,12 @@ impl Default for MinerApp {
             settings: load_settings(),
             phase: Phase::Idle,
             child: None,
+            quarantined_child: None,
+            pending_exit: None,
+            pending_observation_failure: None,
             receiver: None,
+            reader_threads: Vec::new(),
+            output_disconnected_at: None,
             requested_stop: false,
             started_at: None,
             hashrate: 0.0,
@@ -606,11 +924,16 @@ impl Default for MinerApp {
             meter_history: VecDeque::new(),
             last_metrics_at: None,
             ready_workers: 0,
+            ready_worker_ids: BTreeSet::new(),
+            worker_errors: BTreeMap::new(),
+            worker_error_can_restore_mining: false,
+            engine_fatal_seen: false,
             reveal_password: false,
             memory_acknowledged: false,
             memory_system,
             memory_snapshot,
             last_memory_refresh: Some(Instant::now()),
+            node_link_live: false,
         }
     }
 }
@@ -618,6 +941,9 @@ impl Default for MinerApp {
 impl MinerApp {
     fn is_running(&self) -> bool {
         self.child.is_some()
+            || self.quarantined_child.is_some()
+            || self.pending_exit.is_some()
+            || self.pending_observation_failure.is_some()
     }
 
     fn refresh_memory_now(&mut self) {
@@ -636,23 +962,24 @@ impl MinerApp {
 
     fn memory_preflight_error(&self) -> Option<String> {
         let workers = self.settings.workers;
-        let dataset_gib = workers as f64 * RANDOMX_GIB_PER_WORKER;
+        let randomx_estimate = randomx_memory_bytes(workers);
         match self.memory_snapshot {
             Some(snapshot)
                 if snapshot.available
-                    < randomx_memory_bytes(workers) + memory_headroom_bytes(snapshot.total) =>
+                    < randomx_estimate + memory_headroom_bytes(snapshot.total) =>
             {
                 Some(format!(
-                    "Start blocked: {workers} RandomX worker{} may need ≈{dataset_gib:.1} GiB, plus {} of system headroom, but the live scan reports only {} available.",
-                    if workers == 1 { "" } else { "s" },
+                    "Start blocked: RandomX may need about {} total (one shared {RANDOMX_DATASET_GIB:.1} GiB dataset + {RANDOMX_WORKER_MIB:.0} MiB per worker), plus {} of system headroom, but the live scan reports only {} available for {workers} worker{}.",
+                    format_memory(randomx_estimate),
                     format_memory(memory_headroom_bytes(snapshot.total)),
                     format_memory(snapshot.available),
+                    if workers == 1 { "" } else { "s" },
                 ))
             }
             Some(_) => None,
             None if !self.memory_acknowledged => Some(format!(
-                "The operating-system memory scan is unavailable. Confirm at least {:.1} GiB is available before starting {workers} RandomX worker{}.",
-                dataset_gib + MIN_MEMORY_HEADROOM_GIB,
+                "The operating-system memory scan is unavailable. Confirm at least {:.1} GiB is available before starting {workers} RandomX worker{} (one shared dataset, not one dataset per worker).",
+                randomx_estimate as f64 / BYTES_PER_GIB + MIN_MEMORY_HEADROOM_GIB,
                 if workers == 1 { "" } else { "s" },
             )),
             None => None,
@@ -708,6 +1035,13 @@ impl MinerApp {
         self.meter_history.clear();
         self.last_metrics_at = None;
         self.ready_workers = 0;
+        self.ready_worker_ids.clear();
+        self.worker_errors.clear();
+        self.worker_error_can_restore_mining = false;
+        self.engine_fatal_seen = false;
+        self.output_disconnected_at = None;
+        self.pending_observation_failure = None;
+        self.node_link_live = false;
     }
 
     fn clear_active_work(&mut self) {
@@ -723,8 +1057,74 @@ impl MinerApp {
         self.height_started_at = None;
     }
 
+    fn mark_worker_unready(&mut self, worker: u64) {
+        self.ready_worker_ids.remove(&worker);
+        self.ready_workers = self.ready_worker_ids.len() as u64;
+    }
+
+    fn mark_worker_ready(&mut self, worker: u64) -> bool {
+        if worker >= self.settings.workers || self.engine_fatal_seen {
+            return false;
+        }
+        let newly_ready = self.ready_worker_ids.insert(worker);
+        self.ready_workers = self.ready_worker_ids.len() as u64;
+        let recovered = self.worker_errors.remove(&worker).is_some();
+        if recovered
+            && self.worker_error_can_restore_mining
+            && !self.engine_fatal_seen
+            && matches!(self.phase, Phase::Error)
+        {
+            if let Some((failed_worker, message)) = self.worker_errors.iter().next() {
+                self.last_error = format!("Worker {} error: {message}", failed_worker + 1);
+            } else {
+                self.phase = Phase::Mining;
+                self.last_error.clear();
+            }
+        }
+        if self.worker_errors.is_empty() {
+            self.worker_error_can_restore_mining = false;
+        }
+        newly_ready || recovered
+    }
+
+    fn enter_mining_phase(&mut self) {
+        if self.engine_fatal_seen {
+            self.phase = Phase::Error;
+            self.worker_error_can_restore_mining = false;
+        } else if let Some((worker, message)) = self.worker_errors.iter().next() {
+            self.phase = Phase::Error;
+            self.worker_error_can_restore_mining = true;
+            self.last_error = format!("Worker {} error: {message}", worker + 1);
+        } else {
+            self.phase = Phase::Mining;
+            self.worker_error_can_restore_mining = false;
+        }
+    }
+
+    fn enter_connection_phase(&mut self, phase: Phase) {
+        if self.engine_fatal_seen {
+            self.phase = Phase::Error;
+        } else if let Some((worker, message)) = self.worker_errors.iter().next() {
+            self.phase = Phase::Error;
+            self.last_error = format!("Worker {} error: {message}", worker + 1);
+        } else {
+            self.phase = phase;
+        }
+        self.worker_error_can_restore_mining = false;
+    }
+
+    fn redact_sensitive_text(&self, raw: &str) -> String {
+        let redacted = redact_secret(raw, &self.settings.password);
+        if let Some(userinfo) = endpoint_userinfo(&self.settings.pool) {
+            redact_secret(&redacted, userinfo)
+        } else {
+            redacted
+        }
+    }
+
     fn push_log(&mut self, text: impl Into<String>, error: bool) {
-        let text = text.into();
+        let text = self.redact_sensitive_text(&text.into());
+        let text = bounded_text(&text, MAX_STORED_LOG_BYTES, TRUNCATED_LINE_SUFFIX, false);
         if text.trim().is_empty() {
             return;
         }
@@ -817,24 +1217,29 @@ impl MinerApp {
 
         if let Some(mut stdin) = child.stdin.take() {
             if let Err(error) = stdin.write_all(self.settings.password.as_bytes()) {
-                let _ = child.kill();
-                let _ = child.wait();
                 self.phase = Phase::Error;
                 self.last_error = format!("Cannot pass credentials to mining engine: {error}");
+                if let Err(cleanup_error) = terminate_and_reap_child(&mut child) {
+                    self.last_error
+                        .push_str(&format!(" Child cleanup failed: {cleanup_error}."));
+                }
                 self.push_log(self.last_error.clone(), true);
                 return;
             }
         }
 
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(CHILD_OUTPUT_QUEUE_CAPACITY);
+        let mut reader_threads = Vec::with_capacity(2);
+        let mut reader_start_errors = Vec::new();
         if let Some(stdout) = child.stdout.take() {
             let tx = sender.clone();
-            thread::Builder::new()
+            match thread::Builder::new()
                 .name("xus-gui-telemetry".into())
                 .spawn(move || {
-                    for line in BufReader::new(stdout).lines() {
-                        match line {
-                            Ok(line) => match serde_json::from_str::<Value>(&line) {
+                    let mut reader = BufReader::new(stdout);
+                    loop {
+                        match read_bounded_child_line(&mut reader) {
+                            Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
                                 Ok(value) => {
                                     if tx.send(ProcessMessage::Telemetry(value)).is_err() {
                                         break;
@@ -846,6 +1251,7 @@ impl MinerApp {
                                     }
                                 }
                             },
+                            Ok(None) => break,
                             Err(error) => {
                                 let _ = tx.send(ProcessMessage::Log(format!(
                                     "Telemetry channel failed: {error}"
@@ -854,98 +1260,390 @@ impl MinerApp {
                             }
                         }
                     }
-                })
-                .ok();
+                }) {
+                Ok(handle) => reader_threads.push(handle),
+                Err(error) => reader_start_errors
+                    .push(format!("Cannot start the telemetry reader thread: {error}")),
+            }
+        } else {
+            reader_start_errors.push("Mining engine stdout pipe is unavailable.".into());
         }
         if let Some(stderr) = child.stderr.take() {
-            thread::Builder::new()
+            let tx = sender.clone();
+            match thread::Builder::new()
                 .name("xus-gui-engine-log".into())
                 .spawn(move || {
-                    for line in BufReader::new(stderr).lines() {
-                        match line {
-                            Ok(line) => {
-                                if sender.send(ProcessMessage::Log(line)).is_err() {
+                    let mut reader = BufReader::new(stderr);
+                    loop {
+                        match read_bounded_child_line(&mut reader) {
+                            Ok(Some(line)) => {
+                                if tx.send(ProcessMessage::Log(line)).is_err() {
                                     break;
                                 }
                             }
-                            Err(_) => break,
+                            Ok(None) => break,
+                            Err(error) => {
+                                let _ = tx.send(ProcessMessage::Log(format!(
+                                    "Engine log channel failed: {error}"
+                                )));
+                                break;
+                            }
                         }
                     }
-                })
-                .ok();
+                }) {
+                Ok(handle) => reader_threads.push(handle),
+                Err(error) => reader_start_errors.push(format!(
+                    "Cannot start the engine-log reader thread: {error}"
+                )),
+            }
+        } else {
+            reader_start_errors.push("Mining engine stderr pipe is unavailable.".into());
+        }
+        drop(sender);
+
+        if !reader_start_errors.is_empty() {
+            let cleanup = terminate_and_reap_child(&mut child);
+            drop(receiver);
+            let reaped = cleanup.is_ok();
+            if let Err(error) = cleanup {
+                reader_start_errors.push(format!("Child cleanup failed: {error}."));
+            }
+            let mut detached_readers = 0_usize;
+            for handle in reader_threads {
+                if reaped || handle.is_finished() {
+                    if handle.join().is_err() {
+                        reader_start_errors
+                            .push("An output reader panicked during startup cleanup.".into());
+                    }
+                } else {
+                    detached_readers += 1;
+                }
+            }
+            if detached_readers > 0 {
+                reader_start_errors.push(format!(
+                    "{detached_readers} output reader(s) could not be joined without blocking."
+                ));
+            }
+            self.phase = Phase::Error;
+            self.last_error = reader_start_errors.join(" ");
+            self.push_log(self.last_error.clone(), true);
+            return;
         }
 
         self.receiver = Some(receiver);
+        self.reader_threads = reader_threads;
         self.child = Some(child);
     }
 
     fn stop(&mut self) {
         if self.child.is_none() {
+            if let Some(mut child) = self.quarantined_child.take() {
+                self.push_log("Retrying cleanup of the unobserved mining engine…", false);
+                match terminate_and_reap_child(&mut child) {
+                    Ok(status) => {
+                        self.push_log(
+                            format!(
+                                "Previously unobserved mining engine is now stopped ({}).",
+                                describe_exit_status(&status)
+                            ),
+                            false,
+                        );
+                    }
+                    Err(error) => {
+                        self.last_error =
+                            format!("Mining engine cleanup is still unconfirmed: {error}");
+                        self.push_log(self.last_error.clone(), true);
+                        self.quarantined_child = Some(child);
+                    }
+                }
+            }
             return;
         }
-        self.requested_stop = true;
+        let already_exited = match self.child.as_mut().expect("child checked above").try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                self.begin_observation_failure(
+                    "Cannot observe mining engine before stopping",
+                    error,
+                );
+                return;
+            }
+        };
+        if let Some(status) = already_exited {
+            self.child = None;
+            self.pending_exit = Some(status);
+            return;
+        }
+
+        self.worker_error_can_restore_mining = false;
+        self.node_link_live = false;
         self.phase = Phase::Stopping;
         self.push_log("Stopping mining engine and releasing worker memory…", false);
-        if let Err(error) = self.child.as_mut().expect("child checked above").kill() {
-            self.last_error = format!("Could not stop mining engine: {error}");
+        match self.child.as_mut().expect("child checked above").kill() {
+            Ok(()) => self.requested_stop = true,
+            Err(error) => {
+                self.engine_fatal_seen = true;
+                self.last_error = format!("Could not stop mining engine: {error}");
+                self.phase = Phase::Error;
+                self.push_log(self.last_error.clone(), true);
+            }
+        }
+    }
+
+    fn apply_process_message(&mut self, message: ProcessMessage) {
+        match message {
+            ProcessMessage::Telemetry(value) => self.apply_telemetry(&value),
+            ProcessMessage::Log(line) => {
+                // Structured `metrics` telemetry already drives the dashboard.
+                // Do not duplicate its two-second stderr summary into the event log.
+                if line.starts_with("height ") && line.contains(" | total ") {
+                    return;
+                }
+                let lower = line.to_ascii_lowercase();
+                let error = lower.contains("error:")
+                    || lower.contains("failed")
+                    || lower.contains("submission rejected")
+                    || lower.contains("share rejected #")
+                    || lower.contains("session ended");
+                self.push_log(line, error);
+            }
+        }
+    }
+
+    /// Processes a bounded amount of child output so a noisy engine cannot
+    /// monopolize a GUI frame. `true` means every sender has exited and the
+    /// bounded queue is empty.
+    fn drain_process_messages(&mut self) -> bool {
+        let Some(receiver) = self.receiver.take() else {
+            return true;
+        };
+        let mut disconnected = false;
+        for _ in 0..MAX_PROCESS_MESSAGES_PER_FRAME {
+            match receiver.try_recv() {
+                Ok(message) => self.apply_process_message(message),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        self.receiver = Some(receiver);
+        disconnected
+    }
+
+    fn join_reader_threads(&mut self) {
+        for handle in std::mem::take(&mut self.reader_threads) {
+            if handle.join().is_err() {
+                self.push_log("A mining-engine output reader stopped unexpectedly.", true);
+            }
+        }
+    }
+
+    fn join_finished_reader_threads(&mut self) -> usize {
+        let mut detached = 0_usize;
+        for handle in std::mem::take(&mut self.reader_threads) {
+            if handle.is_finished() {
+                if handle.join().is_err() {
+                    self.push_log("A mining-engine output reader stopped unexpectedly.", true);
+                }
+            } else {
+                // Dropping a JoinHandle detaches the exceptional reader. This
+                // path is only used after termination/reap failed and a bounded
+                // drain grace expired; joining could otherwise hang the GUI.
+                detached += 1;
+            }
+        }
+        detached
+    }
+
+    fn begin_observation_failure(&mut self, context: &str, error: io::Error) {
+        if self.pending_observation_failure.is_some() {
+            return;
+        }
+        self.engine_fatal_seen = true;
+        self.node_link_live = false;
+        self.requested_stop = false;
+        self.worker_error_can_restore_mining = false;
+        self.phase = Phase::Error;
+        self.last_error = format!("{context}: {error}");
+        self.push_log(self.last_error.clone(), true);
+
+        let cleanup_summary = match self.child.take() {
+            None => "child handle was already unavailable".to_owned(),
+            Some(mut child) => match terminate_and_reap_child(&mut child) {
+                Ok(status) => format!("child cleanup observed {}", describe_exit_status(&status)),
+                Err(cleanup_error) => {
+                    let summary = format!("child cleanup incomplete: {cleanup_error}");
+                    self.push_log(summary.clone(), true);
+                    // Dropping a live Child handle would make Start available
+                    // while the original memory-heavy engine may still exist.
+                    // Quarantine it until a later nonblocking observation or
+                    // explicit cleanup retry proves that it is gone.
+                    self.quarantined_child = Some(child);
+                    summary
+                }
+            },
+        };
+        self.pending_observation_failure = Some(PendingObservationFailure {
+            report_detail: format!("{}; {cleanup_summary}", self.last_error),
+            drain_deadline: Instant::now() + OBSERVATION_FAILURE_DRAIN_GRACE,
+        });
+    }
+
+    fn finish_observation_failure(&mut self, report_detail: &str) {
+        self.hashrate = 0.0;
+        self.smoothed_hashrate = 0.0;
+        self.last_metrics_at = None;
+        self.clear_active_work();
+        self.ready_worker_ids.clear();
+        self.ready_workers = 0;
+        self.output_disconnected_at = None;
+        self.node_link_live = false;
+        self.phase = Phase::Error;
+        match self.write_crash_report(report_detail) {
+            Ok(path) => self.push_log(
+                format!("Crash report saved securely to {}.", path.display()),
+                false,
+            ),
+            Err(error) => self.push_log(format!("Could not save crash report: {error}"), true),
+        }
+    }
+
+    fn finish_exited_child(&mut self, status: ExitStatus) {
+        self.worker_error_can_restore_mining = false;
+        self.hashrate = 0.0;
+        self.smoothed_hashrate = 0.0;
+        self.last_metrics_at = None;
+        self.clear_active_work();
+        self.ready_worker_ids.clear();
+        self.ready_workers = 0;
+        self.output_disconnected_at = None;
+        self.node_link_live = false;
+        if self.requested_stop
+            && !self.engine_fatal_seen
+            && exit_status_matches_requested_stop(&status)
+        {
+            self.phase = Phase::Idle;
+            self.push_log("Mining stopped.", false);
+        } else {
             self.phase = Phase::Error;
+            let detail = describe_exit_status(&status);
+            self.last_error = format!("Mining engine exited unexpectedly: {detail}.");
             self.push_log(self.last_error.clone(), true);
+            match self.write_crash_report(&detail) {
+                Ok(path) => self.push_log(
+                    format!("Crash report saved securely to {}.", path.display()),
+                    false,
+                ),
+                Err(error) => self.push_log(format!("Could not save crash report: {error}"), true),
+            }
         }
     }
 
     fn poll_process(&mut self, ctx: &egui::Context) {
-        let mut messages = Vec::new();
-        if let Some(receiver) = &self.receiver {
-            while let Ok(message) = receiver.try_recv() {
-                messages.push(message);
-            }
-        }
-        for message in messages {
-            match message {
-                ProcessMessage::Telemetry(value) => self.apply_telemetry(&value),
-                ProcessMessage::Log(line) => {
-                    // Structured `metrics` telemetry already drives the dashboard.
-                    // Do not duplicate its two-second stderr summary into the event log.
-                    if line.starts_with("height ") && line.contains(" | total ") {
-                        continue;
-                    }
-                    let lower = line.to_ascii_lowercase();
-                    let error = lower.contains("error:")
-                        || lower.contains("failed")
-                        || lower.contains("submission rejected")
-                        || lower.contains("share rejected #")
-                        || lower.contains("session ended");
-                    self.push_log(line, error);
+        let had_output_receiver = self.receiver.is_some();
+        let output_disconnected = self.drain_process_messages();
+
+        if self.pending_exit.is_none() && self.pending_observation_failure.is_none() {
+            let observation = self.child.as_mut().map(Child::try_wait);
+            match observation {
+                Some(Ok(Some(status))) => {
+                    self.child = None;
+                    self.node_link_live = false;
+                    self.pending_exit = Some(status);
                 }
+                Some(Err(error)) => {
+                    self.begin_observation_failure("Cannot observe mining engine", error);
+                }
+                Some(Ok(None)) | None => {}
             }
         }
 
-        let exit = self
-            .child
-            .as_mut()
-            .and_then(|child| match child.try_wait() {
-                Ok(status) => status,
-                Err(error) => {
-                    self.last_error = format!("Cannot observe mining engine: {error}");
-                    self.phase = Phase::Error;
-                    None
-                }
-            });
-        if let Some(status) = exit {
-            self.child = None;
-            self.receiver = None;
-            self.hashrate = 0.0;
-            self.smoothed_hashrate = 0.0;
-            self.last_metrics_at = None;
-            self.clear_active_work();
-            if self.requested_stop {
-                self.phase = Phase::Idle;
-                self.push_log("Mining stopped.", false);
+        let observation_drain_timed_out = self
+            .pending_observation_failure
+            .as_ref()
+            .is_some_and(|failure| Instant::now() >= failure.drain_deadline);
+        if self.pending_observation_failure.is_some()
+            && (output_disconnected || observation_drain_timed_out)
+        {
+            if output_disconnected {
+                self.join_reader_threads();
             } else {
-                self.phase = Phase::Error;
-                self.last_error = format!("Mining engine exited unexpectedly ({status}).");
-                self.push_log(self.last_error.clone(), true);
+                self.receiver = None;
+                let detached = self.join_finished_reader_threads();
+                self.push_log(
+                    format!(
+                        "Crash report output drain timed out; {detached} reader thread(s) were detached and the final tail may be incomplete."
+                    ),
+                    true,
+                );
             }
+            self.receiver = None;
+            let failure = self
+                .pending_observation_failure
+                .take()
+                .expect("observation failure checked above");
+            self.finish_observation_failure(&failure.report_detail);
+        }
+
+        let quarantined_exit = self
+            .quarantined_child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten());
+        if let Some(status) = quarantined_exit {
+            self.quarantined_child = None;
+            self.push_log(
+                format!(
+                    "Previously unobserved mining engine exit is now confirmed ({}); restart is safe.",
+                    describe_exit_status(&status)
+                ),
+                false,
+            );
+        }
+
+        // Once the process exits, the reader threads drain the pipe tail into
+        // the bounded channel. Only snapshot a crash report after all senders
+        // are gone and the queued tail has been processed.
+        if output_disconnected {
+            if let Some(status) = self.pending_exit.take() {
+                self.join_reader_threads();
+                self.receiver = None;
+                self.finish_exited_child(status);
+            }
+        }
+
+        // Either reader ending before the child is waitable is suspicious, but
+        // pipe EOF can lead process waitability by a few scheduler ticks. Give
+        // normal/requested exits a short grace window before failing closed.
+        let reader_ended = output_disconnected
+            || self
+                .reader_threads
+                .iter()
+                .any(thread::JoinHandle::is_finished);
+        if self.pending_exit.is_none() && self.child.is_some() && reader_ended {
+            let ended_at = self.output_disconnected_at.get_or_insert_with(Instant::now);
+            if ended_at.elapsed() >= OUTPUT_DISCONNECT_GRACE
+                && !self.requested_stop
+                && !self.engine_fatal_seen
+            {
+                self.engine_fatal_seen = true;
+                self.node_link_live = false;
+                self.worker_error_can_restore_mining = false;
+                self.phase = Phase::Error;
+                self.last_error =
+                    "A mining engine output reader ended while the engine was still running."
+                        .into();
+                self.push_log(self.last_error.clone(), true);
+                if let Err(error) = self.child.as_mut().expect("child checked above").kill() {
+                    self.push_log(
+                        format!("Could not stop the unobserved mining engine: {error}"),
+                        true,
+                    );
+                }
+            }
+        } else if had_output_receiver && !reader_ended {
+            self.output_disconnected_at = None;
         }
 
         if self.is_running() {
@@ -954,20 +1652,30 @@ impl MinerApp {
     }
 
     fn apply_telemetry(&mut self, value: &Value) {
-        match value.get("event").and_then(Value::as_str) {
+        let event = value.get("event").and_then(Value::as_str);
+        // Fatal is terminal for this child. Reader threads may still deliver
+        // telemetry that raced with the fatal event, but it must not repaint
+        // the stopped engine as healthy or repopulate cleared work.
+        if self.engine_fatal_seen || (self.requested_stop && event != Some("engine_fatal")) {
+            return;
+        }
+        match event {
             Some("startup") => {
-                self.phase = Phase::Connecting;
+                self.node_link_live = false;
+                self.enter_connection_phase(Phase::Connecting);
                 self.push_log("Mining engine online.", false);
             }
             Some("connecting") => {
-                self.phase = Phase::Connecting;
+                self.node_link_live = false;
+                self.enter_connection_phase(Phase::Connecting);
             }
             Some("pool_connected") => {
-                self.phase = Phase::Authenticating;
+                self.enter_connection_phase(Phase::Authenticating);
                 self.push_log("TCP connection established; authenticating…", false);
             }
             Some("node_connected") => {
-                self.phase = Phase::Mining;
+                self.node_link_live = true;
+                self.enter_mining_phase();
                 self.push_log(
                     "Connected directly to SOV node RPC; requesting work…",
                     false,
@@ -975,10 +1683,11 @@ impl MinerApp {
             }
             Some("worker_initializing") => {
                 if let Some(worker) = value.get("worker").and_then(Value::as_u64) {
+                    self.mark_worker_unready(worker);
                     self.push_log(
                         format!(
-                            "Worker {} is initializing its RandomX dataset (~2.3 GiB)…",
-                            worker + 1
+                            "Worker {} is preparing RandomX (shared {RANDOMX_DATASET_GIB:.1} GiB dataset; ~{RANDOMX_WORKER_MIB:.0} MiB worker overhead)…",
+                            worker + 1,
                         ),
                         false,
                     );
@@ -986,15 +1695,59 @@ impl MinerApp {
             }
             Some("worker_ready") => {
                 if let Some(worker) = value.get("worker").and_then(Value::as_u64) {
-                    self.ready_workers = self
-                        .ready_workers
-                        .saturating_add(1)
-                        .min(self.settings.workers);
-                    self.push_log(format!("Worker {} ready; hashing.", worker + 1), false);
+                    if self.mark_worker_ready(worker) {
+                        self.push_log(format!("Worker {} ready; hashing.", worker + 1), false);
+                    }
                 }
             }
+            Some("worker_error") => {
+                if let Some(worker) = value
+                    .get("worker")
+                    .and_then(Value::as_u64)
+                    .filter(|worker| *worker < self.settings.workers)
+                {
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("proof-of-work worker failed");
+                    let message = self.redact_sensitive_text(message);
+                    if self.worker_errors.is_empty() {
+                        self.worker_error_can_restore_mining = matches!(self.phase, Phase::Mining);
+                    }
+                    self.mark_worker_unready(worker);
+                    self.worker_errors.insert(worker, message.clone());
+                    self.phase = Phase::Error;
+                    self.last_error = format!("Worker {} error: {message}", worker + 1);
+                    self.push_log(self.last_error.clone(), true);
+                }
+            }
+            Some("worker_recovered") => {
+                if let Some(worker) = value.get("worker").and_then(Value::as_u64) {
+                    if self.mark_worker_ready(worker) {
+                        self.push_log(format!("Worker {} recovered; hashing.", worker + 1), false);
+                    }
+                }
+            }
+            Some("engine_fatal") => {
+                self.engine_fatal_seen = true;
+                self.node_link_live = false;
+                self.worker_error_can_restore_mining = false;
+                self.phase = Phase::Error;
+                self.hashrate = 0.0;
+                self.smoothed_hashrate = 0.0;
+                self.last_metrics_at = None;
+                self.clear_active_work();
+                self.ready_worker_ids.clear();
+                self.ready_workers = 0;
+                self.last_error = value.get("message").and_then(Value::as_str).map_or_else(
+                    || "Mining engine reported a fatal error.".to_owned(),
+                    |message| self.redact_sensitive_text(message),
+                );
+                self.push_log(self.last_error.clone(), true);
+            }
             Some("job") => {
-                self.phase = Phase::Mining;
+                self.node_link_live = true;
+                self.enter_mining_phase();
                 let next_height = value.get("height").and_then(Value::as_u64);
                 if next_height.is_some() && next_height != self.height {
                     self.round_hashes = 0;
@@ -1172,25 +1925,34 @@ impl MinerApp {
                     .unwrap_or(self.rejected);
             }
             Some("session_error") => {
-                self.phase = Phase::Reconnecting;
+                self.node_link_live = false;
+                self.worker_error_can_restore_mining = false;
                 self.hashrate = 0.0;
                 self.smoothed_hashrate = 0.0;
                 self.last_metrics_at = None;
                 self.clear_active_work();
                 self.mempool_size = None;
                 self.peer_count = None;
-                self.last_error = value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Pool session ended.")
-                    .to_owned();
+                let session_error = value.get("message").and_then(Value::as_str).map_or_else(
+                    || "Pool session ended.".to_owned(),
+                    |message| self.redact_sensitive_text(message),
+                );
+                if !self.engine_fatal_seen {
+                    self.phase = Phase::Reconnecting;
+                    self.last_error = session_error;
+                }
             }
             _ => {}
         }
     }
 
     fn solo_block_eta_seconds(&self) -> Option<f64> {
-        if !self.telemetry_is_fresh() || !matches!(self.phase, Phase::Mining) {
+        if !self.telemetry_is_fresh()
+            || !self.node_link_live
+            || self.engine_fatal_seen
+            || self.requested_stop
+            || self.ready_workers == 0
+        {
             return None;
         }
         let expected = self.expected_hashes?;
@@ -1199,13 +1961,21 @@ impl MinerApp {
 
     fn current_round_probability(&self) -> Option<f64> {
         self.expected_hashes?;
-        (self.telemetry_is_fresh() && matches!(self.phase, Phase::Mining))
+        (self.telemetry_is_fresh()
+            && self.node_link_live
+            && !self.engine_fatal_seen
+            && !self.requested_stop
+            && self.ready_workers > 0)
             .then_some(self.round_probability)
             .flatten()
     }
 
     fn current_round_elapsed(&self) -> Option<Duration> {
-        (self.telemetry_is_fresh() && matches!(self.phase, Phase::Mining))
+        (self.telemetry_is_fresh()
+            && self.node_link_live
+            && !self.engine_fatal_seen
+            && !self.requested_stop
+            && self.ready_workers > 0)
             .then(|| self.height_started_at.map(|started| started.elapsed()))
             .flatten()
     }
@@ -1246,6 +2016,72 @@ impl MinerApp {
             .join("\n")
     }
 
+    fn crash_report_text(&self, exit_detail: &str) -> String {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let header = format!(
+            "XUS MINER CRASH REPORT\n\
+             version: {}\n\
+             platform: {} {}\n\
+             timestamp_unix: {timestamp}\n\
+             engine_exit: {exit_detail}\n\
+             endpoint: {}\n\
+             configured_workers: {}\n\
+             phase: {}\n\
+             \nRECENT ENGINE LOG (up to the last {} bounded lines)\n",
+            env!("CARGO_PKG_VERSION"),
+            env::consts::OS,
+            env::consts::ARCH,
+            sanitize_endpoint(&self.settings.pool),
+            self.settings.workers,
+            self.phase.label(),
+            MAX_CRASH_REPORT_LOG_LINES,
+        );
+        let mut report = self.redact_sensitive_text(&header);
+        let origin = self.started_at;
+        let omission_marker = "[older engine log lines omitted to keep this report bounded]\n";
+        let mut remaining = MAX_CRASH_REPORT_BYTES
+            .saturating_sub(report.len())
+            .saturating_sub(omission_marker.len());
+        let mut recent_lines = Vec::new();
+        let mut omitted = self.logs.len() > MAX_CRASH_REPORT_LOG_LINES;
+        for line in self.logs.iter().rev().take(MAX_CRASH_REPORT_LOG_LINES) {
+            let seconds = origin
+                .map(|start| line.at.saturating_duration_since(start).as_secs())
+                .unwrap_or(0);
+            let formatted = format!("[{:02}:{:02}] {}\n", seconds / 60, seconds % 60, line.text);
+            let formatted = self.redact_sensitive_text(&formatted);
+            if formatted.len() > remaining {
+                omitted = true;
+                break;
+            }
+            remaining -= formatted.len();
+            recent_lines.push(formatted);
+        }
+        for line in recent_lines.iter().rev() {
+            report.push_str(line);
+        }
+        if omitted {
+            report.push_str(omission_marker);
+        }
+
+        bounded_text(
+            &report,
+            MAX_CRASH_REPORT_BYTES,
+            TRUNCATED_REPORT_SUFFIX,
+            report.len() > MAX_CRASH_REPORT_BYTES,
+        )
+    }
+
+    fn write_crash_report(&self, exit_detail: &str) -> Result<PathBuf, String> {
+        let directory = settings_path()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .ok_or_else(|| "cannot locate the user settings directory".to_string())?;
+        write_crash_report_at(&directory, &self.crash_report_text(exit_detail))
+    }
+
     fn diagnostics_text(&self) -> String {
         let mempool = self
             .mempool_size
@@ -1279,9 +2115,10 @@ impl MinerApp {
             .current_round_probability()
             .map(format_probability)
             .unwrap_or_else(|| "unavailable".into());
-        format!(
+        let diagnostics = format!(
             "XUS MINER DIAGNOSTICS\n\
              phase: {}\n\
+             node link: {}\n\
              endpoint: {}\n\
              algorithm: {}\n\
              height: {}\n\
@@ -1305,7 +2142,12 @@ impl MinerApp {
              last error: {}\n\
              \nEVENT LOG\n{}",
             self.phase.label(),
-            self.settings.pool.trim(),
+            if self.node_link_live {
+                "connected"
+            } else {
+                "disconnected"
+            },
+            sanitize_endpoint(&self.settings.pool),
             self.algorithm,
             height,
             self.job_id,
@@ -1336,7 +2178,8 @@ impl MinerApp {
             self.uptime(),
             last_error,
             self.formatted_logs(),
-        )
+        );
+        self.redact_sensitive_text(&diagnostics)
     }
 
     fn engine_log_panel(&mut self, ui: &mut egui::Ui) {
@@ -1529,15 +2372,12 @@ impl MinerApp {
         );
         ui.label(
             RichText::new(format!(
-                "RandomX memory ceiling ≈ {:.1} GiB",
-                self.settings.workers as f64 * RANDOMX_GIB_PER_WORKER
+                "RandomX ≈ {} total • shared {RANDOMX_DATASET_GIB:.1} GiB + {:.0} MiB workers",
+                format_memory(randomx_memory_bytes(self.settings.workers)),
+                self.settings.workers as f64 * RANDOMX_WORKER_MIB,
             ))
             .size(10.0)
-            .color(if self.settings.workers > 1 {
-                AMBER
-            } else {
-                MUTED
-            }),
+            .color(MUTED),
         );
         ui.add_space(5.0);
         if let Some(snapshot) = self.memory_snapshot {
@@ -1615,7 +2455,7 @@ impl MinerApp {
                             &mut self.memory_acknowledged,
                             format!(
                                 "I confirm ≥ {:.1} GiB available",
-                                self.settings.workers as f64 * RANDOMX_GIB_PER_WORKER
+                                randomx_memory_bytes(self.settings.workers) as f64 / BYTES_PER_GIB
                                     + MIN_MEMORY_HEADROOM_GIB,
                             ),
                         ),
@@ -1720,9 +2560,10 @@ impl MinerApp {
 
     fn status_rail(&self, ui: &mut egui::Ui) {
         let metrics_fresh = self.telemetry_is_fresh();
-        let connected = matches!(self.phase, Phase::Mining);
+        let connected = self.node_link_live && !self.engine_fatal_seen && !self.requested_stop;
         let has_job = connected && self.height.is_some() && self.job_id != WAITING_FOR_WORK;
-        let hashing = has_job && metrics_fresh && self.hashrate > 0.0;
+        let hashing = has_job && metrics_fresh && self.hashrate > 0.0 && self.ready_workers > 0;
+        let degraded = hashing && !self.worker_errors.is_empty();
         let recently_found = self
             .last_found_block
             .filter(|(_, found_at)| found_at.elapsed() <= BLOCK_FOUND_HIGHLIGHT);
@@ -1749,7 +2590,9 @@ impl MinerApp {
             heartbeat_card(
                 &mut columns[1],
                 "PROOF OF WORK",
-                if hashing {
+                if degraded {
+                    "HASHING • DEGRADED"
+                } else if hashing {
                     "HASHING"
                 } else if connected {
                     "WARMING"
@@ -1758,16 +2601,19 @@ impl MinerApp {
                 },
                 if hashing {
                     format!(
-                        "{} • {} workers",
+                        "{} • {}/{} workers",
                         format_hashrate(self.hashrate),
-                        self.ready_workers
+                        self.ready_workers,
+                        self.settings.workers,
                     )
                 } else if connected {
                     "Preparing workers".into()
                 } else {
                     "No active engine".into()
                 },
-                if hashing {
+                if degraded {
+                    AMBER
+                } else if hashing {
                     CYAN
                 } else if connected {
                     AMBER
@@ -2057,7 +2903,12 @@ impl MinerApp {
                             });
                             ui.add_space(10.0);
                             ui.columns(2, |chips| {
-                                work_chip(&mut chips[0], "ALGORITHM", &self.algorithm, CYAN);
+                                work_chip(
+                                    &mut chips[0],
+                                    "ALGORITHM",
+                                    &self.redact_sensitive_text(&self.algorithm),
+                                    CYAN,
+                                );
                                 work_chip(
                                     &mut chips[1],
                                     "HEIGHT",
@@ -2069,12 +2920,24 @@ impl MinerApp {
                                 );
                             });
                             ui.add_space(10.0);
-                            copyable_detail_row(ui, "Job ID", &self.job_id);
-                            copyable_detail_row(ui, "Endpoint", self.settings.pool.trim());
+                            copyable_detail_row(
+                                ui,
+                                "Job ID",
+                                &self.redact_sensitive_text(&self.job_id),
+                            );
+                            copyable_detail_row(
+                                ui,
+                                "Endpoint",
+                                &sanitize_endpoint(&self.settings.pool),
+                            );
                             copyable_detail_row(
                                 ui,
                                 "Coinbase",
-                                self.coinbase.as_deref().unwrap_or("awaiting template confirmation"),
+                                &self.redact_sensitive_text(
+                                    self.coinbase
+                                        .as_deref()
+                                        .unwrap_or("awaiting template confirmation"),
+                                ),
                             );
                             copyable_detail_row(
                                 ui,
@@ -2150,9 +3013,24 @@ impl MinerApp {
 impl Drop for MinerApp {
     fn drop(&mut self) {
         let _ = save_settings(&self.settings);
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let active_child_reaped = self
+            .child
+            .take()
+            .is_none_or(|mut child| terminate_and_reap_child(&mut child).is_ok());
+        let quarantined_child_reaped = self
+            .quarantined_child
+            .take()
+            .is_none_or(|mut child| terminate_and_reap_child(&mut child).is_ok());
+        let cleanup_reaped = active_child_reaped && quarantined_child_reaped;
+        // Closing the receiver releases any reader blocked by bounded-channel
+        // backpressure. If process cleanup could not be confirmed, only join
+        // readers already known to be finished so application shutdown cannot
+        // hang on a still-live pipe.
+        self.receiver = None;
+        if cleanup_reaped {
+            self.join_reader_threads();
+        } else {
+            self.join_finished_reader_threads();
         }
     }
 }
@@ -2746,7 +3624,10 @@ fn recommended_worker_limit(snapshot: MemorySnapshot) -> u64 {
     let usable = snapshot
         .available
         .saturating_sub(memory_headroom_bytes(snapshot.total));
-    (usable / randomx_memory_bytes(1)).min(64)
+    (1..=64)
+        .rev()
+        .find(|workers| randomx_memory_bytes(*workers) <= usable)
+        .unwrap_or(0)
 }
 
 fn format_memory(bytes: u64) -> String {
@@ -2919,17 +3800,411 @@ mod tests {
         assert!(validate_pool("pool.example:0").is_err());
         assert!(validate_pool("pool.example:99999").is_err());
         assert!(validate_pool("pool example:3333").is_err());
+        assert!(validate_pool("http://operator:secret@127.0.0.1:8645").is_err());
+    }
+
+    #[test]
+    fn child_line_reader_bounds_and_drains_oversized_records() {
+        let mut input = vec![b'a'; MAX_CHILD_LINE_BYTES * 3];
+        input.extend_from_slice(b"\r\n{\"event\":\"startup\"}\n");
+        let mut reader = BufReader::with_capacity(257, io::Cursor::new(input));
+
+        let oversized = read_bounded_child_line(&mut reader).unwrap().unwrap();
+        assert!(oversized.len() <= MAX_CHILD_LINE_BYTES);
+        assert!(oversized.ends_with(TRUNCATED_LINE_SUFFIX));
+        assert_eq!(
+            read_bounded_child_line(&mut reader).unwrap().unwrap(),
+            r#"{"event":"startup"}"#
+        );
+        assert_eq!(read_bounded_child_line(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn stored_engine_log_is_bounded_by_line_size_and_count() {
+        let mut app = MinerApp::default();
+        for index in 0..(MAX_LOG_LINES + 12) {
+            app.push_log(
+                format!("{index}:{}", "z".repeat(MAX_STORED_LOG_BYTES * 2)),
+                false,
+            );
+        }
+        assert_eq!(app.logs.len(), MAX_LOG_LINES);
+        assert!(app
+            .logs
+            .iter()
+            .all(|line| line.text.len() <= MAX_STORED_LOG_BYTES));
+        assert!(app.logs.front().unwrap().text.starts_with("12:"));
+        assert!(app
+            .logs
+            .back()
+            .unwrap()
+            .text
+            .ends_with(TRUNCATED_LINE_SUFFIX));
+    }
+
+    #[test]
+    fn child_output_queue_is_bounded_and_frames_have_a_work_budget() {
+        let (sender, receiver) = mpsc::sync_channel(CHILD_OUTPUT_QUEUE_CAPACITY);
+        for index in 0..CHILD_OUTPUT_QUEUE_CAPACITY {
+            sender
+                .try_send(ProcessMessage::Log(format!("queued-{index}")))
+                .unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(ProcessMessage::Log("overflow".into())),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+
+        let mut app = MinerApp::default();
+        app.receiver = Some(receiver);
+        assert!(!app.drain_process_messages());
+        assert_eq!(app.logs.len(), MAX_PROCESS_MESSAGES_PER_FRAME);
+        assert_eq!(app.logs.front().unwrap().text, "queued-0");
+        assert_eq!(
+            app.logs.back().unwrap().text,
+            format!("queued-{}", MAX_PROCESS_MESSAGES_PER_FRAME - 1)
+        );
+    }
+
+    #[test]
+    fn output_tail_is_drained_before_reader_handles_are_joined() {
+        let (sender, receiver) = mpsc::sync_channel(CHILD_OUTPUT_QUEUE_CAPACITY);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+        let handle = thread::spawn(move || {
+            sender
+                .send(ProcessMessage::Log("before-tail".into()))
+                .unwrap();
+            sender
+                .send(ProcessMessage::Log("final-output-tail".into()))
+                .unwrap();
+            drop(sender);
+            ready_sender.send(()).unwrap();
+        });
+        ready_receiver.recv().unwrap();
+
+        let mut app = MinerApp::default();
+        app.receiver = Some(receiver);
+        app.reader_threads.push(handle);
+        assert!(app.drain_process_messages());
+        assert_eq!(app.logs.back().unwrap().text, "final-output-tail");
+        app.join_reader_threads();
+        assert!(app.reader_threads.is_empty());
+        assert!(app
+            .crash_report_text("synthetic exit")
+            .contains("final-output-tail"));
+    }
+
+    #[test]
+    fn observation_failure_is_single_shot_terminal_and_preserves_context() {
+        let mut app = MinerApp::default();
+        app.phase = Phase::Mining;
+        app.begin_observation_failure(
+            "Cannot observe mining engine",
+            io::Error::other("synthetic wait failure"),
+        );
+
+        assert!(app.child.is_none());
+        assert!(app.engine_fatal_seen);
+        assert_eq!(app.phase, Phase::Error);
+        assert!(app.is_running());
+        assert!(app.last_error.contains("synthetic wait failure"));
+        let pending = app.pending_observation_failure.as_ref().unwrap();
+        assert!(pending.report_detail.contains("synthetic wait failure"));
+        assert!(pending
+            .report_detail
+            .contains("child handle was already unavailable"));
+
+        // Re-entering the same terminal path cannot replace the preserved
+        // failure or restart cleanup.
+        app.begin_observation_failure("replacement", io::Error::other("must not replace"));
+        assert!(!app.last_error.contains("must not replace"));
+    }
+
+    #[test]
+    fn quarantined_child_blocks_restart_until_exit_is_proven() {
+        let child = Command::new(env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut app = MinerApp::default();
+        app.quarantined_child = Some(child);
+
+        assert!(app.is_running());
+        app.start();
+        assert!(app.child.is_none());
+        assert!(app.quarantined_child.is_some());
+
+        let mut child = app.quarantined_child.take().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!app.is_running());
+    }
+
+    #[test]
+    fn worker_and_engine_failures_drive_health_until_recovery() {
+        let mut app = MinerApp::default();
+        app.settings.workers = 2;
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 42,
+            "algorithm": "RandomX",
+            "job_id": "job-42",
+        }));
+        app.apply_telemetry(&json!({"event": "worker_ready", "worker": 0}));
+        app.apply_telemetry(&json!({"event": "worker_ready", "worker": 0}));
+        app.apply_telemetry(&json!({"event": "worker_ready", "worker": 1}));
+        assert_eq!(app.ready_workers, 2);
+        assert_eq!(app.phase, Phase::Mining);
+
+        app.apply_telemetry(&json!({
+            "event": "worker_error",
+            "worker": 1,
+            "message": "RandomX VM unavailable",
+        }));
+        assert_eq!(app.ready_workers, 1);
+        assert_eq!(app.phase, Phase::Error);
+        assert!(
+            app.node_link_live,
+            "a worker failure must not falsely disconnect the live RPC session"
+        );
+        assert!(app.last_error.contains("RandomX VM unavailable"));
+
+        // A later job must not paint the engine green while a worker remains
+        // failed. Either recovery event restores that worker exactly once.
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 43,
+            "algorithm": "RandomX",
+            "job_id": "job-43",
+        }));
+        assert_eq!(app.phase, Phase::Error);
+        app.apply_telemetry(&json!({"event": "worker_recovered", "worker": 1}));
+        assert_eq!(app.ready_workers, 2);
+        assert_eq!(app.phase, Phase::Mining);
+        assert!(app.last_error.is_empty());
+
+        app.apply_telemetry(&json!({
+            "event": "worker_error",
+            "worker": 0,
+            "message": "worker supervisor restarted",
+        }));
+        app.apply_telemetry(&json!({"event": "worker_ready", "worker": 0}));
+        assert_eq!(app.ready_workers, 2);
+        assert_eq!(app.phase, Phase::Mining);
+
+        app.apply_telemetry(&json!({
+            "event": "worker_error",
+            "worker": 0,
+            "message": "temporary worker failure",
+        }));
+        app.apply_telemetry(&json!({
+            "event": "session_error",
+            "message": "connection lost",
+        }));
+        app.apply_telemetry(&json!({"event": "worker_recovered", "worker": 0}));
+        assert_eq!(app.phase, Phase::Reconnecting);
+        assert!(!app.node_link_live);
+        assert_eq!(app.last_error, "connection lost");
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 44,
+            "algorithm": "RandomX",
+            "job_id": "job-44",
+        }));
+        assert_eq!(app.phase, Phase::Mining);
+        assert!(app.node_link_live);
+
+        app.apply_telemetry(&json!({
+            "event": "engine_fatal",
+            "message": "cannot start mining reporter",
+        }));
+        assert_eq!(app.ready_workers, 0);
+        assert_eq!(app.phase, Phase::Error);
+        assert!(!app.node_link_live);
+        assert_eq!(app.hashrate, 0.0);
+        app.apply_telemetry(&json!({"event": "worker_ready", "worker": 0}));
+        app.apply_telemetry(&json!({
+            "event": "worker_error",
+            "worker": 1,
+            "message": "late worker event",
+        }));
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 45,
+            "algorithm": "RandomX",
+            "job_id": "late-job",
+        }));
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "height": 45,
+            "hashrate": 999.0,
+        }));
+        assert_eq!(app.ready_workers, 0);
+        assert_eq!(app.phase, Phase::Error);
+        assert_eq!(app.last_error, "cannot start mining reporter");
+        assert_eq!(app.hashrate, 0.0);
+        assert_eq!(app.height, None);
+    }
+
+    #[test]
+    fn queued_telemetry_cannot_repaint_a_requested_stop() {
+        let mut app = MinerApp::default();
+        app.phase = Phase::Stopping;
+        app.requested_stop = true;
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 99,
+            "algorithm": "RandomX",
+            "job_id": "late-job",
+        }));
+        app.apply_telemetry(&json!({
+            "event": "worker_error",
+            "worker": 0,
+            "message": "late error",
+        }));
+        assert_eq!(app.phase, Phase::Stopping);
+        assert_eq!(app.height, None);
+        assert!(app.worker_errors.is_empty());
+    }
+
+    #[test]
+    fn requested_stop_still_records_a_raced_engine_fatal() {
+        let mut app = MinerApp::default();
+        app.phase = Phase::Stopping;
+        app.requested_stop = true;
+        app.node_link_live = true;
+        app.apply_telemetry(&json!({
+            "event": "engine_fatal",
+            "message": "reporter failed during stop",
+        }));
+        assert!(app.engine_fatal_seen);
+        assert_eq!(app.phase, Phase::Error);
+        assert!(!app.node_link_live);
+        assert_eq!(app.last_error, "reporter failed during stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn requested_stop_does_not_hide_a_raced_unexpected_exit() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let natural_failure = ExitStatus::from_raw(7 << 8);
+        let gui_sigkill = ExitStatus::from_raw(9);
+        assert!(!exit_status_matches_requested_stop(&natural_failure));
+        assert!(exit_status_matches_requested_stop(&gui_sigkill));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn requested_stop_requires_the_windows_termination_status() {
+        use std::os::windows::process::ExitStatusExt;
+
+        assert!(exit_status_matches_requested_stop(&ExitStatus::from_raw(1)));
+        assert!(!exit_status_matches_requested_stop(&ExitStatus::from_raw(
+            0xC000_0005
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn common_windows_native_failures_have_actionable_names() {
+        assert_eq!(
+            windows_ntstatus_description(0xC000_0005),
+            Some("access violation (native memory fault)")
+        );
+        assert_eq!(
+            windows_ntstatus_description(0xC000_0017),
+            Some("not enough virtual memory")
+        );
+        assert_eq!(
+            windows_ntstatus_description(0xC000_0374),
+            Some("heap corruption")
+        );
+        assert_eq!(windows_ntstatus_description(7), None);
+    }
+
+    #[test]
+    fn crash_reports_are_bounded_unique_and_password_free() {
+        let home = TestSettingsHome::new("crash-report");
+        let directory = home.settings_path().parent().unwrap().to_path_buf();
+        let secret = "wallet-secret-must-never-be-written";
+        let endpoint_secret = "endpoint-userinfo-must-never-be-written";
+        let mut app = MinerApp::default();
+        app.settings.pool =
+            format!("http://operator:{endpoint_secret}@192.168.0.244:8645/private/path");
+        app.settings.password = secret.into();
+        app.settings.workers = 2;
+        for _ in 0..MAX_CRASH_REPORT_LOG_LINES {
+            app.push_log("q".repeat(MAX_STORED_LOG_BYTES), false);
+        }
+        app.push_log(
+            format!(
+                "native engine failed after receiving password={secret} and auth=operator:{endpoint_secret}"
+            ),
+            true,
+        );
+
+        let report = app.crash_report_text("Windows exception 0xC0000005");
+        assert!(report.len() <= MAX_CRASH_REPORT_BYTES);
+        assert!(!report.contains(secret));
+        assert!(!report.contains(endpoint_secret));
+        assert!(!report.contains("operator:"));
+        assert!(report.contains("http://192.168.0.244:8645/private/path"));
+        assert!(report.contains("[REDACTED]"));
+
+        let first = write_crash_report_at(&directory, &report).unwrap();
+        let second = write_crash_report_at(&directory, &report).unwrap();
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(CRASH_REPORT_PREFIX));
+        let written = fs::read_to_string(&first).unwrap();
+        assert!(written.len() <= MAX_CRASH_REPORT_BYTES);
+        assert!(!written.contains(secret));
+        assert!(!written.contains(endpoint_secret));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn crash_redaction_never_reintroduces_even_a_one_character_password() {
+        for secret in ["D", "[", "x", "REDACTED"] {
+            let raw = format!("before-{secret}-after");
+            assert!(!redact_secret(&raw, secret).contains(secret));
+        }
+        assert_eq!(
+            redact_secret("xus-miner reported password=x", "x"),
+            "xus-miner reported password=[REDACTED]"
+        );
     }
 
     #[test]
     fn persisted_settings_never_include_password() {
         let settings = Settings {
             password: "super-secret".into(),
+            pool: "http://operator:endpoint-secret@127.0.0.1:8645".into(),
             ..Settings::default()
         };
         let encoded = settings.persisted_json().to_string();
         assert!(!encoded.contains("super-secret"));
-        assert!(encoded.contains(DEFAULT_POOL));
+        assert!(!encoded.contains("endpoint-secret"));
+        assert!(!encoded.contains("operator:"));
+        assert!(encoded.contains("http://127.0.0.1:8645"));
     }
 
     #[cfg(unix)]
@@ -3044,8 +4319,10 @@ mod tests {
     #[test]
     fn copied_diagnostics_include_connection_state_but_never_password() {
         let mut app = MinerApp::default();
-        app.settings.pool = "192.168.0.244:8645".into();
+        app.settings.pool =
+            "http://operator:endpoint-secret-must-not-copy@192.168.0.244:8645".into();
         app.settings.password = "wallet-secret-must-not-copy".into();
+        app.node_link_live = true;
         app.algorithm = "RandomX".into();
         app.height = Some(10_126);
         app.coinbase = Some("confirmed-reward-account".into());
@@ -3054,14 +4331,22 @@ mod tests {
             available: gib_to_bytes(12.0),
             total: gib_to_bytes(16.0),
         });
+        app.last_error = "server reflected wallet-secret-must-not-copy".into();
+        app.push_log(
+            "endpoint auth operator:endpoint-secret-must-not-copy failed",
+            true,
+        );
         let copied = app.diagnostics_text();
-        assert!(copied.contains("192.168.0.244:8645"));
+        assert!(copied.contains("http://192.168.0.244:8645"));
+        assert!(copied.contains("node link: connected"));
         assert!(copied.contains("RandomX"));
         assert!(copied.contains("10126"));
         assert!(copied.contains("confirmed-reward-account"));
         assert!(copied.contains("authenticated node peers: 4"));
         assert!(copied.contains("12.0 GiB available / 16.0 GiB total"));
         assert!(!copied.contains("wallet-secret-must-not-copy"));
+        assert!(!copied.contains("endpoint-secret-must-not-copy"));
+        assert!(!copied.contains("operator:"));
     }
 
     #[test]
@@ -3213,6 +4498,11 @@ mod tests {
             "algorithm": "RandomX",
             "job_id": "job-42-a",
             "expected_hashes": 1_000.0,
+        }));
+        app.apply_telemetry(&json!({
+            "event": "worker_ready",
+            "worker": 0,
+            "mode": "fast-shared",
         }));
         app.apply_telemetry(&json!({
             "event": "metrics",

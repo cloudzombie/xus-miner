@@ -69,8 +69,13 @@ The GUI provides:
   and the miner's smoothed local hashrate (both expected/mean and 50% window);
 - an unmistakable green, pulsing `BLOCK FOUND` confirmation for 30 seconds when
   the direct SOV node accepts this miner's exact sealed block;
-- bounded engine logs, an explicit per-worker RandomX memory estimate, and a
+- bounded engine logs, an explicit shared-dataset RandomX memory estimate, and a
   RAM-only operating-system scan every ten seconds;
+- honest worker-readiness telemetry that distinguishes the shared fast dataset
+  from the lower-memory fallback, while keeping a live node link visibly
+  connected if one worker enters a degraded state;
+- selectable engine logs, copied diagnostics, and crash reports that scrub the
+  password and endpoint userinfo; embedded endpoint credentials are rejected;
 - a template-confirmed Coinbase field in Active Work, diagnostics, and the
   startup engine log;
 - validated pool, worker, thread, reconnect, and telemetry settings;
@@ -80,8 +85,10 @@ The GUI provides:
 - settings persistence without ever saving the Stratum password.
 
 The GUI passes the password to its child engine over standard input instead of
-exposing it in process arguments. Closing the window terminates the child and
-releases its RandomX worker memory.
+exposing it in process arguments. Closing the window requests child termination
+and release of its RandomX memory. If the operating system cannot prove that
+termination completed, the GUI keeps the child quarantined and restart disabled
+instead of risking a duplicate engine.
 
 Mining is probabilistic: the displayed solo block ETA is `expected hashes ÷
 smoothed local hashes/second`, not a guaranteed countdown. The round meter uses
@@ -143,11 +150,12 @@ cannot override a valid low-memory reading.
 ## Current constraints
 
 - The connection is plaintext TCP. Use a trusted network or a secured tunnel.
-- Each worker uses a thread-local fast RandomX VM and may allocate approximately
-  2.3 GiB. The default is one worker. Neither the GUI nor headless engine
-  silently changes the chosen worker count; RandomX initialization is blocked
-  when the live RAM preflight cannot preserve the larger of 1.5 GiB or 10% of
-  installed RAM (capped at 4 GiB).
+- Workers use independent, allocation-checked RandomX VMs backed by one shared
+  read-only dataset (approximately 2.3 GiB total plus a conservative 32 MiB
+  allowance per worker). The default is one worker. Neither the GUI nor
+  headless engine silently changes the chosen worker count; RandomX
+  initialization is blocked when the live RAM preflight cannot preserve the
+  larger of 1.5 GiB or 10% of installed RAM (capped at 4 GiB).
 - The current bridge records shares but has no PPLNS payout implementation. Its
   configured coinbase account receives the block. A public operator must not
   promise automatic or trustless payouts until that layer exists.

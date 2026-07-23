@@ -76,6 +76,13 @@ jobs:
         run: cargo test --locked --test miner_protocol
       - name: Test SOV 0.1.99 direct RPC contract
         run: cargo test --locked --test rpc_0199_protocol
+      - name: Validate fast RandomX mining vector (shared full dataset)
+        timeout-minutes: 12
+        run: cargo test --locked --release --bin xus-miner randomx_mainnet_job_uses_the_exact_sov_mining_seal -- --ignored --test-threads=1
+      - name: Soak two-worker direct RPC RandomX engine (Windows)
+        if: matrix.os == 'windows-2025'
+        timeout-minutes: 12
+        run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_short_window -- --ignored --test-threads=1
       - name: Build locked release binary
         run: cargo build --locked --release
       - name: Confirm embedded application version

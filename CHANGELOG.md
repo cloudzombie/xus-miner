@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.2
+
+- Isolate the exact, locked `randomx-rs` native library behind a narrow reviewed
+  ownership adapter that checks every cache, dataset, and VM allocation before
+  hashing. Full-dataset initialization is synchronous, so a failed operating
+  system thread spawn cannot strand native pointer workers.
+- Share one read-only full RandomX dataset across all worker VMs instead of
+  allocating approximately 2.3 GiB per worker. Memory preflight now budgets one
+  dataset plus a conservative per-worker allowance.
+- Fall back to safe light-memory RandomX after fast-mode allocation failure,
+  retry fast mode after memory is released, and supervise recoverable Rust
+  worker panics without terminating the mining engine.
+- Bound child-process output queues and log lines, drain final stdout/stderr
+  before retaining sanitized crash reports, and explain common Windows native
+  exit codes without recording the Stratum password or endpoint credentials.
+  If process termination cannot be proven, quarantine its handle and keep
+  restart disabled rather than risk launching a second memory-heavy engine.
+- Report each worker's actual fast-shared or light-fallback mode, keep GUI worker
+  health synchronized with error/recovery events, preserve truthful node-link
+  and degraded-hashing indicators, and return a failing process status when an
+  engine thread cannot be started.
+- Validate the real shared full-dataset path on every release platform and add
+  a two-worker Windows direct-RPC stability soak.
+
 ## 0.1.1
 
 - Add a compact authenticated SOV node-peers chip backed by the optional

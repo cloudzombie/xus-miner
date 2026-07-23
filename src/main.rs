@@ -1,15 +1,21 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod gui;
 mod pow;
+// RandomX exposes a C API. Keep the required unsafe ownership proof isolated
+// to one small module; unsafe code remains denied everywhere else.
+#[allow(unsafe_code)]
+mod randomx_native;
 mod wire;
 
 use borsh::BorshDeserialize;
-use pow::{pow_seal_mining, PowAlgo};
+use pow::{pow_hash_mining, MiningHash, MiningMode, PowAlgo};
 use serde_json::{json, Value};
+use std::any::Any;
 use std::env;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -28,7 +34,9 @@ const MAX_RPC_BODY_BYTES: usize = MAX_BLOB_BYTES * 2 + 256 * 1024;
 const MAX_RPC_HEADER_BYTES: usize = 32 * 1024;
 const MAX_RPC_RESPONSE_BYTES: usize = MAX_RPC_HEADER_BYTES + MAX_RPC_BODY_BYTES;
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
-const RANDOMX_GIB_PER_WORKER: f64 = 2.3;
+const BYTES_PER_MIB: f64 = 1_048_576.0;
+pub(crate) const RANDOMX_DATASET_GIB: f64 = 2.3;
+pub(crate) const RANDOMX_WORKER_MIB: f64 = 32.0;
 const MIN_MEMORY_HEADROOM_GIB: f64 = 1.5;
 const MAX_MEMORY_HEADROOM_GIB: f64 = 4.0;
 const DIRECT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -111,8 +119,8 @@ impl Default for Config {
             pool: "127.0.0.1:3333".into(),
             user: "xus-miner".into(),
             password: "x".into(),
-            // The fast RandomX path owns one full dataset per worker thread.
-            // Defaulting to one avoids surprising multi-gigabyte allocations.
+            // The fast RandomX path shares one read-only dataset. One worker
+            // remains the quiet, conservative default.
             workers: 1,
             reconnect_secs: 5,
             report_secs: 10,
@@ -130,7 +138,7 @@ fn usage() -> &'static str {
        --user <label>           Public account/worker label [xus-miner]\n\
        --password <value>       Stratum password [x]\n\
        --password-stdin         Read the Stratum password from standard input\n\
-       --workers <n>            Mining threads [1; each may use ~2.3 GiB]\n\
+       --workers <n>            Mining threads [1; one ~2.3 GiB dataset is shared]\n\
        --confirm-randomx-memory Confirm required RAM only if the OS scan is unavailable\n\
        --reconnect-secs <n>     Delay after disconnect [5]\n\
        --report-secs <n>        Hashrate reporting interval [10]\n\
@@ -427,8 +435,11 @@ impl Job {
         })
     }
 
-    fn seal_blob(&self, blob: &[u8]) -> [u8; 32] {
-        pow_seal_mining(self.algo, &self.pow_key, blob)
+    fn seal_blob<F>(&self, blob: &[u8], before_build: F) -> Result<MiningHash, String>
+    where
+        F: FnOnce(),
+    {
+        pow_hash_mining(self.algo, &self.pow_key, blob, before_build)
     }
 }
 
@@ -983,26 +994,41 @@ fn run_rpc_session(
                 // Run both bounded reads together so one slow optional method
                 // cannot add its timeout to the other and hold up tip polling.
                 let (network, peer_info) = thread::scope(|scope| {
-                    let network = scope.spawn(|| {
-                        rpc_call_with_timeout(
-                            &cfg.pool,
-                            "sov_getDifficulty",
-                            json!({}),
-                            Duration::from_secs(1),
-                        )
-                    });
-                    let peers = scope.spawn(|| {
-                        rpc_call_with_timeout(
-                            &cfg.pool,
-                            "sov_getPeerInfo",
-                            json!({}),
-                            Duration::from_secs(1),
-                        )
-                    });
-                    (
-                        network.join().ok().and_then(|result| result.ok()),
-                        peers.join().ok().and_then(|result| result.ok()),
-                    )
+                    let network = thread::Builder::new()
+                        .name("xus-rpc-difficulty".into())
+                        .spawn_scoped(scope, || {
+                            rpc_call_with_timeout(
+                                &cfg.pool,
+                                "sov_getDifficulty",
+                                json!({}),
+                                Duration::from_secs(1),
+                            )
+                        });
+                    let peers = thread::Builder::new()
+                        .name("xus-rpc-peers".into())
+                        .spawn_scoped(scope, || {
+                            rpc_call_with_timeout(
+                                &cfg.pool,
+                                "sov_getPeerInfo",
+                                json!({}),
+                                Duration::from_secs(1),
+                            )
+                        });
+                    let network = match network {
+                        Ok(handle) => handle.join().ok().and_then(|result| result.ok()),
+                        Err(error) => {
+                            eprintln!("optional difficulty RPC worker unavailable: {error}");
+                            None
+                        }
+                    };
+                    let peers = match peers {
+                        Ok(handle) => handle.join().ok().and_then(|result| result.ok()),
+                        Err(error) => {
+                            eprintln!("optional peer RPC worker unavailable: {error}");
+                            None
+                        }
+                    };
+                    (network, peers)
                 });
                 if let Some(network) = network {
                     state.emit(json!({
@@ -1138,12 +1164,15 @@ fn worker_loop(state: Arc<State>, worker: u64) {
     let mut job: Option<Arc<Job>> = None;
     let mut blob = Vec::new();
     let mut nonce = worker << 56;
-    let mut initialized = false;
+    let mut ready_state: Option<(PowAlgo, Vec<u8>, MiningMode)> = None;
+    let mut preparation_announced = false;
+    let mut last_pow_error: Option<(String, Instant)> = None;
 
     loop {
         let latest_generation = state.generation.load(Ordering::Acquire);
         if latest_generation != generation {
             generation = latest_generation;
+            preparation_announced = false;
             job = state.job.read().expect("job lock").clone();
             if let Some(current) = &job {
                 blob.clone_from(&current.blob);
@@ -1163,18 +1192,69 @@ fn worker_loop(state: Arc<State>, worker: u64) {
             }
             blob[current.nonce_offset..current.nonce_offset + 8]
                 .copy_from_slice(&nonce.to_le_bytes());
-            if !initialized {
-                eprintln!("worker {worker}: initializing RandomX dataset (~2.3 GiB); hashrate appears when ready");
-                state.emit(json!({"event":"worker_initializing", "worker":worker}));
+            let seal = match current.seal_blob(&blob, || {
+                if !preparation_announced {
+                    ready_state = None;
+                    preparation_announced = true;
+                    eprintln!(
+                        "worker {worker}: initializing RandomX work memory and VM; hashrate appears when ready"
+                    );
+                    state.emit(json!({"event":"worker_initializing", "worker":worker}));
+                }
+            }) {
+                Ok(seal) => seal,
+                Err(error) => {
+                    let should_report = last_pow_error.as_ref().is_none_or(|(previous, at)| {
+                        previous != &error || at.elapsed() >= Duration::from_secs(30)
+                    });
+                    if should_report {
+                        eprintln!("worker {worker}: proof-of-work engine unavailable: {error}");
+                        state.emit(json!({
+                            "event": "worker_error",
+                            "worker": worker,
+                            "message": error,
+                        }));
+                        last_pow_error = Some((error, Instant::now()));
+                    }
+                    ready_state = None;
+                    preparation_announced = true;
+                    nonce = nonce.wrapping_add(1);
+                    thread::sleep(Duration::from_secs(1));
+                    break;
+                }
+            };
+            preparation_announced = false;
+            if last_pow_error.take().is_some() {
+                eprintln!("worker {worker}: proof-of-work engine recovered; hashing");
+                state.emit(json!({"event":"worker_recovered", "worker":worker}));
             }
-            let seal = current.seal_blob(&blob);
-            if !initialized {
-                initialized = true;
-                eprintln!("worker {worker}: RandomX dataset ready; hashing");
-                state.emit(json!({"event":"worker_ready", "worker":worker}));
+            if ready_state.as_ref().is_none_or(|(algo, key, mode)| {
+                *algo != current.algo
+                    || key.as_slice() != current.pow_key.as_slice()
+                    || *mode != seal.mode
+            }) {
+                ready_state = Some((current.algo, current.pow_key.clone(), seal.mode));
+                match seal.mode {
+                    MiningMode::RandomXFastShared => eprintln!(
+                        "worker {worker}: RandomX VM ready on the shared full dataset; hashing"
+                    ),
+                    MiningMode::RandomXLightFallback => eprintln!(
+                        "worker {worker}: RandomX VM ready in light-memory fallback; hashing while fast mode retries"
+                    ),
+                    MiningMode::Sha256d => {
+                        eprintln!("worker {worker}: SHA-256d engine ready; hashing")
+                    }
+                }
+                state.emit(json!({
+                    "event":"worker_ready",
+                    "worker":worker,
+                    "mode": seal.mode.telemetry_name(),
+                }));
             }
             completed += 1;
-            if seal <= current.target && state.generation.load(Ordering::Acquire) == generation {
+            if seal.digest <= current.target
+                && state.generation.load(Ordering::Acquire) == generation
+            {
                 if let Some(endpoint) = state
                     .rpc_endpoint
                     .read()
@@ -1212,7 +1292,7 @@ fn worker_loop(state: Arc<State>, worker: u64) {
                     "params": {
                         "job_id": current.id,
                         "nonce": nonce_wire(nonce),
-                        "result": hex::encode(seal),
+                        "result": hex::encode(seal.digest),
                     }
                 });
                 if let Some(connection) = state
@@ -1240,6 +1320,39 @@ fn worker_loop(state: Arc<State>, worker: u64) {
             .fetch_add(completed, Ordering::Relaxed);
         state.total_hashes.fetch_add(completed, Ordering::Relaxed);
         state.record_round_hashes(current, completed);
+    }
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".into())
+}
+
+fn worker_supervisor(state: Arc<State>, worker: u64) {
+    let mut restarts = 0_u64;
+    loop {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            worker_loop(Arc::clone(&state), worker);
+        }));
+        let Err(payload) = result else {
+            return;
+        };
+        restarts = restarts.saturating_add(1);
+        let message = panic_payload_message(&*payload);
+        let retry_secs = restarts.min(30);
+        eprintln!(
+            "worker {worker}: recovered from an internal panic ({message}); restarting in {retry_secs} seconds"
+        );
+        state.emit(json!({
+            "event": "worker_error",
+            "worker": worker,
+            "message": format!("internal worker panic: {message}"),
+            "retry_in_secs": retry_secs,
+        }));
+        thread::sleep(Duration::from_secs(retry_secs));
     }
 }
 
@@ -1293,8 +1406,13 @@ fn gib_to_bytes(gib: f64) -> u64 {
     (gib * BYTES_PER_GIB).ceil() as u64
 }
 
-fn randomx_memory_bytes(workers: u64) -> u64 {
-    gib_to_bytes(RANDOMX_GIB_PER_WORKER).saturating_mul(workers)
+fn mib_to_bytes(mib: f64) -> u64 {
+    (mib * BYTES_PER_MIB).ceil() as u64
+}
+
+pub(crate) fn randomx_memory_bytes(workers: u64) -> u64 {
+    gib_to_bytes(RANDOMX_DATASET_GIB)
+        .saturating_add(mib_to_bytes(RANDOMX_WORKER_MIB).saturating_mul(workers))
 }
 
 fn memory_headroom_bytes(total: u64) -> u64 {
@@ -1320,7 +1438,7 @@ fn validate_headless_memory(
     let required = dataset.saturating_add(reserve);
     if available < required {
         return Err(format!(
-            "{workers} RandomX worker{} may need ≈{:.1} GiB plus {:.1} GiB of system headroom, but only {:.1} GiB is available; refusing to start",
+            "the shared RandomX engine for {workers} worker{} may need ≈{:.1} GiB plus {:.1} GiB of system headroom, but only {:.1} GiB is available; refusing to start",
             if workers == 1 { "" } else { "s" },
             dataset as f64 / BYTES_PER_GIB,
             reserve as f64 / BYTES_PER_GIB,
@@ -1358,7 +1476,11 @@ fn resolve_headless_memory(
     })
 }
 
-fn run_headless(cfg: Config, json_events: bool, unavailable_scan_confirmed: bool) {
+fn run_headless(
+    cfg: Config,
+    json_events: bool,
+    unavailable_scan_confirmed: bool,
+) -> Result<(), String> {
     eprintln!(
         "xus-miner {VERSION} | pool {} | user {} | workers {}",
         cfg.pool, cfg.user, cfg.workers
@@ -1375,18 +1497,28 @@ fn run_headless(cfg: Config, json_events: bool, unavailable_scan_confirmed: bool
     }));
     for worker in 0..cfg.workers {
         let worker_state = Arc::clone(&state);
-        thread::Builder::new()
+        if let Err(error) = thread::Builder::new()
             .name(format!("xus-worker-{worker}"))
-            .spawn(move || worker_loop(worker_state, worker))
-            .expect("spawn mining worker");
+            .spawn(move || worker_supervisor(worker_state, worker))
+        {
+            let message = format!("cannot start mining worker {worker}: {error}");
+            eprintln!("{message}");
+            state.emit(json!({"event":"engine_fatal", "message":message}));
+            return Err(message);
+        }
     }
     {
         let report_state = Arc::clone(&state);
         let interval = Duration::from_secs(cfg.report_secs);
-        thread::Builder::new()
+        if let Err(error) = thread::Builder::new()
             .name("xus-reporter".into())
             .spawn(move || reporter_loop(report_state, interval))
-            .expect("spawn reporter");
+        {
+            let message = format!("cannot start mining reporter: {error}");
+            eprintln!("{message}");
+            state.emit(json!({"event":"engine_fatal", "message":message}));
+            return Err(message);
+        }
     }
 
     loop {
@@ -1451,7 +1583,10 @@ fn main() {
         }
         cfg.password = password;
     }
-    run_headless(cfg, json_events, unavailable_scan_confirmed);
+    if let Err(error) = run_headless(cfg, json_events, unavailable_scan_confirmed) {
+        eprintln!("fatal mining engine error: {error}");
+        process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -1534,6 +1669,11 @@ mod tests {
         );
 
         let required = randomx_memory_bytes(3) + reserve;
+        assert_eq!(
+            randomx_memory_bytes(3) - randomx_memory_bytes(1),
+            mib_to_bytes(RANDOMX_WORKER_MIB * 2.0),
+            "workers must share one full dataset instead of allocating one each"
+        );
         let preflight = resolve_headless_memory(3, required, total, false).unwrap();
         assert_eq!(preflight.dataset, randomx_memory_bytes(3));
         assert_eq!(preflight.reserve, reserve);
@@ -1784,7 +1924,10 @@ mod tests {
         let nonce: u64 = 0x0123_4567_89ab_cdef;
         let mut blob = job.blob.clone();
         blob[job.nonce_offset..].copy_from_slice(&nonce.to_le_bytes());
-        assert_eq!(job.seal_blob(&blob), crate::pow::sha256d(&blob));
+        assert_eq!(
+            job.seal_blob(&blob, || {}).unwrap().digest,
+            crate::pow::sha256d(&blob)
+        );
     }
 
     #[test]
@@ -1798,10 +1941,14 @@ mod tests {
         let nonce: u64 = 0xfeed_face_cafe_beef;
         let mut blob = job.blob.clone();
         blob[job.nonce_offset..].copy_from_slice(&nonce.to_le_bytes());
+        let fast = job.seal_blob(&blob, || {}).unwrap();
         assert_eq!(
-            job.seal_blob(&blob),
-            crate::pow::pow_seal(PowAlgo::RandomX, &job.pow_key, &blob)
+            fast.mode,
+            MiningMode::RandomXFastShared,
+            "release validation must not pass through light-memory fallback"
         );
+        let light = crate::pow::pow_hash(PowAlgo::RandomX, &job.pow_key, &blob).unwrap();
+        assert_eq!(fast.digest, light);
     }
 
     #[test]

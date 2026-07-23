@@ -13,6 +13,10 @@ This repository owns only the standalone XUS Miner client.
 - Runtime integration with a node is limited to documented RPC or Stratum
   network calls. The miner must not read or write node source, chain state, a
   wallet seed, or private keys.
+- Rust unsafe code is denied throughout the application except for the single
+  allocation-checked RandomX C-API ownership module at
+  `src/randomx_native.rs`. Do not broaden that allowance or add another native
+  boundary.
 - If a miner change appears to require chaincode changes, stop and ask the user
   to authorize a separate task in the SOV repository. Do not cross the boundary
   from this repository.

@@ -2,7 +2,7 @@
 
 XUS Miner is an external client, not a component of the SOV source tree.
 
-The repository enforces that separation in four ways:
+The repository enforces that separation in five ways:
 
 1. It is a distinct Git repository and is not a SOV Cargo workspace member.
 2. It has no SOV source dependency: no Git dependency, local path, symlink,
@@ -15,6 +15,9 @@ The repository enforces that separation in four ways:
 4. The running miner communicates with a node only through JSON-RPC or Stratum.
    It writes its own GUI preferences under the user's profile and never opens a
    chain source or node-data path.
+5. Rust unsafe code is denied by default and mechanically confined to one small
+   RandomX C-API ownership module. The boundary check rejects a second unsafe
+   Rust surface.
 
 The boundary check in `scripts/check_chaincode_boundary.py` rejects local SOV
 paths, floating SOV revisions, repository symlinks, submodules, and write-level

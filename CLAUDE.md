@@ -16,3 +16,8 @@ and request a separately authorized task in the SOV repository.
 Never add a SOV Git, path, submodule, or workspace dependency. Run
 `python3 scripts/check_chaincode_boundary.py` before and after dependency
 changes, then execute the complete validation sequence in `AGENTS.md`.
+
+Do not add a second unsafe Rust surface. The only exception to the crate-wide
+unsafe-code denial is `src/randomx_native.rs`, whose null checks, ownership
+lifetimes, and synchronous full-dataset initialization are part of the Windows
+crash-safety contract.
