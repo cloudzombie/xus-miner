@@ -62,13 +62,21 @@ The GUI provides:
 - a unified low-overhead PoW flight recorder with smoothed/raw hashrate,
   block-height markers, current-round probability, mempool activity cells,
   measured network hashrate, and consensus target cadence;
+- an authenticated SOV node-peers chip and a permanent activity-cell legend:
+  bright cyan is stronger sampled hashrate, dim cyan is lower sampled hashrate,
+  and green means transactions were waiting in the mempool for that sample;
 - next-block estimates calculated from the template's inclusive 256-bit target
   and the miner's smoothed local hashrate (both expected/mean and 50% window);
-- bounded engine logs and an explicit per-worker RandomX memory estimate;
+- an unmistakable green, pulsing `BLOCK FOUND` confirmation for 30 seconds when
+  the direct SOV node accepts this miner's exact sealed block;
+- bounded engine logs, an explicit per-worker RandomX memory estimate, and a
+  RAM-only operating-system scan every ten seconds;
 - a template-confirmed Coinbase field in Active Work, diagnostics, and the
   startup engine log;
 - validated pool, worker, thread, reconnect, and telemetry settings;
-- a non-persistent memory confirmation before any multi-worker run;
+- automatic start preflight against live available RAM, with a conservative
+  OS/application reserve and a non-persistent manual fallback only when the
+  native memory probe is unavailable;
 - settings persistence without ever saving the Stratum password.
 
 The GUI passes the password to its child engine over standard input instead of
@@ -96,7 +104,10 @@ The GUI makes reward routing explicit:
 
 Direct mining requires an updated node supporting `sov_getBlockTemplate` and
 `sov_submitBlock`. In direct mode the User field is sent as the public coinbase
-account. A Stratum bridge remains supported for pool operation.
+account. XUS Miner validates the SOV 0.1.99 compact target commitment and only
+counts a direct block as accepted when the node confirms `accepted: true` with
+the matching height and locally computed sealed-block hash. A Stratum bridge
+remains supported for pool operation.
 
 ## Headless/server mode
 
@@ -123,13 +134,20 @@ miner:
 Use `--help` for all options. `tcp://` and `stratum+tcp://` pool prefixes are
 accepted. Operators that automate the miner can use `--json-events` for
 newline-delimited structured telemetry and `--password-stdin` to keep a
-Stratum password out of the process list.
+Stratum password out of the process list. The engine performs its own RAM
+preflight immediately before accepting its first RandomX job, including when it
+is launched without the GUI. `--confirm-randomx-memory` is accepted only as a
+non-persistent fallback when the operating-system scan is unavailable; it
+cannot override a valid low-memory reading.
 
 ## Current constraints
 
 - The connection is plaintext TCP. Use a trusted network or a secured tunnel.
 - Each worker uses a thread-local fast RandomX VM and may allocate approximately
-  2.3 GiB. The default is one worker.
+  2.3 GiB. The default is one worker. Neither the GUI nor headless engine
+  silently changes the chosen worker count; RandomX initialization is blocked
+  when the live RAM preflight cannot preserve the larger of 1.5 GiB or 10% of
+  installed RAM (capped at 4 GiB).
 - The current bridge records shares but has no PPLNS payout implementation. Its
   configured coinbase account receives the block. A public operator must not
   promise automatic or trustless payouts until that layer exists.
@@ -143,6 +161,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --bin xus-miner
 cargo test --locked --test miner_protocol
+cargo test --locked --test rpc_0199_protocol
 python3 scripts/check_chaincode_boundary.py
 python3 scripts/check_version.py
 cargo audit --deny warnings
@@ -158,3 +177,8 @@ a mock Stratum server. It verifies password delivery over stdin, the structured
 GUI telemetry contract, login, full SOV-format job validation, a share whose
 hash is independently recomputed from its nonce, one-in-flight-share
 backpressure, pushed job replacement, and automatic reconnect.
+
+A second integration test launches that same engine against a bounded local
+SOV 0.1.99 JSON-RPC mock. It verifies the direct block-template, peer telemetry,
+coinbase request, compact target, trailing nonce, accepted sealed-block hash,
+and submission acknowledgement contracts without allocating RandomX memory.

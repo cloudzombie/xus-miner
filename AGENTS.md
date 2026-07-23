@@ -35,6 +35,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --bin xus-miner
 cargo test --locked --test miner_protocol
+cargo test --locked --test rpc_0199_protocol
 cargo audit --deny warnings
 cargo build --locked --release
 ```

@@ -15,15 +15,85 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use sysinfo::{MemoryRefreshKind, System};
 use wire::{template_id_for_blob, validate_account_id, BlockHeaderWire};
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_BLOB_BYTES: usize = 1024 * 1024;
+// A maximum-size template is hex-encoded in JSON (2 bytes per blob byte).
+// Keep ample room for the remaining RPC fields without allowing a configured
+// or malicious node to grow the miner's response buffer without bound.
+const MAX_RPC_BODY_BYTES: usize = MAX_BLOB_BYTES * 2 + 256 * 1024;
+const MAX_RPC_HEADER_BYTES: usize = 32 * 1024;
+const MAX_RPC_RESPONSE_BYTES: usize = MAX_RPC_HEADER_BYTES + MAX_RPC_BODY_BYTES;
+const BYTES_PER_GIB: f64 = 1_073_741_824.0;
+const RANDOMX_GIB_PER_WORKER: f64 = 2.3;
+const MIN_MEMORY_HEADROOM_GIB: f64 = 1.5;
+const MAX_MEMORY_HEADROOM_GIB: f64 = 4.0;
+const DIRECT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const WORK_BATCH: u64 = 256;
 const LOGIN_ID: u64 = 1;
 const KEEPALIVE_ID: u64 = 2;
 const FIRST_SUBMIT_ID: u64 = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeadlessMemoryPreflight {
+    available: Option<u64>,
+    total: Option<u64>,
+    dataset: u64,
+    reserve: u64,
+}
+
+struct RandomxMemoryGate {
+    workers: u64,
+    unavailable_scan_confirmed: bool,
+    approved: Option<HeadlessMemoryPreflight>,
+    system: System,
+}
+
+impl RandomxMemoryGate {
+    fn new(workers: u64, unavailable_scan_confirmed: bool) -> Self {
+        Self {
+            workers,
+            unavailable_scan_confirmed,
+            approved: None,
+            system: System::new(),
+        }
+    }
+
+    fn ensure_safe(&mut self, algo: PowAlgo) -> Result<(), String> {
+        if algo != PowAlgo::RandomX || self.approved.is_some() {
+            return Ok(());
+        }
+        // Match the GUI's sterile scan: RAM counters only. Do not enumerate
+        // processes, CPU, disks, networks, users, or swap.
+        self.system
+            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+        let preflight = resolve_headless_memory(
+            self.workers,
+            self.system.available_memory(),
+            self.system.total_memory(),
+            self.unavailable_scan_confirmed,
+        )?;
+        match (preflight.available, preflight.total) {
+            (Some(available), Some(total)) => eprintln!(
+                "memory preflight PASS: {:.1} GiB available / {:.1} GiB total; {:.1} GiB RandomX estimate + {:.1} GiB reserved",
+                available as f64 / BYTES_PER_GIB,
+                total as f64 / BYTES_PER_GIB,
+                preflight.dataset as f64 / BYTES_PER_GIB,
+                preflight.reserve as f64 / BYTES_PER_GIB,
+            ),
+            _ => eprintln!(
+                "memory preflight manually confirmed: {:.1} GiB RandomX estimate + at least {:.1} GiB reserved",
+                preflight.dataset as f64 / BYTES_PER_GIB,
+                preflight.reserve as f64 / BYTES_PER_GIB,
+            ),
+        }
+        self.approved = Some(preflight);
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Config {
@@ -61,6 +131,7 @@ fn usage() -> &'static str {
        --password <value>       Stratum password [x]\n\
        --password-stdin         Read the Stratum password from standard input\n\
        --workers <n>            Mining threads [1; each may use ~2.3 GiB]\n\
+       --confirm-randomx-memory Confirm required RAM only if the OS scan is unavailable\n\
        --reconnect-secs <n>     Delay after disconnect [5]\n\
        --report-secs <n>        Hashrate reporting interval [10]\n\
        --version                Print the exact application/release version\n\
@@ -259,8 +330,15 @@ impl Job {
         let timestamp_ms = number("timestampMs")?;
         let blob =
             hex::decode(string("blob")?).map_err(|e| format!("invalid template blob: {e}"))?;
-        let nonce_offset = number("nonceOffset")? as usize;
-        if blob.len() < 8 || nonce_offset != blob.len() - 8 {
+        if blob.len() < 8 || blob.len() > MAX_BLOB_BYTES {
+            return Err(format!(
+                "template blob is {} bytes; expected 8..={MAX_BLOB_BYTES}",
+                blob.len()
+            ));
+        }
+        let nonce_offset = usize::try_from(number("nonceOffset")?)
+            .map_err(|_| "template nonceOffset does not fit this platform".to_string())?;
+        if nonce_offset != blob.len() - 8 {
             return Err("node returned an incompatible nonce offset".into());
         }
         let target: [u8; 32] = hex::decode(string("target")?)
@@ -274,6 +352,12 @@ impl Job {
         };
         let pow_key =
             hex::decode(string("powKey")?).map_err(|e| format!("invalid template powKey: {e}"))?;
+        if pow_key.len() != 32 {
+            return Err(format!(
+                "template powKey is {} bytes; SOV 0.1.99 requires 32",
+                pow_key.len()
+            ));
+        }
         let coinbase = string("proposer")?.trim().to_owned();
         if coinbase.is_empty() {
             return Err("template proposer cannot be empty".into());
@@ -310,6 +394,16 @@ impl Job {
                 return Err("template bits does not match encoded header".into());
             }
         }
+        let committed_target = target_from_compact(header.bits).ok_or_else(|| {
+            "template header contains invalid compact difficulty bits".to_string()
+        })?;
+        if target != committed_target {
+            return Err(format!(
+                "template target `{}` does not match compact header difficulty `{}`",
+                hex::encode(target),
+                hex::encode(committed_target),
+            ));
+        }
         let encoded_template_id = template_id_for_blob(&blob);
         if encoded_template_id != template_id {
             return Err(format!(
@@ -336,6 +430,46 @@ impl Job {
     fn seal_blob(&self, blob: &[u8]) -> [u8; 32] {
         pow_seal_mining(self.algo, &self.pow_key, blob)
     }
+}
+
+/// Decode SOV's Bitcoin-style compact `nBits` commitment into the exact
+/// big-endian target the miner must use. Kept client-side so an RPC cannot
+/// substitute an easier target than the one authenticated by the header blob.
+fn target_from_compact(bits: u32) -> Option<[u8; 32]> {
+    let size = (bits >> 24) as usize;
+    let mantissa = bits & 0x007f_ffff;
+    if bits & 0x0080_0000 != 0 {
+        return None;
+    }
+    if mantissa == 0 {
+        return Some([0; 32]);
+    }
+    if size > 34 || (mantissa > 0xff && size > 33) || (mantissa > 0xffff && size > 32) {
+        return None;
+    }
+    let mut target = [0u8; 32];
+    if size <= 3 {
+        let value = mantissa >> (8 * (3 - size));
+        target[29] = (value >> 16) as u8;
+        target[30] = (value >> 8) as u8;
+        target[31] = value as u8;
+    } else {
+        for (offset, byte) in [
+            (mantissa >> 16) as u8,
+            (mantissa >> 8) as u8,
+            mantissa as u8,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(index) = (32 + offset).checked_sub(size) {
+                if index < 32 {
+                    target[index] = byte;
+                }
+            }
+        }
+    }
+    Some(target)
 }
 
 /// Expected independent hashes before a uniformly distributed 256-bit seal is
@@ -368,6 +502,8 @@ struct State {
     rejected: AtomicU64,
     mempool_size: AtomicU64,
     mempool_known: AtomicBool,
+    peer_count: AtomicU64,
+    peers_known: AtomicBool,
     round: Mutex<RoundStats>,
     confirmed_coinbase: RwLock<Option<String>>,
     json_events: bool,
@@ -388,6 +524,8 @@ impl State {
             rejected: AtomicU64::new(0),
             mempool_size: AtomicU64::new(0),
             mempool_known: AtomicBool::new(false),
+            peer_count: AtomicU64::new(0),
+            peers_known: AtomicBool::new(false),
             round: Mutex::new(RoundStats::default()),
             confirmed_coinbase: RwLock::new(None),
             json_events,
@@ -479,6 +617,26 @@ impl State {
             self.generation.fetch_add(1, Ordering::Release);
         }
     }
+
+    fn clear_job_if_current(&self, completed: &Arc<Job>) -> bool {
+        let mut current = self.job.write().expect("job lock");
+        if current
+            .as_ref()
+            .is_some_and(|job| Arc::ptr_eq(job, completed))
+        {
+            *current = None;
+            self.generation.fetch_add(1, Ordering::Release);
+            self.emit(json!({
+                "event": "job_cleared",
+                "job_id": completed.id,
+                "height": completed.height,
+                "reason": "accepted_block",
+            }));
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct Connection {
@@ -539,19 +697,31 @@ fn read_json_line(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Value>
     Ok(Some(value))
 }
 
-fn install_job_value(state: &State, value: &Value) -> io::Result<()> {
+fn install_job_value(
+    state: &State,
+    value: &Value,
+    memory_gate: &mut RandomxMemoryGate,
+) -> io::Result<()> {
     let job =
         Job::from_stratum(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    memory_gate
+        .ensure_safe(job.algo)
+        .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
     state.install_job(job);
     Ok(())
 }
 
-fn handle_message(state: &State, connection: &Connection, message: &Value) -> io::Result<()> {
+fn handle_message(
+    state: &State,
+    connection: &Connection,
+    message: &Value,
+    memory_gate: &mut RandomxMemoryGate,
+) -> io::Result<()> {
     if message.get("method").and_then(Value::as_str) == Some("job") {
         let params = message
             .get("params")
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "job push has no params"))?;
-        return install_job_value(state, params);
+        return install_job_value(state, params, memory_gate);
     }
 
     let id = message.get("id").and_then(Value::as_u64);
@@ -565,7 +735,7 @@ fn handle_message(state: &State, connection: &Connection, message: &Value) -> io
         let job = message
             .pointer("/result/job")
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "login reply has no job"))?;
-        return install_job_value(state, job);
+        return install_job_value(state, job, memory_gate);
     }
 
     if id.is_some_and(|id| id >= FIRST_SUBMIT_ID) {
@@ -610,7 +780,7 @@ fn is_direct_rpc(raw: &str) -> bool {
 }
 
 fn rpc_call(endpoint: &str, method: &str, params: Value) -> io::Result<Value> {
-    rpc_call_with_timeout(endpoint, method, params, Duration::from_secs(30))
+    rpc_call_with_timeout(endpoint, method, params, DIRECT_RPC_TIMEOUT)
 }
 
 fn rpc_call_with_timeout(
@@ -620,7 +790,8 @@ fn rpc_call_with_timeout(
     read_timeout: Duration,
 ) -> io::Result<Value> {
     let address = endpoint_address(endpoint);
-    let mut stream = connect(address).map_err(|e| {
+    let connect_timeout = read_timeout.min(Duration::from_secs(10));
+    let mut stream = connect_with_timeout(address, connect_timeout).map_err(|e| {
         if e.kind() == io::ErrorKind::ConnectionRefused {
             io::Error::new(e.kind(), format!(
                 "SOV node refused {address}. On SOV Station enable ‘Expose node RPC on LAN’, then restart its node ({e})"
@@ -628,7 +799,7 @@ fn rpc_call_with_timeout(
         } else { e }
     })?;
     stream.set_read_timeout(Some(read_timeout))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(read_timeout.min(DIRECT_RPC_TIMEOUT)))?;
     let request = json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params});
     let body = request.to_string();
     let host = address.split(':').next().unwrap_or("sov-node");
@@ -636,15 +807,27 @@ fn rpc_call_with_timeout(
         "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(), body)?;
     stream.flush()?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    let response = read_bounded_rpc_response(&mut stream)?;
     let split = response
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "node returned malformed HTTP")
         })?;
-    let value: Value = serde_json::from_slice(&response[split + 4..]).map_err(|e| {
+    if split > MAX_RPC_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("node RPC HTTP headers exceed the {MAX_RPC_HEADER_BYTES}-byte safety limit"),
+        ));
+    }
+    let body = &response[split + 4..];
+    if body.len() > MAX_RPC_BODY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("node RPC body exceeds the {MAX_RPC_BODY_BYTES}-byte safety limit"),
+        ));
+    }
+    let value: Value = serde_json::from_slice(body).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("node returned invalid JSON: {e}"),
@@ -660,6 +843,20 @@ fn rpc_call_with_timeout(
         .get("result")
         .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "node RPC reply has no result"))
+}
+
+fn read_bounded_rpc_response<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut response = Vec::new();
+    reader
+        .take((MAX_RPC_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut response)?;
+    if response.len() > MAX_RPC_RESPONSE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("node RPC response exceeds the {MAX_RPC_RESPONSE_BYTES}-byte safety limit"),
+        ));
+    }
+    Ok(response)
 }
 
 fn requested_coinbase(user: &str) -> Option<&str> {
@@ -682,7 +879,52 @@ fn validate_rpc_coinbase(requested: Option<&str>, job: &Job) -> Result<(), Strin
     Ok(())
 }
 
-fn run_rpc_session(cfg: &Config, state: &Arc<State>) -> io::Result<()> {
+fn peer_count_from_info(info: &Value) -> Option<u64> {
+    info.get("peers").and_then(Value::as_u64)
+}
+
+fn validate_rpc_submission(result: &Value, job: &Job, sealed_blob: &[u8]) -> Result<(), String> {
+    match result.get("accepted").and_then(Value::as_bool) {
+        Some(true) => {}
+        Some(false) => {
+            return Err(format!(
+                "node returned accepted=false{}",
+                result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map_or_else(String::new, |error| format!(": {error}"))
+            ));
+        }
+        None => return Err("node submission reply has no boolean `accepted`".into()),
+    }
+    let height = result
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "node submission reply has no integer `height`".to_string())?;
+    if height != job.height {
+        return Err(format!(
+            "node submission height {height} does not match mined height {}",
+            job.height
+        ));
+    }
+    let hash = result
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "node submission reply has no string `hash`".to_string())?;
+    let expected_hash = template_id_for_blob(sealed_blob);
+    if hash != expected_hash {
+        return Err(format!(
+            "node submission hash `{hash}` does not match locally sealed block `{expected_hash}`"
+        ));
+    }
+    Ok(())
+}
+
+fn run_rpc_session(
+    cfg: &Config,
+    state: &Arc<State>,
+    memory_gate: &mut RandomxMemoryGate,
+) -> io::Result<()> {
     *state.rpc_endpoint.write().expect("rpc endpoint lock") = Some(cfg.pool.clone());
     let result = (|| {
         let mut previous_id = String::new();
@@ -729,18 +971,40 @@ fn run_rpc_session(cfg: &Config, state: &Arc<State>) -> io::Result<()> {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 validate_rpc_coinbase(requested, &job)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                memory_gate
+                    .ensure_safe(job.algo)
+                    .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                 previous_id = job.id.clone();
                 state.install_job(job);
                 chain_height = Some(current_height);
                 refreshed = Instant::now();
                 // Optional dashboard enrichment comes after work installation so
                 // an older/slow node can never delay hashing a valid template.
-                if let Ok(network) = rpc_call_with_timeout(
-                    &cfg.pool,
-                    "sov_getDifficulty",
-                    json!({}),
-                    Duration::from_secs(2),
-                ) {
+                // Run both bounded reads together so one slow optional method
+                // cannot add its timeout to the other and hold up tip polling.
+                let (network, peer_info) = thread::scope(|scope| {
+                    let network = scope.spawn(|| {
+                        rpc_call_with_timeout(
+                            &cfg.pool,
+                            "sov_getDifficulty",
+                            json!({}),
+                            Duration::from_secs(1),
+                        )
+                    });
+                    let peers = scope.spawn(|| {
+                        rpc_call_with_timeout(
+                            &cfg.pool,
+                            "sov_getPeerInfo",
+                            json!({}),
+                            Duration::from_secs(1),
+                        )
+                    });
+                    (
+                        network.join().ok().and_then(|result| result.ok()),
+                        peers.join().ok().and_then(|result| result.ok()),
+                    )
+                });
+                if let Some(network) = network {
                     state.emit(json!({
                         "event": "network",
                         "hashrate": network.get("hashrate").cloned().unwrap_or(Value::Null),
@@ -748,6 +1012,18 @@ fn run_rpc_session(cfg: &Config, state: &Arc<State>) -> io::Result<()> {
                         "difficulty": network.get("sha256d").cloned().unwrap_or(Value::Null),
                     }));
                 }
+                let peer_count = peer_info.and_then(|info| peer_count_from_info(&info));
+                match peer_count {
+                    Some(peer_count) => {
+                        state.peer_count.store(peer_count, Ordering::Relaxed);
+                        state.peers_known.store(true, Ordering::Release);
+                    }
+                    None => state.peers_known.store(false, Ordering::Release),
+                }
+                state.emit(json!({
+                    "event": "peers",
+                    "count": peer_count,
+                }));
             }
             thread::sleep(Duration::from_secs(2));
         }
@@ -758,16 +1034,21 @@ fn run_rpc_session(cfg: &Config, state: &Arc<State>) -> io::Result<()> {
         .write()
         .expect("confirmed coinbase lock") = None;
     state.mempool_known.store(false, Ordering::Release);
+    state.peers_known.store(false, Ordering::Release);
     *state.job.write().expect("job lock") = None;
     state.generation.fetch_add(1, Ordering::Release);
     result
 }
 
 fn connect(pool: &str) -> io::Result<TcpStream> {
+    connect_with_timeout(pool, Duration::from_secs(10))
+}
+
+fn connect_with_timeout(pool: &str, timeout: Duration) -> io::Result<TcpStream> {
     let address = pool_address(pool);
     let mut last = None;
     for socket in address.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&socket, Duration::from_secs(10)) {
+        match TcpStream::connect_timeout(&socket, timeout) {
             Ok(stream) => return Ok(stream),
             Err(error) => last = Some(error),
         }
@@ -780,7 +1061,11 @@ fn connect(pool: &str) -> io::Result<TcpStream> {
     }))
 }
 
-fn run_session(cfg: &Config, state: &Arc<State>) -> io::Result<()> {
+fn run_session(
+    cfg: &Config,
+    state: &Arc<State>,
+    memory_gate: &mut RandomxMemoryGate,
+) -> io::Result<()> {
     let stream = connect(&cfg.pool)?;
     state.emit(json!({"event": "pool_connected"}));
     stream.set_nodelay(true)?;
@@ -813,7 +1098,7 @@ fn run_session(cfg: &Config, state: &Arc<State>) -> io::Result<()> {
         let mut reader = BufReader::new(stream);
         loop {
             match read_json_line(&mut reader) {
-                Ok(Some(message)) => handle_message(state, &connection, &message)?,
+                Ok(Some(message)) => handle_message(state, &connection, &message, memory_gate)?,
                 Ok(None) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -902,11 +1187,14 @@ fn worker_loop(state: Arc<State>, worker: u64) {
                         "nonce": nonce,
                         "timestampMs": current.timestamp_ms,
                     });
-                    match rpc_call(&endpoint, "sov_submitBlock", params) {
-                        Ok(_) => {
+                    let submission = rpc_call(&endpoint, "sov_submitBlock", params)
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| validate_rpc_submission(&result, current, &blob));
+                    match submission {
+                        Ok(()) => {
                             state.accepted.fetch_add(1, Ordering::Relaxed);
                             state.emit(json!({"event":"share", "submitted":state.submitted.load(Ordering::Relaxed), "accepted":state.accepted.load(Ordering::Relaxed), "rejected":state.rejected.load(Ordering::Relaxed)}));
-                            state.generation.fetch_add(1, Ordering::Release);
+                            state.clear_job_if_current(current);
                         }
                         Err(error) => {
                             state.rejected.fetch_add(1, Ordering::Relaxed);
@@ -995,22 +1283,89 @@ fn reporter_loop(state: Arc<State>, every: Duration) {
             "rejected": state.rejected.load(Ordering::Relaxed),
             "mempool_size": state.mempool_known.load(Ordering::Acquire)
                 .then(|| state.mempool_size.load(Ordering::Relaxed)),
+            "peer_count": state.peers_known.load(Ordering::Acquire)
+                .then(|| state.peer_count.load(Ordering::Relaxed)),
         }));
     }
 }
 
-fn run_headless(cfg: Config, json_events: bool) {
+fn gib_to_bytes(gib: f64) -> u64 {
+    (gib * BYTES_PER_GIB).ceil() as u64
+}
+
+fn randomx_memory_bytes(workers: u64) -> u64 {
+    gib_to_bytes(RANDOMX_GIB_PER_WORKER).saturating_mul(workers)
+}
+
+fn memory_headroom_bytes(total: u64) -> u64 {
+    (total / 10).clamp(
+        gib_to_bytes(MIN_MEMORY_HEADROOM_GIB),
+        gib_to_bytes(MAX_MEMORY_HEADROOM_GIB),
+    )
+}
+
+fn validate_headless_memory(
+    workers: u64,
+    available: u64,
+    total: u64,
+) -> Result<HeadlessMemoryPreflight, String> {
+    if total == 0 || available > total {
+        return Err(
+            "operating-system RAM scan returned unavailable or inconsistent readings; refusing to start headless RandomX workers"
+                .into(),
+        );
+    }
+    let dataset = randomx_memory_bytes(workers);
+    let reserve = memory_headroom_bytes(total);
+    let required = dataset.saturating_add(reserve);
+    if available < required {
+        return Err(format!(
+            "{workers} RandomX worker{} may need ≈{:.1} GiB plus {:.1} GiB of system headroom, but only {:.1} GiB is available; refusing to start",
+            if workers == 1 { "" } else { "s" },
+            dataset as f64 / BYTES_PER_GIB,
+            reserve as f64 / BYTES_PER_GIB,
+            available as f64 / BYTES_PER_GIB,
+        ));
+    }
+    Ok(HeadlessMemoryPreflight {
+        available: Some(available),
+        total: Some(total),
+        dataset,
+        reserve,
+    })
+}
+
+fn resolve_headless_memory(
+    workers: u64,
+    available: u64,
+    total: u64,
+    unavailable_scan_confirmed: bool,
+) -> Result<HeadlessMemoryPreflight, String> {
+    if total > 0 && available <= total {
+        return validate_headless_memory(workers, available, total);
+    }
+    if !unavailable_scan_confirmed {
+        return Err(
+            "operating-system RAM scan is unavailable; refusing to initialize RandomX without explicit memory confirmation"
+                .into(),
+        );
+    }
+    Ok(HeadlessMemoryPreflight {
+        available: None,
+        total: None,
+        dataset: randomx_memory_bytes(workers),
+        reserve: gib_to_bytes(MIN_MEMORY_HEADROOM_GIB),
+    })
+}
+
+fn run_headless(cfg: Config, json_events: bool, unavailable_scan_confirmed: bool) {
     eprintln!(
         "xus-miner {VERSION} | pool {} | user {} | workers {}",
         cfg.pool, cfg.user, cfg.workers
     );
-    if cfg.workers > 1 {
-        eprintln!(
-            "warning: each worker may allocate a full ~2.3 GiB RandomX dataset; monitor memory"
-        );
-    }
 
     let state = Arc::new(State::new(json_events));
+    let mut memory_gate = RandomxMemoryGate::new(cfg.workers, unavailable_scan_confirmed);
     state.emit(json!({
         "event": "startup",
         "version": VERSION,
@@ -1042,9 +1397,9 @@ fn run_headless(cfg: Config, json_events: bool) {
             eprintln!("direct SOV node RPC mode");
         }
         let session = if direct {
-            run_rpc_session(&cfg, &state)
+            run_rpc_session(&cfg, &state, &mut memory_gate)
         } else {
-            run_session(&cfg, &state)
+            run_session(&cfg, &state, &mut memory_gate)
         };
         if let Err(error) = session {
             eprintln!(
@@ -1073,10 +1428,11 @@ fn main() {
 
     let json_events = raw.iter().any(|arg| arg == "--json-events");
     let password_stdin = raw.iter().any(|arg| arg == "--password-stdin");
+    let unavailable_scan_confirmed = raw.iter().any(|arg| arg == "--confirm-randomx-memory");
     raw.retain(|arg| {
         !matches!(
             arg.as_str(),
-            "--headless" | "--json-events" | "--password-stdin"
+            "--headless" | "--json-events" | "--password-stdin" | "--confirm-randomx-memory"
         )
     });
     let mut cfg = parse_args_from(raw);
@@ -1095,7 +1451,7 @@ fn main() {
         }
         cfg.password = password;
     }
-    run_headless(cfg, json_events);
+    run_headless(cfg, json_events, unavailable_scan_confirmed);
 }
 
 #[cfg(test)]
@@ -1123,25 +1479,77 @@ mod tests {
             _receipts_root: [0; 32],
             _state_root: [0; 32],
             timestamp_ms: 1_700_000_000_000_u64,
-            proposer: "sov-coinbase-account".into(),
-            version_bits: 0,
-            bits: 0,
+            proposer: "a35755d38a626de1b25820913aadbe8299b6ff6a8d0338ddef5295c7444c1e24".into(),
+            // SOV 0.1.99's mainnet preset signals tx-domain + fee-auction.
+            version_bits: 0b11,
+            bits: 506_433_601,
             _nonce: 0,
         };
         let blob = borsh::to_vec(&header).unwrap();
         json!({
             "templateId": template_id_for_blob(&blob),
             "blob": hex::encode(&blob),
-            "target": "ff".repeat(32),
-            "powAlgo": "Sha256d",
-            "powKey": "",
+            "target": "00002f9041000000000000000000000000000000000000000000000000000000",
+            "powAlgo": "RandomX",
+            "powKey": "cb0272ff88e64c18cde0257f7fae1c8236b02651f10cc7a02456fd682ee2e72d",
             "height": 43,
             "timestampMs": 1_700_000_000_000_u64,
+            "minTimestampMs": 1_699_999_999_999_u64,
             "nonceOffset": blob.len() - 8,
-            "proposer": "sov-coinbase-account",
-            "versionBits": 0,
-            "bits": 0,
+            "proposer": "a35755d38a626de1b25820913aadbe8299b6ff6a8d0338ddef5295c7444c1e24",
+            "prevHash": "00".repeat(32),
+            "txRoot": "00".repeat(32),
+            "receiptsRoot": "00".repeat(32),
+            "stateRoot": "00".repeat(32),
+            "versionBits": 3,
+            "bits": 506_433_601,
         })
+    }
+
+    #[test]
+    fn direct_rpc_response_reader_is_strictly_bounded() {
+        let exact = vec![b'x'; MAX_RPC_RESPONSE_BYTES];
+        assert_eq!(
+            read_bounded_rpc_response(&mut io::Cursor::new(exact))
+                .unwrap()
+                .len(),
+            MAX_RPC_RESPONSE_BYTES
+        );
+
+        let oversized = vec![b'x'; MAX_RPC_RESPONSE_BYTES + 1];
+        let error = read_bounded_rpc_response(&mut io::Cursor::new(oversized)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("safety limit"));
+    }
+
+    #[test]
+    fn headless_randomx_memory_preflight_matches_gui_safety_policy() {
+        let total = gib_to_bytes(16.0);
+        let reserve = memory_headroom_bytes(total);
+        assert_eq!(reserve, total / 10);
+        assert_eq!(memory_headroom_bytes(gib_to_bytes(8.0)), gib_to_bytes(1.5));
+        assert_eq!(
+            memory_headroom_bytes(gib_to_bytes(128.0)),
+            gib_to_bytes(4.0)
+        );
+
+        let required = randomx_memory_bytes(3) + reserve;
+        let preflight = resolve_headless_memory(3, required, total, false).unwrap();
+        assert_eq!(preflight.dataset, randomx_memory_bytes(3));
+        assert_eq!(preflight.reserve, reserve);
+        assert_eq!(preflight.available, Some(required));
+        assert_eq!(preflight.total, Some(total));
+        assert!(resolve_headless_memory(3, required - 1, total, true)
+            .unwrap_err()
+            .contains("refusing to start"));
+        assert!(resolve_headless_memory(1, 1, 0, false)
+            .unwrap_err()
+            .contains("explicit memory confirmation"));
+        let confirmed = resolve_headless_memory(1, 1, 0, true).unwrap();
+        assert_eq!(confirmed.available, None);
+        assert_eq!(confirmed.total, None);
+        assert_eq!(confirmed.reserve, gib_to_bytes(1.5));
+        assert!(resolve_headless_memory(1, total + 1, total, false).is_err());
     }
 
     #[test]
@@ -1156,12 +1564,20 @@ mod tests {
     }
 
     #[test]
-    fn rpc_template_confirms_header_coinbase() {
+    fn sov_0_1_99_rpc_template_contract_is_accepted_and_authenticates_coinbase() {
         let job = Job::from_rpc(&valid_rpc_template()).unwrap();
-        assert_eq!(job.coinbase.as_deref(), Some("sov-coinbase-account"));
-        assert_eq!(job.block_target, Some([0xff; 32]));
+        let coinbase = "a35755d38a626de1b25820913aadbe8299b6ff6a8d0338ddef5295c7444c1e24";
+        assert_eq!(job.coinbase.as_deref(), Some(coinbase));
+        assert_eq!(job.algo, PowAlgo::RandomX);
+        assert_eq!(job.pow_key.len(), 32);
+        assert_eq!(
+            BlockHeaderWire::try_from_slice(&job.blob)
+                .unwrap()
+                .version_bits,
+            0b11
+        );
         assert!(validate_rpc_coinbase(None, &job).is_ok());
-        assert!(validate_rpc_coinbase(Some("sov-coinbase-account"), &job).is_ok());
+        assert!(validate_rpc_coinbase(Some(coinbase), &job).is_ok());
     }
 
     #[test]
@@ -1180,7 +1596,79 @@ mod tests {
         let error = validate_rpc_coinbase(Some("different-account"), &job).unwrap_err();
         assert!(error.contains("refusing to hash"));
         assert!(error.contains("different-account"));
-        assert!(error.contains("sov-coinbase-account"));
+        assert!(error.contains("a35755d38a626de1b25820913aadbe8299b6ff6a8d0338ddef5295c7444c1e24"));
+    }
+
+    #[test]
+    fn sov_0_1_99_compact_target_and_rpc_submission_are_verified_end_to_end() {
+        let expected_target =
+            hex::decode("00002f9041000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+        assert_eq!(
+            target_from_compact(506_433_601).unwrap().as_slice(),
+            expected_target.as_slice()
+        );
+        assert_eq!(target_from_compact(0x1d80_ffff), None);
+
+        let job = Job::from_rpc(&valid_rpc_template()).unwrap();
+        let mut sealed_blob = job.blob.clone();
+        sealed_blob[job.nonce_offset..].copy_from_slice(&7_u64.to_le_bytes());
+        let accepted = json!({
+            "accepted": true,
+            "height": job.height,
+            "hash": template_id_for_blob(&sealed_blob),
+        });
+        assert_eq!(
+            validate_rpc_submission(&accepted, &job, &sealed_blob),
+            Ok(())
+        );
+
+        let rejected = json!({
+            "accepted": false,
+            "height": job.height,
+            "hash": template_id_for_blob(&sealed_blob),
+            "error": "import rejected",
+        });
+        assert!(validate_rpc_submission(&rejected, &job, &sealed_blob)
+            .unwrap_err()
+            .contains("import rejected"));
+        assert!(validate_rpc_submission(
+            &json!({"height": job.height, "hash": template_id_for_blob(&sealed_blob)}),
+            &job,
+            &sealed_blob,
+        )
+        .unwrap_err()
+        .contains("accepted"));
+        assert!(validate_rpc_submission(
+            &json!({"accepted": true, "height": job.height + 1, "hash": template_id_for_blob(&sealed_blob)}),
+            &job,
+            &sealed_blob,
+        )
+        .unwrap_err()
+        .contains("height"));
+        assert!(validate_rpc_submission(
+            &json!({"accepted": true, "height": job.height, "hash": "00".repeat(32)}),
+            &job,
+            &sealed_blob,
+        )
+        .unwrap_err()
+        .contains("locally sealed block"));
+
+        let state = State::new(false);
+        state.install_job(job.clone());
+        let completed = state.job.read().expect("job lock").clone().unwrap();
+        assert!(state.clear_job_if_current(&completed));
+        assert!(state.job.read().expect("job lock").is_none());
+
+        state.install_job(job);
+        let replacement = state.job.read().expect("job lock").clone().unwrap();
+        assert!(!state.clear_job_if_current(&completed));
+        assert!(state
+            .job
+            .read()
+            .expect("job lock")
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &replacement)));
     }
 
     #[test]
@@ -1201,7 +1689,9 @@ mod tests {
     #[test]
     fn round_probability_segments_target_changes_and_rejects_stale_height_work() {
         let state = State::new(false);
-        let first = Job::from_rpc(&valid_rpc_template()).unwrap();
+        let mut first = Job::from_rpc(&valid_rpc_template()).unwrap();
+        first.target = [0xff; 32];
+        first.block_target = Some([0xff; 32]);
         state.install_job(first.clone());
         state.record_round_hashes(&first, 1);
         assert_eq!(
@@ -1257,6 +1747,29 @@ mod tests {
         assert!(Job::from_stratum(&value)
             .unwrap_err()
             .contains("cannot be empty"));
+
+        let mut value = valid_rpc_template();
+        value["powKey"] = json!("00");
+        assert!(Job::from_rpc(&value).unwrap_err().contains("requires 32"));
+
+        let mut value = valid_rpc_template();
+        value["target"] = json!("ff".repeat(32));
+        assert!(Job::from_rpc(&value)
+            .unwrap_err()
+            .contains("compact header difficulty"));
+
+        let mut value = valid_rpc_template();
+        let mut header =
+            BlockHeaderWire::try_from_slice(&hex::decode(value["blob"].as_str().unwrap()).unwrap())
+                .unwrap();
+        header.bits = 0x1d80_ffff;
+        let blob = borsh::to_vec(&header).unwrap();
+        value["blob"] = json!(hex::encode(&blob));
+        value["templateId"] = json!(template_id_for_blob(&blob));
+        value["bits"] = json!(header.bits);
+        assert!(Job::from_rpc(&value)
+            .unwrap_err()
+            .contains("invalid compact difficulty"));
     }
 
     #[test]
@@ -1289,6 +1802,27 @@ mod tests {
             job.seal_blob(&blob),
             crate::pow::pow_seal(PowAlgo::RandomX, &job.pow_key, &blob)
         );
+    }
+
+    #[test]
+    fn peer_count_accepts_only_the_authenticated_peer_field() {
+        assert_eq!(
+            peer_count_from_info(&json!({
+                "peers": 4,
+                "tcpLinks": 9,
+                "connectedPeers": ["one", "two"],
+            })),
+            Some(4)
+        );
+        assert_eq!(peer_count_from_info(&json!({"peers": 0})), Some(0));
+        assert_eq!(
+            peer_count_from_info(&json!({"connectedPeers": ["one", "two", "three"]})),
+            None
+        );
+        assert_eq!(peer_count_from_info(&json!({"tcpLinks": 4})), None);
+        assert_eq!(peer_count_from_info(&json!({"peers": "4"})), None);
+        assert_eq!(peer_count_from_info(&json!({"peers": -1})), None);
+        assert_eq!(peer_count_from_info(&json!({"peers": 1.5})), None);
     }
 
     #[test]

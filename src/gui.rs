@@ -1,3 +1,9 @@
+#[cfg(test)]
+use crate::gib_to_bytes;
+use crate::{
+    memory_headroom_bytes, randomx_memory_bytes, BYTES_PER_GIB, MIN_MEMORY_HEADROOM_GIB,
+    RANDOMX_GIB_PER_WORKER,
+};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke,
     Vec2,
@@ -15,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sysinfo::{MemoryRefreshKind, System};
 
 const WINDOW_TITLE: &str = "XUS Miner";
 const DEFAULT_POOL: &str = "127.0.0.1:3333";
@@ -24,6 +31,12 @@ const MAX_METER_SAMPLES: usize = 180;
 const SETTINGS_DIRECTORY: &str = ".xus-miner";
 const SETTINGS_FILE: &str = "gui-settings.json";
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+const MEMORY_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const BLOCK_FOUND_HIGHLIGHT: Duration = Duration::from_secs(30);
+const MAX_ACTIVITY_CELLS: usize = 48;
+const WAITING_FOR_WORK: &str = "Waiting for work";
+const ACTIVITY_CELL_SUMMARY: &str =
+    "Each cell is one telemetry time slice—not an incoming job or an individual hash. Up to 48 cells summarize recent telemetry history.";
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const BG: Color32 = Color32::from_rgb(9, 11, 18);
@@ -508,6 +521,12 @@ struct MeterSample {
     round_probability: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemorySnapshot {
+    available: u64,
+    total: u64,
+}
+
 struct MinerApp {
     settings: Settings,
     phase: Phase,
@@ -524,6 +543,9 @@ struct MinerApp {
     height: Option<u64>,
     algorithm: String,
     job_id: String,
+    job_observed_in_metrics: bool,
+    jobless_metrics_seen: u8,
+    last_found_block: Option<(u64, Instant)>,
     coinbase: Option<String>,
     expected_hashes: Option<f64>,
     round_hashes: u64,
@@ -535,15 +557,21 @@ struct MinerApp {
     last_error: String,
     logs: VecDeque<LogLine>,
     mempool_size: Option<u64>,
+    peer_count: Option<u64>,
     meter_history: VecDeque<MeterSample>,
     last_metrics_at: Option<Instant>,
     ready_workers: u64,
     reveal_password: bool,
     memory_acknowledged: bool,
+    memory_system: System,
+    memory_snapshot: Option<MemorySnapshot>,
+    last_memory_refresh: Option<Instant>,
 }
 
 impl Default for MinerApp {
     fn default() -> Self {
+        let mut memory_system = System::new();
+        let memory_snapshot = capture_memory_snapshot(&mut memory_system);
         Self {
             settings: load_settings(),
             phase: Phase::Idle,
@@ -559,7 +587,10 @@ impl Default for MinerApp {
             rejected: 0,
             height: None,
             algorithm: "—".into(),
-            job_id: "Waiting for work".into(),
+            job_id: WAITING_FOR_WORK.into(),
+            job_observed_in_metrics: false,
+            jobless_metrics_seen: 0,
+            last_found_block: None,
             coinbase: None,
             expected_hashes: None,
             round_hashes: 0,
@@ -571,11 +602,15 @@ impl Default for MinerApp {
             last_error: String::new(),
             logs: VecDeque::new(),
             mempool_size: None,
+            peer_count: None,
             meter_history: VecDeque::new(),
             last_metrics_at: None,
             ready_workers: 0,
             reveal_password: false,
             memory_acknowledged: false,
+            memory_system,
+            memory_snapshot,
+            last_memory_refresh: Some(Instant::now()),
         }
     }
 }
@@ -583,6 +618,67 @@ impl Default for MinerApp {
 impl MinerApp {
     fn is_running(&self) -> bool {
         self.child.is_some()
+    }
+
+    fn refresh_memory_now(&mut self) {
+        self.memory_snapshot = capture_memory_snapshot(&mut self.memory_system);
+        self.last_memory_refresh = Some(Instant::now());
+    }
+
+    fn refresh_memory_if_due(&mut self) {
+        if self
+            .last_memory_refresh
+            .is_none_or(|last| last.elapsed() >= MEMORY_REFRESH_INTERVAL)
+        {
+            self.refresh_memory_now();
+        }
+    }
+
+    fn memory_preflight_error(&self) -> Option<String> {
+        let workers = self.settings.workers;
+        let dataset_gib = workers as f64 * RANDOMX_GIB_PER_WORKER;
+        match self.memory_snapshot {
+            Some(snapshot)
+                if snapshot.available
+                    < randomx_memory_bytes(workers) + memory_headroom_bytes(snapshot.total) =>
+            {
+                Some(format!(
+                    "Start blocked: {workers} RandomX worker{} may need ≈{dataset_gib:.1} GiB, plus {} of system headroom, but the live scan reports only {} available.",
+                    if workers == 1 { "" } else { "s" },
+                    format_memory(memory_headroom_bytes(snapshot.total)),
+                    format_memory(snapshot.available),
+                ))
+            }
+            Some(_) => None,
+            None if !self.memory_acknowledged => Some(format!(
+                "The operating-system memory scan is unavailable. Confirm at least {:.1} GiB is available before starting {workers} RandomX worker{}.",
+                dataset_gib + MIN_MEMORY_HEADROOM_GIB,
+                if workers == 1 { "" } else { "s" },
+            )),
+            None => None,
+        }
+    }
+
+    fn memory_preflight_summary(&self) -> String {
+        let dataset = randomx_memory_bytes(self.settings.workers);
+        self.memory_snapshot.map_or_else(
+            || {
+                format!(
+                    "Memory preflight manually confirmed: {} RandomX estimate plus at least {:.1} GiB reserved.",
+                    format_memory(dataset),
+                    MIN_MEMORY_HEADROOM_GIB,
+                )
+            },
+            |snapshot| {
+                format!(
+                    "Memory preflight PASS: {} available / {} total; {} RandomX estimate + {} reserved.",
+                    format_memory(snapshot.available),
+                    format_memory(snapshot.total),
+                    format_memory(dataset),
+                    format_memory(memory_headroom_bytes(snapshot.total)),
+                )
+            },
+        )
     }
 
     fn reset_telemetry(&mut self) {
@@ -594,7 +690,10 @@ impl MinerApp {
         self.rejected = 0;
         self.height = None;
         self.algorithm = "—".into();
-        self.job_id = "Waiting for work".into();
+        self.job_id = WAITING_FOR_WORK.into();
+        self.job_observed_in_metrics = false;
+        self.jobless_metrics_seen = 0;
+        self.last_found_block = None;
         self.coinbase = None;
         self.expected_hashes = None;
         self.round_hashes = 0;
@@ -605,9 +704,23 @@ impl MinerApp {
         self.network_difficulty = None;
         self.last_error.clear();
         self.mempool_size = None;
+        self.peer_count = None;
         self.meter_history.clear();
         self.last_metrics_at = None;
         self.ready_workers = 0;
+    }
+
+    fn clear_active_work(&mut self) {
+        self.height = None;
+        self.algorithm = "—".into();
+        self.job_id = WAITING_FOR_WORK.into();
+        self.job_observed_in_metrics = false;
+        self.jobless_metrics_seen = 0;
+        self.coinbase = None;
+        self.expected_hashes = None;
+        self.round_hashes = 0;
+        self.round_probability = None;
+        self.height_started_at = None;
     }
 
     fn push_log(&mut self, text: impl Into<String>, error: bool) {
@@ -625,47 +738,7 @@ impl MinerApp {
         }
     }
 
-    fn start(&mut self) {
-        if self.is_running() {
-            return;
-        }
-        if let Err(error) = self.settings.validate() {
-            self.last_error.clone_from(&error);
-            self.phase = Phase::Error;
-            self.push_log(error, true);
-            return;
-        }
-        if self.settings.workers > 1 && !self.memory_acknowledged {
-            let required = self.settings.workers as f64 * 2.3;
-            let error = format!(
-                "Confirm that at least {required:.1} GiB of memory is available before starting {} RandomX workers.",
-                self.settings.workers
-            );
-            self.last_error.clone_from(&error);
-            self.phase = Phase::Error;
-            self.push_log(error, true);
-            return;
-        }
-        if let Err(error) = save_settings(&self.settings) {
-            self.push_log(error, true);
-        }
-
-        self.reset_telemetry();
-        self.phase = Phase::Starting;
-        self.requested_stop = false;
-        self.started_at = Some(Instant::now());
-        self.logs.clear();
-        self.push_log("Starting isolated mining engine…", false);
-
-        let executable = match env::current_exe() {
-            Ok(path) => path,
-            Err(error) => {
-                self.phase = Phase::Error;
-                self.last_error = format!("Cannot locate miner executable: {error}");
-                self.push_log(self.last_error.clone(), true);
-                return;
-            }
-        };
+    fn headless_command(&self, executable: &Path) -> Command {
         let mut command = Command::new(executable);
         command
             .arg("--headless")
@@ -680,10 +753,57 @@ impl MinerApp {
             .arg("--reconnect-secs")
             .arg(self.settings.reconnect_secs.to_string())
             .arg("--report-secs")
-            .arg(self.settings.report_secs.to_string())
+            .arg(self.settings.report_secs.to_string());
+        if self.memory_snapshot.is_none() && self.memory_acknowledged {
+            command.arg("--confirm-randomx-memory");
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command
+    }
+
+    fn start(&mut self) {
+        if self.is_running() {
+            return;
+        }
+        if let Err(error) = self.settings.validate() {
+            self.last_error.clone_from(&error);
+            self.phase = Phase::Error;
+            self.push_log(error, true);
+            return;
+        }
+        self.refresh_memory_now();
+        if let Some(error) = self.memory_preflight_error() {
+            self.last_error.clone_from(&error);
+            self.phase = Phase::Error;
+            self.push_log(error, true);
+            return;
+        }
+        let memory_preflight = self.memory_preflight_summary();
+        if let Err(error) = save_settings(&self.settings) {
+            self.push_log(error, true);
+        }
+
+        self.reset_telemetry();
+        self.phase = Phase::Starting;
+        self.requested_stop = false;
+        self.started_at = Some(Instant::now());
+        self.logs.clear();
+        self.push_log("Starting isolated mining engine…", false);
+        self.push_log(memory_preflight, false);
+
+        let executable = match env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                self.phase = Phase::Error;
+                self.last_error = format!("Cannot locate miner executable: {error}");
+                self.push_log(self.last_error.clone(), true);
+                return;
+            }
+        };
+        let mut command = self.headless_command(&executable);
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -817,6 +937,7 @@ impl MinerApp {
             self.hashrate = 0.0;
             self.smoothed_hashrate = 0.0;
             self.last_metrics_at = None;
+            self.clear_active_work();
             if self.requested_stop {
                 self.phase = Phase::Idle;
                 self.push_log("Mining stopped.", false);
@@ -891,6 +1012,12 @@ impl MinerApp {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_owned();
+                // A reporter sample can be assembled just before this event but
+                // reach stdout just after it. Until metrics confirms this job,
+                // require two jobless samples before clearing it so one raced
+                // `height: null` sample cannot erase newer work.
+                self.job_observed_in_metrics = false;
+                self.jobless_metrics_seen = 0;
                 self.coinbase = value
                     .get("coinbase")
                     .and_then(Value::as_str)
@@ -904,6 +1031,26 @@ impl MinerApp {
                     self.round_probability = None;
                 }
             }
+            Some("job_cleared") => {
+                let cleared_job_id = value.get("job_id").and_then(Value::as_str);
+                let cleared_height = value.get("height").and_then(Value::as_u64);
+                if let Some(height) = cleared_height.filter(|height| {
+                    cleared_job_id == Some(self.job_id.as_str()) && self.height == Some(*height)
+                }) {
+                    if value.get("reason").and_then(Value::as_str) == Some("accepted_block") {
+                        let destination = self
+                            .coinbase
+                            .as_deref()
+                            .map_or_else(String::new, |account| format!(" to {account}"));
+                        self.last_found_block = Some((height, Instant::now()));
+                        self.push_log(
+                            format!("★ BLOCK FOUND AND ACCEPTED at height {height}{destination}."),
+                            false,
+                        );
+                    }
+                    self.clear_active_work();
+                }
+            }
             Some("network") => {
                 self.network_hashrate = value
                     .get("hashrate")
@@ -914,6 +1061,21 @@ impl MinerApp {
                     .get("difficulty")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+            }
+            Some("peers") => {
+                let next = value.get("count").and_then(Value::as_u64);
+                if next != self.peer_count {
+                    if let Some(count) = next {
+                        self.push_log(
+                            format!(
+                                "SOV node reports {count} authenticated P2P peer{}.",
+                                if count == 1 { "" } else { "s" }
+                            ),
+                            false,
+                        );
+                    }
+                }
+                self.peer_count = next;
             }
             Some("metrics") => {
                 let now = Instant::now();
@@ -951,6 +1113,23 @@ impl MinerApp {
                 if self.height.is_none() {
                     self.height = metrics_height;
                 }
+                match metrics_height {
+                    Some(height)
+                        if self.height == Some(height) && self.job_id != WAITING_FOR_WORK =>
+                    {
+                        self.job_observed_in_metrics = true;
+                        self.jobless_metrics_seen = 0;
+                    }
+                    None if value.get("height").is_some_and(Value::is_null)
+                        && self.job_id != WAITING_FOR_WORK =>
+                    {
+                        self.jobless_metrics_seen = self.jobless_metrics_seen.saturating_add(1);
+                        if self.job_observed_in_metrics || self.jobless_metrics_seen >= 2 {
+                            self.clear_active_work();
+                        }
+                    }
+                    _ => {}
+                }
                 let round_height = value.get("round_height").and_then(Value::as_u64);
                 if round_height == metrics_height && metrics_height == self.height {
                     self.round_hashes = value
@@ -965,9 +1144,8 @@ impl MinerApp {
                             .map(|probability| probability.clamp(0.0, 1.0))
                     });
                 }
-                if let Some(size) = value.get("mempool_size").and_then(Value::as_u64) {
-                    self.mempool_size = Some(size);
-                }
+                self.mempool_size = value.get("mempool_size").and_then(Value::as_u64);
+                self.peer_count = value.get("peer_count").and_then(Value::as_u64);
                 self.meter_history.push_back(MeterSample {
                     hashrate: self.hashrate,
                     smoothed_hashrate: self.smoothed_hashrate,
@@ -998,6 +1176,9 @@ impl MinerApp {
                 self.hashrate = 0.0;
                 self.smoothed_hashrate = 0.0;
                 self.last_metrics_at = None;
+                self.clear_active_work();
+                self.mempool_size = None;
+                self.peer_count = None;
                 self.last_error = value
                     .get("message")
                     .and_then(Value::as_str)
@@ -1069,6 +1250,19 @@ impl MinerApp {
         let mempool = self
             .mempool_size
             .map_or_else(|| "unavailable".into(), |size| size.to_string());
+        let peers = self
+            .peer_count
+            .map_or_else(|| "unavailable".into(), |count| count.to_string());
+        let system_memory = self.memory_snapshot.map_or_else(
+            || "unavailable".into(),
+            |snapshot| {
+                format!(
+                    "{} available / {} total",
+                    format_memory(snapshot.available),
+                    format_memory(snapshot.total),
+                )
+            },
+        );
         let height = self
             .height
             .map_or_else(|| "unavailable".into(), |height| height.to_string());
@@ -1103,6 +1297,8 @@ impl MinerApp {
              network difficulty: {}\n\
              total hashes: {}\n\
              workers ready/configured: {}/{}\n\
+             system memory: {}\n\
+             authenticated node peers: {}\n\
              mempool pending: {}\n\
              submitted/accepted/rejected: {}/{}/{}\n\
              uptime: {}\n\
@@ -1131,6 +1327,8 @@ impl MinerApp {
             self.total_hashes,
             self.ready_workers,
             self.settings.workers,
+            system_memory,
+            peers,
             mempool,
             self.submitted,
             self.accepted,
@@ -1332,7 +1530,7 @@ impl MinerApp {
         ui.label(
             RichText::new(format!(
                 "RandomX memory ceiling ≈ {:.1} GiB",
-                self.settings.workers as f64 * 2.3
+                self.settings.workers as f64 * RANDOMX_GIB_PER_WORKER
             ))
             .size(10.0)
             .color(if self.settings.workers > 1 {
@@ -1341,22 +1539,93 @@ impl MinerApp {
                 MUTED
             }),
         );
-        if self.settings.workers > 1 {
-            ui.add_enabled(
-                !running,
-                egui::Checkbox::new(
-                    &mut self.memory_acknowledged,
-                    format!(
-                        "I have ≥ {:.1} GiB free",
-                        self.settings.workers as f64 * 2.3
-                    ),
-                ),
-            );
-            ui.label(
-                RichText::new("This confirmation is never saved.")
-                    .size(10.0)
-                    .color(MUTED),
-            );
+        ui.add_space(5.0);
+        if let Some(snapshot) = self.memory_snapshot {
+            let reserve = memory_headroom_bytes(snapshot.total);
+            let safe_workers = recommended_worker_limit(snapshot);
+            let has_capacity =
+                snapshot.available >= randomx_memory_bytes(self.settings.workers) + reserve;
+            let color = if running {
+                CYAN
+            } else if has_capacity {
+                GREEN
+            } else {
+                RED
+            };
+            Frame::new()
+                .fill(color.gamma_multiply(0.08))
+                .stroke(Stroke::new(1.0, color.gamma_multiply(0.42)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(9))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("SYSTEM MEMORY")
+                            .size(9.0)
+                            .strong()
+                            .color(MUTED),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} available / {} total",
+                            format_memory(snapshot.available),
+                            format_memory(snapshot.total),
+                        ))
+                        .size(12.0)
+                        .strong()
+                        .color(color),
+                    );
+                    ui.label(
+                        RichText::new(if running {
+                            "Available now, after miner allocation".into()
+                        } else {
+                            format!(
+                                "Safe preflight: up to {} worker{}",
+                                safe_workers,
+                                if safe_workers == 1 { "" } else { "s" }
+                            )
+                        })
+                        .size(9.5)
+                        .color(TEXT),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} OS/app reserve • RAM-only scan every 10s",
+                            format_memory(reserve),
+                        ))
+                        .size(8.5)
+                        .color(MUTED),
+                    );
+                });
+        } else {
+            Frame::new()
+                .fill(AMBER.gamma_multiply(0.08))
+                .stroke(Stroke::new(1.0, AMBER.gamma_multiply(0.42)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(9))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("SYSTEM MEMORY • SCAN UNAVAILABLE")
+                            .size(9.0)
+                            .strong()
+                            .color(AMBER),
+                    );
+                    ui.add_enabled(
+                        !running,
+                        egui::Checkbox::new(
+                            &mut self.memory_acknowledged,
+                            format!(
+                                "I confirm ≥ {:.1} GiB available",
+                                self.settings.workers as f64 * RANDOMX_GIB_PER_WORKER
+                                    + MIN_MEMORY_HEADROOM_GIB,
+                            ),
+                        ),
+                    );
+                    ui.label(
+                        RichText::new("Fallback confirmation is never saved.")
+                            .size(8.5)
+                            .color(MUTED),
+                    );
+                });
         }
 
         ui.add_space(14.0);
@@ -1451,9 +1720,12 @@ impl MinerApp {
 
     fn status_rail(&self, ui: &mut egui::Ui) {
         let metrics_fresh = self.telemetry_is_fresh();
-        let connected = matches!(self.phase, Phase::Mining) && self.height.is_some();
-        let hashing = connected && metrics_fresh && self.hashrate > 0.0;
-        let has_job = connected && self.job_id != "Waiting for work";
+        let connected = matches!(self.phase, Phase::Mining);
+        let has_job = connected && self.height.is_some() && self.job_id != WAITING_FOR_WORK;
+        let hashing = has_job && metrics_fresh && self.hashrate > 0.0;
+        let recently_found = self
+            .last_found_block
+            .filter(|(_, found_at)| found_at.elapsed() <= BLOCK_FOUND_HIGHLIGHT);
         let pulse_time = ui.input(|input| input.time);
 
         ui.columns(4, |columns| {
@@ -1508,26 +1780,48 @@ impl MinerApp {
             heartbeat_card(
                 &mut columns[2],
                 "JOB FEED",
-                if has_job { "ACTIVE" } else { "WAITING" },
-                self.height.map_or_else(
-                    || "No current template".into(),
-                    |height| {
-                        format!(
-                            "Block #{height} • {}",
-                            self.solo_block_eta_seconds()
-                                .map(format_eta)
-                                .unwrap_or_else(|| {
-                                    if self.expected_hashes.is_none() {
-                                        "ETA unavailable".into()
-                                    } else {
-                                        "ETA locking".into()
-                                    }
-                                })
+                if recently_found.is_some() {
+                    "★ BLOCK FOUND"
+                } else if has_job {
+                    "ACTIVE"
+                } else {
+                    "WAITING"
+                },
+                recently_found.map_or_else(
+                    || {
+                        self.height.map_or_else(
+                            || "No current template".into(),
+                            |height| {
+                                format!(
+                                    "Block #{height} • {}",
+                                    self.solo_block_eta_seconds()
+                                        .map(format_eta)
+                                        .unwrap_or_else(|| {
+                                            if self.expected_hashes.is_none() {
+                                                "ETA unavailable".into()
+                                            } else {
+                                                "ETA locking".into()
+                                            }
+                                        })
+                                )
+                            },
+                        )
+                    },
+                    |(height, _)| {
+                        self.height.map_or_else(
+                            || format!("Accepted block #{height} • reward submitted"),
+                            |current| format!("Accepted block #{height} • now mining #{current}"),
                         )
                     },
                 ),
-                if has_job { PURPLE } else { AMBER },
-                has_job,
+                if recently_found.is_some() {
+                    GREEN
+                } else if has_job {
+                    PURPLE
+                } else {
+                    AMBER
+                },
+                has_job || recently_found.is_some(),
                 pulse_time + 0.34,
             );
             let pending = self.mempool_size.unwrap_or(0);
@@ -1667,36 +1961,34 @@ impl MinerApp {
                         );
                     });
                 ui.add_space(7.0);
+                activity_cell_legend(ui);
+                ui.add_space(7.0);
                 ui.horizontal_wrapped(|ui| {
-                    Frame::new()
-                        .fill(PURPLE.gamma_multiply(0.18))
-                        .stroke(Stroke::new(1.0, PURPLE.gamma_multiply(0.72)))
-                        .corner_radius(CornerRadius::same(7))
-                        .inner_margin(Margin::symmetric(9, 5))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("●").size(8.0).color(PURPLE));
-                                ui.label(
-                                    RichText::new("NETWORK HASHRATE")
-                                        .size(9.0)
-                                        .strong()
-                                        .color(TEXT),
-                                );
-                                ui.label(
-                                    RichText::new(
-                                        self.network_hashrate
-                                            .map(format_hashrate)
-                                            .unwrap_or_else(|| "—".into()),
-                                    )
-                                    .size(11.0)
-                                    .strong()
-                                    .monospace()
-                                    .color(PURPLE),
-                                );
-                            });
-                        })
-                        .response
-                        .on_hover_text("Estimated by the connected SOV node; separate from this miner's local hashrate.");
+                    telemetry_chip(
+                        ui,
+                        "NETWORK HASHRATE",
+                        &self
+                            .network_hashrate
+                            .map(format_hashrate)
+                            .unwrap_or_else(|| "—".into()),
+                        PURPLE,
+                        "Estimated by the connected SOV node; separate from this miner's local hashrate.",
+                    );
+                    let peer_color = match self.peer_count {
+                        Some(0) => AMBER,
+                        Some(_) => GREEN,
+                        None => MUTED,
+                    };
+                    telemetry_chip(
+                        ui,
+                        "NODE PEERS",
+                        &self.peer_count.map_or_else(
+                            || "—".into(),
+                            |count| format!("{count} AUTH"),
+                        ),
+                        peer_color,
+                        "Authenticated P2P peers reported by the connected SOV node; separate from this miner's RPC connection.",
+                    );
                     ui.label(
                         RichText::new(format!(
                             "TARGET CADENCE {}",
@@ -1867,6 +2159,7 @@ impl Drop for MinerApp {
 
 impl eframe::App for MinerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.refresh_memory_if_due();
         self.poll_process(ctx);
         ctx.request_repaint_after(Duration::from_secs(1));
     }
@@ -1961,6 +2254,29 @@ fn metric_card(ui: &mut egui::Ui, label: &str, value: &str, accent: Color32) {
             ui.add_space(5.0);
             ui.label(RichText::new(value).size(21.0).strong().color(accent));
         });
+}
+
+fn telemetry_chip(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, tooltip: &str) {
+    Frame::new()
+        .fill(color.gamma_multiply(0.18))
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.72)))
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(9, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("●").size(8.0).color(color));
+                ui.label(RichText::new(label).size(9.0).strong().color(TEXT));
+                ui.label(
+                    RichText::new(value)
+                        .size(11.0)
+                        .strong()
+                        .monospace()
+                        .color(color),
+                );
+            });
+        })
+        .response
+        .on_hover_text(tooltip);
 }
 
 fn heartbeat_card(
@@ -2285,7 +2601,7 @@ fn mining_meter(ui: &mut egui::Ui, history: &VecDeque<MeterSample>, report_secs:
         );
     }
 
-    let cells = history.len().min(48);
+    let cells = history.len().min(MAX_ACTIVITY_CELLS);
     let cell_top = outer.bottom() - cells_height;
     let cell_width = outer.width() / cells as f32;
     for cell in 0..cells {
@@ -2295,12 +2611,6 @@ fn mining_meter(ui: &mut egui::Ui, history: &VecDeque<MeterSample>, report_secs:
             cell * (history.len() - 1) / (cells - 1)
         };
         let sample = history.get(index).expect("meter sample index");
-        let activity = (sample.smoothed_hashrate / max_rate).clamp(0.0, 1.0) as f32;
-        let color = if sample.mempool.unwrap_or(0) > 0 {
-            GREEN
-        } else {
-            CYAN
-        };
         let cell_rect = egui::Rect::from_min_max(
             egui::pos2(outer.left() + cell as f32 * cell_width + 1.0, cell_top),
             egui::pos2(
@@ -2311,7 +2621,7 @@ fn mining_meter(ui: &mut egui::Ui, history: &VecDeque<MeterSample>, report_secs:
         painter.rect_filled(
             cell_rect,
             CornerRadius::same(2),
-            color.gamma_multiply(0.12 + activity * 0.76),
+            activity_cell_color(sample, max_rate),
         );
     }
 
@@ -2353,12 +2663,13 @@ fn mining_meter(ui: &mut egui::Ui, history: &VecDeque<MeterSample>, report_secs:
         egui::pos2(outer.left(), cell_top - 3.0),
         egui::Align2::LEFT_BOTTOM,
         format!(
-            "MEMPOOL {}  •  HASH CELLS {}",
+            "MEMPOOL {}  •  ACTIVITY SLICES {}/{}",
             history
                 .back()
                 .and_then(|sample| sample.mempool)
                 .map_or_else(|| "—".into(), |pending| pending.to_string()),
-            cells
+            cells,
+            MAX_ACTIVITY_CELLS,
         ),
         FontId::monospace(8.5),
         if history
@@ -2372,6 +2683,84 @@ fn mining_meter(ui: &mut egui::Ui, history: &VecDeque<MeterSample>, report_secs:
             MUTED
         },
     );
+}
+
+fn activity_cell_legend(ui: &mut egui::Ui) {
+    Frame::new()
+        .fill(BG.gamma_multiply(0.88))
+        .stroke(Stroke::new(1.0, BORDER.gamma_multiply(0.75)))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.label(RichText::new(ACTIVITY_CELL_SUMMARY).size(10.0).color(TEXT));
+            ui.add_space(3.0);
+            ui.horizontal_wrapped(|ui| {
+                activity_legend_item(
+                    ui,
+                    CYAN.gamma_multiply(0.9),
+                    "BRIGHT CYAN",
+                    "stronger hashrate during that sample",
+                );
+                activity_legend_item(
+                    ui,
+                    CYAN.gamma_multiply(0.28),
+                    "DIM CYAN",
+                    "lower hashrate during that sample",
+                );
+                activity_legend_item(
+                    ui,
+                    GREEN.gamma_multiply(0.9),
+                    "GREEN",
+                    "the mempool contained transactions during that sample",
+                );
+            });
+        });
+}
+
+fn activity_legend_item(ui: &mut egui::Ui, color: Color32, label: &str, meaning: &str) {
+    Frame::new()
+        .fill(CARD.gamma_multiply(0.7))
+        .corner_radius(CornerRadius::same(5))
+        .inner_margin(Margin::symmetric(7, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (swatch, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(swatch, CornerRadius::same(2), color);
+                ui.label(RichText::new(label).size(9.0).strong().color(color));
+                ui.label(RichText::new(meaning).size(9.0).color(MUTED));
+            });
+        });
+}
+
+fn capture_memory_snapshot(system: &mut System) -> Option<MemorySnapshot> {
+    system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    memory_snapshot_from_readings(system.available_memory(), system.total_memory())
+}
+
+fn memory_snapshot_from_readings(available: u64, total: u64) -> Option<MemorySnapshot> {
+    (total > 0 && available <= total).then_some(MemorySnapshot { available, total })
+}
+
+fn recommended_worker_limit(snapshot: MemorySnapshot) -> u64 {
+    let usable = snapshot
+        .available
+        .saturating_sub(memory_headroom_bytes(snapshot.total));
+    (usable / randomx_memory_bytes(1)).min(64)
+}
+
+fn format_memory(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / BYTES_PER_GIB)
+}
+
+fn activity_cell_color(sample: &MeterSample, max_rate: f64) -> Color32 {
+    let activity = (sample.smoothed_hashrate / max_rate.max(1.0)).clamp(0.0, 1.0) as f32;
+    let color = if sample.mempool.unwrap_or(0) > 0 {
+        GREEN
+    } else {
+        CYAN
+    };
+    color.gamma_multiply(0.12 + activity * 0.76)
 }
 
 fn format_eta(seconds: f64) -> String {
@@ -2660,12 +3049,159 @@ mod tests {
         app.algorithm = "RandomX".into();
         app.height = Some(10_126);
         app.coinbase = Some("confirmed-reward-account".into());
+        app.peer_count = Some(4);
+        app.memory_snapshot = Some(MemorySnapshot {
+            available: gib_to_bytes(12.0),
+            total: gib_to_bytes(16.0),
+        });
         let copied = app.diagnostics_text();
         assert!(copied.contains("192.168.0.244:8645"));
         assert!(copied.contains("RandomX"));
         assert!(copied.contains("10126"));
         assert!(copied.contains("confirmed-reward-account"));
+        assert!(copied.contains("authenticated node peers: 4"));
+        assert!(copied.contains("12.0 GiB available / 16.0 GiB total"));
         assert!(!copied.contains("wallet-secret-must-not-copy"));
+    }
+
+    #[test]
+    fn memory_scan_validation_preflight_and_worker_recommendation_are_conservative() {
+        let total = gib_to_bytes(16.0);
+        let reserve = memory_headroom_bytes(total);
+        assert_eq!(reserve, total / 10);
+        assert_eq!(memory_headroom_bytes(gib_to_bytes(8.0)), gib_to_bytes(1.5));
+        assert_eq!(
+            memory_headroom_bytes(gib_to_bytes(128.0)),
+            gib_to_bytes(4.0)
+        );
+        assert_eq!(
+            memory_snapshot_from_readings(0, total).unwrap().available,
+            0
+        );
+        assert_eq!(memory_snapshot_from_readings(1, 0), None);
+        assert_eq!(memory_snapshot_from_readings(total + 1, total), None);
+
+        let mut app = MinerApp::default();
+        app.settings.workers = 3;
+        let exact = randomx_memory_bytes(3) + reserve;
+        app.memory_snapshot = Some(MemorySnapshot {
+            available: exact,
+            total,
+        });
+        assert_eq!(app.memory_preflight_error(), None);
+        app.memory_snapshot = Some(MemorySnapshot {
+            available: exact - 1,
+            total,
+        });
+        assert!(app
+            .memory_preflight_error()
+            .unwrap()
+            .contains("Start blocked"));
+
+        let no_capacity = MemorySnapshot {
+            available: reserve,
+            total,
+        };
+        assert_eq!(recommended_worker_limit(no_capacity), 0);
+        assert_eq!(
+            recommended_worker_limit(MemorySnapshot {
+                available: gib_to_bytes(256.0),
+                total: gib_to_bytes(256.0),
+            }),
+            64
+        );
+
+        app.settings.workers = 1;
+        app.memory_snapshot = None;
+        app.memory_acknowledged = false;
+        assert!(app.memory_preflight_error().is_some());
+        app.memory_acknowledged = true;
+        assert_eq!(app.memory_preflight_error(), None);
+    }
+
+    #[test]
+    fn headless_memory_confirmation_is_only_forwarded_for_acknowledged_scan_failure() {
+        fn args(app: &MinerApp) -> Vec<String> {
+            app.headless_command(Path::new("xus-miner-test"))
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        }
+
+        let mut app = MinerApp::default();
+        app.memory_snapshot = Some(MemorySnapshot {
+            available: gib_to_bytes(12.0),
+            total: gib_to_bytes(16.0),
+        });
+        app.memory_acknowledged = false;
+        assert!(!args(&app)
+            .iter()
+            .any(|arg| arg == "--confirm-randomx-memory"));
+
+        app.memory_acknowledged = true;
+        assert!(!args(&app)
+            .iter()
+            .any(|arg| arg == "--confirm-randomx-memory"));
+
+        app.memory_snapshot = None;
+        app.memory_acknowledged = false;
+        assert!(!args(&app)
+            .iter()
+            .any(|arg| arg == "--confirm-randomx-memory"));
+
+        app.memory_acknowledged = true;
+        let args = args(&app);
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "--confirm-randomx-memory")
+                .count(),
+            1
+        );
+        assert!(args.iter().any(|arg| arg == "--password-stdin"));
+        assert!(!args.iter().any(|arg| arg == &app.settings.password));
+    }
+
+    #[test]
+    fn activity_cell_semantics_and_peer_staleness_are_explicit() {
+        assert_eq!(MAX_ACTIVITY_CELLS, 48);
+        assert!(ACTIVITY_CELL_SUMMARY.contains("not an incoming job"));
+        assert!(ACTIVITY_CELL_SUMMARY.contains("individual hash"));
+
+        let low = MeterSample {
+            hashrate: 100.0,
+            smoothed_hashrate: 100.0,
+            mempool: Some(0),
+            height: Some(1),
+            round_probability: Some(0.0),
+        };
+        let high = MeterSample {
+            smoothed_hashrate: 1_000.0,
+            ..low
+        };
+        let with_transactions = MeterSample {
+            mempool: Some(1),
+            ..high
+        };
+        let dim_cyan = activity_cell_color(&low, 1_000.0);
+        let bright_cyan = activity_cell_color(&high, 1_000.0);
+        assert!(bright_cyan.r() > dim_cyan.r());
+        assert!(bright_cyan.g() > dim_cyan.g());
+        assert_eq!(
+            activity_cell_color(&with_transactions, 1_000.0),
+            GREEN.gamma_multiply(0.88)
+        );
+
+        let mut app = MinerApp::default();
+        app.apply_telemetry(&json!({"event": "peers", "count": 4}));
+        assert_eq!(app.peer_count, Some(4));
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "height": 1,
+            "hashrate": 1.0,
+            "peer_count": null,
+            "mempool_size": 0,
+        }));
+        assert_eq!(app.peer_count, None);
     }
 
     #[test]
@@ -2733,6 +3269,187 @@ mod tests {
         app.apply_telemetry(&json!({"event": "session_error", "message": "offline"}));
         assert_eq!(app.solo_block_eta_seconds(), None);
         assert_eq!(app.current_round_probability(), None);
+    }
+
+    #[test]
+    fn explicit_jobless_metrics_clear_confirmed_active_work() {
+        let mut app = MinerApp::default();
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 42,
+            "algorithm": "RandomX",
+            "job_id": "job-42",
+            "coinbase": "reward-account",
+            "expected_hashes": 1_000.0,
+        }));
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "height": 42,
+            "hashrate": 100.0,
+            "round_height": 42,
+            "round_hashes": 100,
+            "round_probability": 0.1,
+        }));
+        assert!(app.job_observed_in_metrics);
+
+        app.apply_telemetry(&json!({
+            "event": "share",
+            "submitted": 1,
+            "accepted": 1,
+            "rejected": 0,
+        }));
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "height": null,
+            "hashrate": 0.0,
+            "round_height": 42,
+            "round_hashes": 100,
+            "round_probability": 0.1,
+        }));
+
+        assert_eq!(app.height, None);
+        assert_eq!(app.algorithm, "—");
+        assert_eq!(app.job_id, WAITING_FOR_WORK);
+        assert_eq!(app.coinbase, None);
+        assert_eq!(app.expected_hashes, None);
+        assert_eq!(app.round_hashes, 0);
+        assert_eq!(app.round_probability, None);
+        assert_eq!(app.height_started_at, None);
+        assert_eq!(app.meter_history.back().unwrap().height, None);
+    }
+
+    #[test]
+    fn raced_jobless_metrics_do_not_erase_a_newer_unconfirmed_job() {
+        let mut app = MinerApp::default();
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 43,
+            "algorithm": "RandomX",
+            "job_id": "job-43",
+            "expected_hashes": 2_000.0,
+        }));
+
+        // This can be a reporter sample assembled before the job event and
+        // emitted after it. One such sample must not erase the newer work.
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "height": null,
+            "hashrate": 0.0,
+            "round_height": 42,
+        }));
+        assert_eq!(app.height, Some(43));
+        assert_eq!(app.job_id, "job-43");
+        assert_eq!(app.jobless_metrics_seen, 1);
+
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "height": 43,
+            "hashrate": 100.0,
+            "round_height": 43,
+        }));
+        assert!(app.job_observed_in_metrics);
+        assert_eq!(app.jobless_metrics_seen, 0);
+
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "height": null,
+            "hashrate": 0.0,
+            "round_height": 43,
+        }));
+        assert_eq!(app.height, None);
+        assert_eq!(app.job_id, WAITING_FOR_WORK);
+    }
+
+    #[test]
+    fn repeated_jobless_metrics_or_session_loss_clear_unconfirmed_work() {
+        let mut app = MinerApp::default();
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 44,
+            "algorithm": "RandomX",
+            "job_id": "job-44",
+        }));
+        let no_job = json!({
+            "event": "metrics",
+            "height": null,
+            "hashrate": 0.0,
+        });
+        app.apply_telemetry(&no_job);
+        assert_eq!(app.job_id, "job-44");
+        app.apply_telemetry(&no_job);
+        assert_eq!(app.job_id, WAITING_FOR_WORK);
+
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 45,
+            "algorithm": "RandomX",
+            "job_id": "job-45",
+        }));
+        app.apply_telemetry(&json!({
+            "event": "session_error",
+            "message": "connection lost",
+        }));
+        assert_eq!(app.height, None);
+        assert_eq!(app.job_id, WAITING_FOR_WORK);
+        assert_eq!(app.coinbase, None);
+    }
+
+    #[test]
+    fn explicit_job_clear_requires_the_current_job_identity() {
+        let mut app = MinerApp::default();
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 42,
+            "algorithm": "RandomX",
+            "job_id": "job-42",
+        }));
+
+        app.apply_telemetry(&json!({
+            "event": "job_cleared",
+            "height": 42,
+            "job_id": "different-job",
+            "reason": "accepted_block",
+        }));
+        app.apply_telemetry(&json!({
+            "event": "job_cleared",
+            "height": 41,
+            "job_id": "job-42",
+            "reason": "accepted_block",
+        }));
+        assert_eq!(app.height, Some(42));
+        assert_eq!(app.job_id, "job-42");
+        assert_eq!(app.last_found_block, None);
+
+        app.apply_telemetry(&json!({
+            "event": "job",
+            "height": 43,
+            "algorithm": "RandomX",
+            "job_id": "job-43",
+        }));
+        app.apply_telemetry(&json!({
+            "event": "job_cleared",
+            "height": 42,
+            "job_id": "job-42",
+            "reason": "accepted_block",
+        }));
+        assert_eq!(app.height, Some(43));
+        assert_eq!(app.job_id, "job-43");
+        assert_eq!(app.last_found_block, None);
+
+        app.apply_telemetry(&json!({
+            "event": "job_cleared",
+            "height": 43,
+            "job_id": "job-43",
+            "reason": "accepted_block",
+        }));
+        assert_eq!(app.height, None);
+        assert_eq!(app.job_id, WAITING_FOR_WORK);
+        assert_eq!(app.algorithm, "—");
+        assert!(app.last_found_block.is_some_and(|(height, _)| height == 43));
+        assert!(app
+            .logs
+            .back()
+            .is_some_and(|line| line.text.contains("BLOCK FOUND AND ACCEPTED")));
     }
 
     #[test]

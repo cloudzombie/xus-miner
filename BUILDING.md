@@ -9,12 +9,19 @@
 - Internet access during the first dependency fetch; third-party crates are
   checksummed and frozen by exact direct versions plus `Cargo.lock`
 - Approximately 4 GiB free disk space for a clean debug plus release build
-- At least 3 GiB free RAM per full-dataset RandomX worker
+- Approximately 2.3 GiB available RAM per full-dataset RandomX worker, plus the
+  miner's conservative OS/application reserve (at least 1.5 GiB)
 - Maintainer validation only: Python 3.11+ and Ruby with its standard Psych YAML
   parser. Neither is linked into or required to run the miner binary.
 
 The miner has no SOV source dependency, does not require a SOV checkout, and
 must not be built as part of one.
+
+At runtime the GUI refreshes only the operating system's RAM counters every ten
+seconds and immediately before Start. The isolated/headless engine checks the
+same counters again immediately before its first RandomX job. Neither path
+inventories processes, CPU, disks, network interfaces, users, or swap, and
+neither performs GPU work.
 
 For the strongest isolation, use an attested GitHub release built on an
 ephemeral hosted runner where SOV is absent. A local Cargo build executes locked
@@ -74,6 +81,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --bin xus-miner
 cargo test --locked --test miner_protocol
+cargo test --locked --test rpc_0199_protocol
 cargo audit --deny warnings
 cargo build --locked --release
 ```
