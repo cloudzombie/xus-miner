@@ -85,6 +85,9 @@ impl TemplateFixture {
             "versionBits": VERSION_BITS,
             "blob": hex::encode(&blob),
             "nonceOffset": blob.len() - 8,
+            // NOTE: the live sov_getBlockTemplate reply carries NO transaction
+            // list or count — only the txRoot commitment above — so the
+            // forming-block tile's tx count must stay a placeholder.
         });
         Self {
             blob,
@@ -447,6 +450,52 @@ fn handle_rpc_connection(
                 "syncing": false,
             }
         }),
+        // Live-verified shape: a bare integer count.
+        "sov_getMempoolSize" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": 2,
+        }),
+        // Live-verified shape: feeGrains is a decimal string in grains.
+        "sov_estimateFee" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "feeGrains": "1651760",
+                "gasPriceGrains": "10",
+                "gasUsed": 165_176,
+                "kind": "transfer",
+            },
+        }),
+        // Live-verified shape: {"header": {...}, "transactions": [...]} with
+        // no top-level hash and no txIds/txCount fields.
+        "sov_getBlockByHeight" => match params.get("height").and_then(Value::as_u64) {
+            Some(height) if height < HEIGHT => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "header": {
+                        "height": height,
+                        "prevHash": "11".repeat(32),
+                        "txRoot": "22".repeat(32),
+                        "timestampMs": TIMESTAMP_MS - 1,
+                        "proposer": COINBASE,
+                    },
+                    "transactions": [
+                        {"kind": "transfer", "nonce": 1},
+                        {"kind": "transfer", "nonce": 2},
+                    ],
+                }
+            }),
+            _ => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32602,
+                    "message": "unknown or unconfirmed height",
+                }
+            }),
+        },
         "sov_submitBlock" => {
             let is_sha_fixture =
                 fixture.response.get("powAlgo").and_then(Value::as_str) == Some("Sha256d");
@@ -556,7 +605,10 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
     let mut saw_job = false;
     let mut saw_peers = false;
     let mut saw_accepted_share = false;
-    while Instant::now() < deadline && !(saw_job && saw_peers && saw_accepted_share) {
+    let mut saw_block_flow = false;
+    while Instant::now() < deadline
+        && !(saw_job && saw_peers && saw_accepted_share && saw_block_flow)
+    {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let event = match telemetry_rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
             Ok(event) => event,
@@ -581,12 +633,28 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
                 assert_eq!(event["rejected"], json!(0));
                 saw_accepted_share = true;
             }
+            Some("block_flow") => {
+                // Every strip value must be exactly what the mock node served
+                // in the live-verified shapes: per-block `transactions` array
+                // lengths, string `feeGrains`, and — because the real template
+                // exposes no transaction list — a null forming-tile count.
+                assert_eq!(event.pointer("/template/height"), Some(&json!(HEIGHT)));
+                assert_eq!(event.pointer("/template/tx_count"), Some(&Value::Null));
+                assert_eq!(event["tip_height"], json!(HEIGHT - 1));
+                assert_eq!(event["fee_grains"], json!(1_651_760));
+                let recent = event["recent"].as_array().expect("recent tiles");
+                assert!(!recent.is_empty());
+                assert_eq!(recent[0]["height"], json!(HEIGHT - 1));
+                assert_eq!(recent[0]["tx_count"], json!(2));
+                assert_eq!(recent[0]["mine"], json!(false));
+                saw_block_flow = true;
+            }
             _ => {}
         }
     }
     assert!(
-        saw_job && saw_peers && saw_accepted_share,
-        "missing required telemetry (job={saw_job}, peers={saw_peers}, share={saw_accepted_share}); miner stderr:\n{}",
+        saw_job && saw_peers && saw_accepted_share && saw_block_flow,
+        "missing required telemetry (job={saw_job}, peers={saw_peers}, share={saw_accepted_share}, block_flow={saw_block_flow}); miner stderr:\n{}",
         stderr_log.lock().expect("stderr log lock")
     );
 
@@ -605,6 +673,9 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
                     "sov_getBlockTemplate",
                     "sov_getDifficulty",
                     "sov_getPeerInfo",
+                    "sov_getMempoolSize",
+                    "sov_estimateFee",
+                    "sov_getBlockByHeight",
                     "sov_submitBlock",
                 ]
                 .iter()
