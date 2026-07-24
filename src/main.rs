@@ -2059,10 +2059,27 @@ System-wide memory free percentage: 62%
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_memory_probe_repeats_without_entering_application_ffi() {
+        // The probe's contract is to repeat safely (no application FFI) and
+        // return a self-consistent, STABLE reading — NOT to prove a host RAM
+        // size. GitHub's hosted macOS runners have ~7 GiB, legitimately below a
+        // developer machine, so a hard ">= 8 GiB" floor is a false failure. A
+        // low floor still catches a gross misparse, and requiring the total to
+        // be identical across calls catches an unstable/racing one.
+        let (_, first_total) = query_memory_counters().unwrap();
+        assert!(
+            first_total >= gib_to_bytes(2.0),
+            "implausible total physical memory from memory_pressure: {first_total} bytes"
+        );
         for _ in 0..32 {
             let (available, total) = query_memory_counters().unwrap();
-            assert!(total >= gib_to_bytes(8.0));
-            assert!(available <= total);
+            assert!(
+                available <= total,
+                "available {available} exceeded total {total}"
+            );
+            assert_eq!(
+                total, first_total,
+                "total physical memory drifted between probes"
+            );
         }
     }
 
