@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.1.5
+
+- Complete the mempool.space-style block-flow strip by consuming the SOV
+  node's new v0.1.99 parity RPCs, with strict graceful degradation: these
+  RPCs are built but not yet deployed to the live network, so every consumer
+  falls back to its honest placeholder on a pre-upgrade node (verified by a
+  dedicated legacy-node integration test) and lights up automatically once
+  nodes upgrade. No rendered number is ever invented.
+  - **Projected pending blocks** from the new `sov_getMempoolHistogram`:
+    effective-tip fee buckets (decimal-string grains, highest first) packed
+    into blocks by the node's own `maxBlockTxs` capacity — the blockspace
+    auction's real per-block unit. The first packed block is the forming
+    template block (already rendered from real template data), so only the
+    overflow beyond it appears as projected tiles, each showing its real
+    transaction count and effective-tip range; the tail past the render cap
+    merges into the last tile so nothing pending is dropped. An old node
+    (method not found), a malformed reply, or an empty mempool renders NO
+    projected tiles — the honest state.
+  - **FEE TO GET IN** now uses `sov_estimateFee`'s new `floorGrains` — the
+    live next-block auction floor — when the node serves it, falling back to
+    the flat `feeGrains` estimate on a pre-upgrade node.
+  - The **forming tile's transaction count** reads the template's new
+    `txCount`/`txIds` fields; a pre-upgrade template (txRoot only) keeps the
+    honest "—".
+  - The **★ YOURS highlight** is exact wherever the upgraded
+    `sov_getBlockByHeight` discloses `header.hash` (hash identity is
+    authoritative, so a same-height reorg can never mislabel someone else's
+    block); the accepted-height fallback remains for pre-upgrade nodes.
+  - The mock node in `tests/rpc_0199_protocol.rs` serves the exact upgraded
+    reply shapes (pinning the real contract) and a legacy pre-upgrade mode;
+    tests cover both paths end to end, including histogram → projected-tile
+    packing, floor-over-fee preference, and every missing-RPC fallback.
+- Relabel the PoW flight recorder to make its fixed rolling window obvious:
+  the header now reads `POW FLIGHT RECORDER • ROLLING LAST <span> (OLDEST
+  DROPS OFF)` instead of a `LAST <span>` that plateaued like a frozen uptime
+  counter once the ~6-minute sample buffer filled. Pure label change; the
+  sampling logic and bounds are untouched.
+
 ## 0.1.4
 
 - **Fix a field GUI crash present in v0.1.3** (captured by the v0.1.3 crash

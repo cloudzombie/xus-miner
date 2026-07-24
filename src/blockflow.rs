@@ -6,14 +6,11 @@
 //! rendered as a neutral placeholder; nothing here invents, estimates, or
 //! fabricates a value.
 //!
-//! OUT OF SCOPE (documented seam): mempool.space renders several *projected*
-//! pending blocks, each a distinct fee-rate bucket. That requires the
-//! mempool's fee histogram, which the SOV node does not expose today —
-//! `sov_getMempoolSize` returns one count and `sov_estimateFee` one estimate.
-//! Exposing a histogram is an additive node RPC and therefore a separately
-//! authorized SOV-repository task; this module must not fake the buckets.
-//! When such an RPC exists, extend the engine's `block_flow` event with the
-//! histogram and add the projected tiles beside the single forming tile.
+//! Projected pending blocks (mempool.space's multi-block view) come from the
+//! additive `sov_getMempoolHistogram` RPC: effective-tip fee buckets, highest
+//! first, packed into blocks by the node's own `maxBlockTxs` capacity. An
+//! older node without the RPC — or an empty mempool — yields NO projected
+//! blocks; that honest absence renders as no tiles, never invented ones.
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -27,6 +24,10 @@ pub(crate) const MAX_FETCH_PER_REFRESH: usize = 4;
 const MAX_SEALED_TRACKED: usize = 32;
 /// Sanity bound for a hash string taken from an RPC response.
 const MAX_HASH_CHARS: usize = 128;
+/// Projected pending blocks rendered beside the forming tile; the packing
+/// tail beyond this cap merges into the last projected block (as
+/// mempool.space does) so nothing pending is silently dropped.
+pub(crate) const MAX_PROJECTED_BLOCKS: usize = 6;
 
 /// The object that actually carries block fields: some RPC shapes nest the
 /// block under a `block` key; use it when present, else the value itself.
@@ -44,10 +45,10 @@ fn block_facet(value: &Value) -> &Value {
 /// shape. Absent both, the count is unknown and the UI must show a
 /// placeholder — never a guess.
 ///
-/// NOTE: the current `sov_getBlockTemplate` reply exposes NO transaction list
-/// or count (only `txRoot`), so for the forming template block this returns
-/// `None` and the tile honestly renders "—" until the node ever discloses
-/// template transactions.
+/// NOTE: pre-upgrade `sov_getBlockTemplate` replies expose NO transaction
+/// list or count (only `txRoot`), so for those the forming template block
+/// yields `None` and the tile honestly renders "—". The upgraded node's
+/// template includes `txCount` + `txIds`, which this reads automatically.
 pub(crate) fn tx_count(value: &Value) -> Option<u64> {
     let facet = block_facet(value);
     if let Some(transactions) = facet.get("transactions").and_then(Value::as_array) {
@@ -56,7 +57,8 @@ pub(crate) fn tx_count(value: &Value) -> Option<u64> {
     if let Some(ids) = facet.get("txIds").and_then(Value::as_array) {
         return Some(ids.len() as u64);
     }
-    None
+    // Upgraded-node block template / digest: an explicit integer count.
+    facet.get("txCount").and_then(Value::as_u64)
 }
 
 /// The block's own hash, when the node discloses one. The live
@@ -84,9 +86,129 @@ pub(crate) fn fee_grains(value: &Value) -> Option<u64> {
     if let Some(fee) = value.as_u64() {
         return Some(fee);
     }
-    let fee = value.get("feeGrains")?;
-    fee.as_u64()
-        .or_else(|| fee.as_str().and_then(|raw| raw.trim().parse::<u64>().ok()))
+    grains(value.get("feeGrains")?)
+}
+
+/// A grains amount the node encodes either as an integer or (its live
+/// convention for large amounts) a decimal string.
+fn grains(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+    })
+}
+
+/// The fee-to-get-in for the strip: the upgraded node's `sov_estimateFee`
+/// additionally returns `floorGrains` — the live next-block auction floor —
+/// which is the real "fee to get in" and is preferred when present. An older
+/// node without it falls back to the flat `feeGrains` estimate; neither
+/// present yields `None` (placeholder), never a guess.
+pub(crate) fn fee_floor_grains(value: &Value) -> Option<u64> {
+    value
+        .get("floorGrains")
+        .and_then(grains)
+        .or_else(|| fee_grains(value))
+}
+
+/// One effective-tip fee bucket of `sov_getMempoolHistogram`, exactly as the
+/// node serves it (`feeRateGrains` is a decimal-string grains rate; buckets
+/// arrive highest-tip first, capped at 128 with the low-tip tail merged).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HistogramBucket {
+    pub(crate) fee_rate_grains: u64,
+    pub(crate) tx_count: u64,
+}
+
+/// The parsed `sov_getMempoolHistogram` reply. `None` for any malformed or
+/// missing field: an old node (method not found) or a bad reply degrades to
+/// "no projected blocks", never to invented ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MempoolHistogram {
+    pub(crate) tx_count: u64,
+    pub(crate) max_block_txs: u64,
+    pub(crate) buckets: Vec<HistogramBucket>,
+}
+
+pub(crate) fn mempool_histogram(value: &Value) -> Option<MempoolHistogram> {
+    let tx_count = grains(value.get("txCount")?)?;
+    let max_block_txs = grains(value.get("maxBlockTxs")?)?;
+    let buckets = value
+        .get("buckets")?
+        .as_array()?
+        .iter()
+        .map(|bucket| {
+            Some(HistogramBucket {
+                fee_rate_grains: grains(bucket.get("feeRateGrains")?)?,
+                tx_count: grains(bucket.get("txCount")?)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(MempoolHistogram {
+        tx_count,
+        max_block_txs,
+        buckets,
+    })
+}
+
+/// One projected pending block: real bucketed mempool transactions packed by
+/// the node's own per-block transaction capacity, with the effective-tip
+/// range they span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectedBlock {
+    pub(crate) tx_count: u64,
+    pub(crate) fee_min_grains: u64,
+    pub(crate) fee_max_grains: u64,
+}
+
+/// Pack the histogram's buckets (highest effective tip first, the node's
+/// auction admission order) into blocks of `maxBlockTxs` transactions — the
+/// capacity unit the node itself reports and the blockspace auction uses.
+/// The FIRST packed block is the forming template block, which the strip
+/// already renders from real template data, so only the blocks BEYOND it are
+/// returned as projected tiles. Everything past `MAX_PROJECTED_BLOCKS`
+/// merges into the last tile. An empty mempool, a zero capacity, or no
+/// overflow beyond the forming block yields no projected tiles.
+pub(crate) fn projected_blocks(histogram: &MempoolHistogram) -> Vec<ProjectedBlock> {
+    if histogram.max_block_txs == 0 || histogram.tx_count == 0 {
+        return Vec::new();
+    }
+    let mut blocks: Vec<ProjectedBlock> = Vec::new();
+    let mut room = 0_u64;
+    for bucket in &histogram.buckets {
+        let mut remaining = bucket.tx_count;
+        while remaining > 0 {
+            if room == 0 {
+                if blocks.len() > MAX_PROJECTED_BLOCKS {
+                    // At the render cap: the whole tail merges into the
+                    // last projected block instead of growing the packing.
+                    let last = blocks.last_mut().expect("capped packing has blocks");
+                    last.tx_count += remaining;
+                    last.fee_min_grains = last.fee_min_grains.min(bucket.fee_rate_grains);
+                    last.fee_max_grains = last.fee_max_grains.max(bucket.fee_rate_grains);
+                    break;
+                }
+                blocks.push(ProjectedBlock {
+                    tx_count: 0,
+                    fee_min_grains: bucket.fee_rate_grains,
+                    fee_max_grains: bucket.fee_rate_grains,
+                });
+                room = histogram.max_block_txs;
+            }
+            let take = remaining.min(room);
+            let block = blocks.last_mut().expect("current packing block");
+            block.tx_count += take;
+            block.fee_min_grains = block.fee_min_grains.min(bucket.fee_rate_grains);
+            block.fee_max_grains = block.fee_max_grains.max(bucket.fee_rate_grains);
+            room -= take;
+            remaining -= take;
+        }
+    }
+    // Drop the forming block; keep only the projected overflow behind it.
+    if blocks.len() <= 1 {
+        return Vec::new();
+    }
+    blocks.split_off(1)
 }
 
 /// The pending-transaction count from `sov_getMempoolSize`. The live node
@@ -242,14 +364,21 @@ mod tests {
             tx_count(&json!({"block": {"height": 7, "transactions": [{}]}})),
             Some(1)
         );
-        // Unknown stays unknown: no invented count. The live block template
-        // carries only txRoot — no list, no count — and must yield None.
+        // Unknown stays unknown: no invented count. The pre-upgrade block
+        // template carries only txRoot — no list, no count — and yields None.
         assert_eq!(
             tx_count(&json!({"height": 7, "txRoot": "22".repeat(32)})),
             None
         );
         assert_eq!(tx_count(&json!({"transactions": "three"})), None);
-        assert_eq!(tx_count(&json!({"txCount": 12})), None);
+        // The upgraded node's template discloses an explicit integer count.
+        assert_eq!(tx_count(&json!({"txCount": 12})), Some(12));
+        assert_eq!(tx_count(&json!({"txCount": "12"})), None);
+        // A disclosed txIds list is authoritative over the count field.
+        assert_eq!(
+            tx_count(&json!({"txCount": 12, "txIds": ["aa", "bb"]})),
+            Some(2)
+        );
     }
 
     #[test]
@@ -301,6 +430,164 @@ mod tests {
         assert_eq!(mempool_size(&json!({"size": 4})), Some(4));
         assert_eq!(mempool_size(&json!({"txs": 9})), None);
         assert_eq!(mempool_size(&json!(null)), None);
+    }
+
+    #[test]
+    fn fee_floor_prefers_the_auction_floor_and_falls_back_to_fee_grains() {
+        // Upgraded node: floorGrains (the live next-block auction floor) wins
+        // over the flat feeGrains estimate.
+        assert_eq!(
+            fee_floor_grains(&json!({
+                "feeGrains": "1651760",
+                "floorGrains": "7000",
+                "tipFloorGrains": "0",
+                "gasPriceGrains": "10",
+                "gasUsed": 165_176,
+                "kind": "transfer",
+            })),
+            Some(7_000)
+        );
+        assert_eq!(
+            fee_floor_grains(&json!({"floorGrains": 0, "feeGrains": "1651760"})),
+            Some(0)
+        );
+        // Pre-upgrade node: no floorGrains — the flat estimate is used.
+        assert_eq!(
+            fee_floor_grains(&json!({"feeGrains": "1651760", "gasUsed": 165_176})),
+            Some(1_651_760)
+        );
+        // A malformed floor falls back to the flat estimate, never a guess.
+        assert_eq!(
+            fee_floor_grains(&json!({"floorGrains": "abc", "feeGrains": 250})),
+            Some(250)
+        );
+        assert_eq!(fee_floor_grains(&json!({"kind": "transfer"})), None);
+    }
+
+    #[test]
+    fn mempool_histogram_parses_the_live_shape_and_rejects_malformed_replies() {
+        // The exact upgraded-node reply shape (grains fields are strings).
+        let parsed = mempool_histogram(&json!({
+            "txCount": 2,
+            "floorGrains": "7000",
+            "poolFloorGrains": "0",
+            "maxBlockTxs": 1,
+            "buckets": [
+                {"feeRateGrains": "7000", "txCount": 1, "totalBytes": 305},
+                {"feeRateGrains": "0", "txCount": 1, "totalBytes": 262},
+            ],
+        }))
+        .expect("live histogram shape parses");
+        assert_eq!(parsed.tx_count, 2);
+        assert_eq!(parsed.max_block_txs, 1);
+        assert_eq!(
+            parsed.buckets,
+            vec![
+                HistogramBucket {
+                    fee_rate_grains: 7_000,
+                    tx_count: 1,
+                },
+                HistogramBucket {
+                    fee_rate_grains: 0,
+                    tx_count: 1,
+                },
+            ]
+        );
+
+        // Old node / error / malformed: honest None, never invented buckets.
+        assert_eq!(mempool_histogram(&json!(null)), None);
+        assert_eq!(mempool_histogram(&json!({})), None);
+        assert_eq!(
+            mempool_histogram(&json!({"txCount": 2, "maxBlockTxs": 1})),
+            None
+        );
+        assert_eq!(
+            mempool_histogram(&json!({
+                "txCount": 2,
+                "maxBlockTxs": 1,
+                "buckets": [{"feeRateGrains": "abc", "txCount": 1}],
+            })),
+            None
+        );
+        assert_eq!(
+            mempool_histogram(&json!({
+                "txCount": 2,
+                "maxBlockTxs": 1,
+                "buckets": "none",
+            })),
+            None
+        );
+    }
+
+    fn histogram(max_block_txs: u64, buckets: &[(u64, u64)]) -> MempoolHistogram {
+        MempoolHistogram {
+            tx_count: buckets.iter().map(|(_, count)| count).sum(),
+            max_block_txs,
+            buckets: buckets
+                .iter()
+                .map(|&(fee_rate_grains, tx_count)| HistogramBucket {
+                    fee_rate_grains,
+                    tx_count,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn projected_blocks_pack_beyond_the_forming_block_by_node_capacity() {
+        // The live two-transaction sample: capacity 1, so the 7000-grain tx
+        // fills the forming block and the zero-tip tx is one projected block.
+        assert_eq!(
+            projected_blocks(&histogram(1, &[(7_000, 1), (0, 1)])),
+            vec![ProjectedBlock {
+                tx_count: 1,
+                fee_min_grains: 0,
+                fee_max_grains: 0,
+            }]
+        );
+
+        // A bucket spanning blocks keeps its fee rate in each block's range.
+        assert_eq!(
+            projected_blocks(&histogram(3, &[(9_000, 2), (5_000, 4), (100, 1)])),
+            vec![
+                ProjectedBlock {
+                    tx_count: 3,
+                    fee_min_grains: 5_000,
+                    fee_max_grains: 5_000,
+                },
+                ProjectedBlock {
+                    tx_count: 1,
+                    fee_min_grains: 100,
+                    fee_max_grains: 100,
+                },
+            ]
+        );
+
+        // Everything fitting in the forming block projects nothing.
+        assert_eq!(projected_blocks(&histogram(8, &[(7_000, 2)])), Vec::new());
+        // An empty mempool or a zero capacity projects nothing.
+        assert_eq!(projected_blocks(&histogram(4, &[])), Vec::new());
+        assert_eq!(projected_blocks(&histogram(0, &[(7_000, 5)])), Vec::new());
+    }
+
+    #[test]
+    fn projected_blocks_merge_the_tail_into_the_last_tile_at_the_cap() {
+        // 1 forming + far more than the cap: capacity 2, 30 transactions in
+        // one 400-grain bucket then 4 in a 10-grain bucket.
+        let projected = projected_blocks(&histogram(2, &[(400, 30), (10, 4)]));
+        assert_eq!(projected.len(), MAX_PROJECTED_BLOCKS);
+        // 2 txs formed; the first cap-1 tiles carry 2 each; the last tile
+        // absorbs the whole remaining tail including the low-tip bucket.
+        for block in &projected[..MAX_PROJECTED_BLOCKS - 1] {
+            assert_eq!(block.tx_count, 2);
+            assert_eq!(block.fee_min_grains, 400);
+            assert_eq!(block.fee_max_grains, 400);
+        }
+        let last = projected.last().expect("capped tail tile");
+        let packed: u64 = projected.iter().map(|block| block.tx_count).sum();
+        assert_eq!(packed, 34 - 2, "no pending transaction is dropped");
+        assert_eq!(last.fee_min_grains, 10);
+        assert_eq!(last.fee_max_grains, 400);
     }
 
     #[test]

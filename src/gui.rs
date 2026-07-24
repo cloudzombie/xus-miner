@@ -907,24 +907,38 @@ struct BlockFlowTile {
     mine: bool,
 }
 
+/// One projected pending block beyond the forming template: real
+/// `sov_getMempoolHistogram` buckets packed by the node's own per-block
+/// transaction capacity (done in the engine's `src/blockflow.rs`). An older
+/// node without the histogram RPC, or an empty mempool, relays no projected
+/// entries and none are rendered — never an invented tile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectedFlowTile {
+    tx_count: u64,
+    fee_min_grains: u64,
+    fee_max_grains: u64,
+}
+
 /// The mempool.space-style strip: recent confirmed blocks (newest first), the
-/// forming template block, and the node's single fee-for-inclusion estimate.
-///
-/// SEAM (out of scope here): mempool.space's several projected pending
-/// blocks need a mempool fee histogram the SOV node does not expose yet; see
-/// `src/blockflow.rs`. Only the one real forming tile is rendered.
+/// forming template block, projected pending blocks behind it, and the
+/// node's fee-to-get-in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct BlockFlowView {
     tip_height: Option<u64>,
     template_height: Option<u64>,
     template_tx_count: Option<u64>,
-    /// `sov_estimateFee`'s `feeGrains` for the next block, in grains
-    /// (1 XUS = 10^8 grains), relayed by the engine.
+    /// `sov_estimateFee`'s fee-to-get-in for the next block, in grains
+    /// (1 XUS = 10^8 grains), relayed by the engine — the live auction
+    /// `floorGrains` when the node serves it, else the flat `feeGrains`.
     fee_grains: Option<u64>,
+    projected: Vec<ProjectedFlowTile>,
     recent: Vec<BlockFlowTile>,
 }
 
 const MAX_FLOW_TILES: usize = 12;
+/// Bound on rendered projected pending tiles (the engine already merges the
+/// packing tail into its last projected block).
+const MAX_PROJECTED_FLOW_TILES: usize = 6;
 
 impl BlockFlowView {
     fn from_telemetry(value: &Value) -> Self {
@@ -933,6 +947,27 @@ impl BlockFlowView {
             template_height: value.pointer("/template/height").and_then(Value::as_u64),
             template_tx_count: value.pointer("/template/tx_count").and_then(Value::as_u64),
             fee_grains: value.get("fee_grains").and_then(Value::as_u64),
+            projected: value
+                .get("projected")
+                .and_then(Value::as_array)
+                .map(|tiles| {
+                    tiles
+                        .iter()
+                        .filter_map(|tile| {
+                            Some(ProjectedFlowTile {
+                                tx_count: tile.get("tx_count").and_then(Value::as_u64)?,
+                                fee_min_grains: tile
+                                    .get("fee_min_grains")
+                                    .and_then(Value::as_u64)?,
+                                fee_max_grains: tile
+                                    .get("fee_max_grains")
+                                    .and_then(Value::as_u64)?,
+                            })
+                        })
+                        .take(MAX_PROJECTED_FLOW_TILES)
+                        .collect()
+                })
+                .unwrap_or_default(),
             recent: value
                 .get("recent")
                 .and_then(Value::as_array)
@@ -3211,7 +3246,7 @@ impl MinerApp {
                                 .and_then(|flow| flow.fee_grains)
                                 .map_or_else(|| "—".into(), format_grains_as_xus),
                             AMBER,
-                            "sov_estimateFee feeGrains: the node's current fee to be included in the next block under the v0.1.98 blockspace auction (dynamic floor). Shown in XUS (1 XUS = 10^8 grains); '—' when the node does not expose the RPC.",
+                            "sov_estimateFee floorGrains: the live next-block auction floor under the v0.1.98 blockspace auction (older nodes without floorGrains fall back to their flat feeGrains estimate). Shown in XUS (1 XUS = 10^8 grains); '—' when the node does not expose the RPC.",
                         );
                     });
                 });
@@ -3223,6 +3258,31 @@ impl MinerApp {
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     let pulse = ui.input(|input| input.time);
+                                    // Projected pending blocks queue behind
+                                    // the forming block: the farthest-out
+                                    // tile is drawn leftmost, mirroring
+                                    // mempool.space's pending side.
+                                    for (index, tile) in flow
+                                        .projected
+                                        .iter()
+                                        .take(MAX_PROJECTED_FLOW_TILES)
+                                        .enumerate()
+                                        .rev()
+                                    {
+                                        let fade =
+                                            (1.0 - index as f32 * 0.09).clamp(0.45, 1.0);
+                                        flow_block_tile(
+                                            ui,
+                                            &format_fee_rate_range(
+                                                tile.fee_min_grains,
+                                                tile.fee_max_grains,
+                                            ),
+                                            Some(tile.tx_count),
+                                            "PROJECTED",
+                                            CYAN.gamma_multiply(fade),
+                                            FlowTileKind::Confirmed,
+                                        );
+                                    }
                                     flow_block_tile(
                                         ui,
                                         &flow
@@ -3272,7 +3332,7 @@ impl MinerApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(
-                        "Real node data only — sealed-block tx counts from sov_getBlockByHeight; the forming tile shows '—' because the node's template discloses no tx list (only txRoot). '—' always means the node did not supply that value. Your accepted blocks are highlighted.",
+                        "Real node data only — sealed-block tx counts from sov_getBlockByHeight; the forming tile's count from the template's txCount/txIds (older nodes disclose neither and show '—'); projected pending blocks from sov_getMempoolHistogram packed by the node's own per-block capacity (none shown when the node lacks the RPC or the mempool is empty). '—' always means the node did not supply that value. Your accepted blocks are highlighted.",
                     )
                     .size(9.0)
                     .color(MUTED),
@@ -4213,7 +4273,10 @@ fn mining_meter(ui: &mut egui::Ui, history: &VecDeque<MeterSample>, report_secs:
     painter.text(
         outer.left_top(),
         egui::Align2::LEFT_TOP,
-        format!("POW FLIGHT RECORDER  •  LAST {}", format_elapsed(span)),
+        format!(
+            "POW FLIGHT RECORDER  •  ROLLING LAST {} (OLDEST DROPS OFF)",
+            format_elapsed(span)
+        ),
         FontId::monospace(9.5),
         MUTED,
     );
@@ -4452,6 +4515,21 @@ fn format_count(value: u64) -> String {
 /// Render a grains amount as XUS (1 XUS = 10^8 grains) with up to five
 /// decimal places, trailing zeros trimmed. Used for the real
 /// `sov_estimateFee` `feeGrains` value only; unknown fees never reach here.
+/// Effective-tip range label for a projected pending block, in raw grains
+/// (the node's `sov_getMempoolHistogram` `feeRateGrains` unit). Both bounds
+/// are real bucket rates the engine relayed; nothing here is estimated.
+fn format_fee_rate_range(min_grains: u64, max_grains: u64) -> String {
+    if min_grains == max_grains {
+        format!("{} gr", format_count(min_grains))
+    } else {
+        format!(
+            "{}–{} gr",
+            format_count(min_grains),
+            format_count(max_grains)
+        )
+    }
+}
+
 fn format_grains_as_xus(grains: u64) -> String {
     if grains > 0 && grains < 1_000 {
         // A real, nonzero fee below the display precision must not be
@@ -5728,6 +5806,11 @@ mod tests {
             // engine relays null and the tile renders "—".
             "template": {"height": 43, "tx_count": null},
             "fee_grains": 1_651_760,
+            "projected": [
+                {"tx_count": 1, "fee_min_grains": 0, "fee_max_grains": 7_000},
+                // A tile missing any real field is dropped, not fabricated.
+                {"tx_count": 2},
+            ],
             "recent": [
                 {"height": 42, "tx_count": 3, "mine": true},
                 {"height": 41, "tx_count": null, "mine": false},
@@ -5740,6 +5823,14 @@ mod tests {
         assert_eq!(flow.template_height, Some(43));
         assert_eq!(flow.template_tx_count, None);
         assert_eq!(flow.fee_grains, Some(1_651_760));
+        assert_eq!(
+            flow.projected,
+            vec![ProjectedFlowTile {
+                tx_count: 1,
+                fee_min_grains: 0,
+                fee_max_grains: 7_000,
+            }]
+        );
         assert_eq!(
             flow.recent,
             vec![
@@ -5763,7 +5854,8 @@ mod tests {
             ]
         );
 
-        // Missing template/fee data keeps every placeholder empty.
+        // Missing template/fee/projected data keeps every placeholder empty:
+        // a pre-upgrade node yields no projected tiles, never invented ones.
         app.apply_telemetry(&json!({
             "event": "block_flow",
             "template": {},
@@ -5771,19 +5863,35 @@ mod tests {
         }));
         let flow = app.block_flow.clone().expect("block flow view");
         assert_eq!(flow, BlockFlowView::default());
+        assert!(flow.projected.is_empty());
 
         // The rendered strip is bounded even against a hostile event.
         let oversized: Vec<Value> = (0..64)
             .map(|height| json!({"height": height, "tx_count": 1}))
             .collect();
+        let oversized_projected: Vec<Value> = (0..64)
+            .map(|rate| json!({"tx_count": 1, "fee_min_grains": rate, "fee_max_grains": rate}))
+            .collect();
         app.apply_telemetry(&json!({
             "event": "block_flow",
             "recent": oversized,
+            "projected": oversized_projected,
         }));
         assert_eq!(
             app.block_flow.as_ref().map(|flow| flow.recent.len()),
             Some(MAX_FLOW_TILES)
         );
+        assert_eq!(
+            app.block_flow.as_ref().map(|flow| flow.projected.len()),
+            Some(MAX_PROJECTED_FLOW_TILES)
+        );
+    }
+
+    #[test]
+    fn projected_fee_rate_ranges_render_raw_grains() {
+        assert_eq!(format_fee_rate_range(7_000, 7_000), "7.00K gr");
+        assert_eq!(format_fee_rate_range(0, 7_000), "0–7.00K gr");
+        assert_eq!(format_fee_rate_range(0, 0), "0 gr");
     }
 
     fn meter_sample(height: Option<u64>) -> MeterSample {

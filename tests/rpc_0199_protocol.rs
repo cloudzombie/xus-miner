@@ -42,6 +42,11 @@ struct TemplateFixture {
     template_id: String,
     target: [u8; 32],
     response: Value,
+    /// Serve the pre-upgrade node's shapes: no template txCount/txIds, no
+    /// header.hash, no estimateFee floorGrains, and no
+    /// sov_getMempoolHistogram method at all. The miner must degrade to
+    /// honest placeholders against this node, never crash or invent values.
+    legacy: bool,
 }
 
 impl TemplateFixture {
@@ -85,21 +90,40 @@ impl TemplateFixture {
             "versionBits": VERSION_BITS,
             "blob": hex::encode(&blob),
             "nonceOffset": blob.len() - 8,
-            // NOTE: the live sov_getBlockTemplate reply carries NO transaction
-            // list or count — only the txRoot commitment above — so the
-            // forming-block tile's tx count must stay a placeholder.
+            // The upgraded node's template additionally discloses its real
+            // transaction count and ids; these feed the forming tile.
+            "txCount": 1,
+            "txIds": ["ab".repeat(32)],
         });
         Self {
             blob,
             template_id,
             target,
             response,
+            legacy: false,
         }
     }
 
     fn sov_0_1_99_randomx() -> Self {
         let mut fixture = Self::sov_0_1_99();
         fixture.response["powAlgo"] = json!("RandomX");
+        fixture
+    }
+
+    /// The pre-upgrade (live today) node: the same consensus contract but
+    /// none of the additive v0.1.99 parity RPC fields.
+    fn sov_pre_upgrade_legacy() -> Self {
+        let mut fixture = Self::sov_0_1_99();
+        fixture.legacy = true;
+        let template = fixture
+            .response
+            .as_object_mut()
+            .expect("template fixture object");
+        // NOTE: the pre-upgrade sov_getBlockTemplate reply carries NO
+        // transaction list or count — only the txRoot commitment — so the
+        // forming-block tile's tx count must stay a placeholder.
+        template.remove("txCount");
+        template.remove("txIds");
         fixture
     }
 }
@@ -456,37 +480,66 @@ fn handle_rpc_connection(
             "id": id,
             "result": 2,
         }),
-        // Live-verified shape: feeGrains is a decimal string in grains.
-        "sov_estimateFee" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
+        // Live-verified shape: feeGrains is a decimal string in grains. The
+        // upgraded node additionally returns the auction floor fields
+        // floorGrains + tipFloorGrains (also decimal strings).
+        "sov_estimateFee" => {
+            let mut result = json!({
                 "feeGrains": "1651760",
                 "gasPriceGrains": "10",
                 "gasUsed": 165_176,
                 "kind": "transfer",
+            });
+            if !fixture.legacy {
+                result["floorGrains"] = json!("7000");
+                result["tipFloorGrains"] = json!("0");
+            }
+            json!({"jsonrpc": "2.0", "id": id, "result": result})
+        }
+        // The upgraded node's mempool fee histogram (exact live PR shape:
+        // grains fields are decimal strings, buckets high→low effective
+        // tip). A pre-upgrade node does not know the method at all.
+        "sov_getMempoolHistogram" if !fixture.legacy => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "txCount": 2,
+                "floorGrains": "7000",
+                "poolFloorGrains": "0",
+                "maxBlockTxs": 1,
+                "buckets": [
+                    {"feeRateGrains": "7000", "txCount": 1, "totalBytes": 305},
+                    {"feeRateGrains": "0", "txCount": 1, "totalBytes": 262},
+                ],
             },
         }),
         // Live-verified shape: {"header": {...}, "transactions": [...]} with
-        // no top-level hash and no txIds/txCount fields.
+        // no txIds/txCount fields. The upgraded node additionally discloses
+        // the block's own hash inside `header`.
         "sov_getBlockByHeight" => match params.get("height").and_then(Value::as_u64) {
-            Some(height) if height < HEIGHT => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "header": {
-                        "height": height,
-                        "prevHash": "11".repeat(32),
-                        "txRoot": "22".repeat(32),
-                        "timestampMs": TIMESTAMP_MS - 1,
-                        "proposer": COINBASE,
-                    },
-                    "transactions": [
-                        {"kind": "transfer", "nonce": 1},
-                        {"kind": "transfer", "nonce": 2},
-                    ],
+            Some(height) if height < HEIGHT => {
+                let mut header = json!({
+                    "height": height,
+                    "prevHash": "11".repeat(32),
+                    "txRoot": "22".repeat(32),
+                    "timestampMs": TIMESTAMP_MS - 1,
+                    "proposer": COINBASE,
+                });
+                if !fixture.legacy {
+                    header["hash"] = json!(format!("{height:064x}"));
                 }
-            }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "header": header,
+                        "transactions": [
+                            {"kind": "transfer", "nonce": 1},
+                            {"kind": "transfer", "nonce": 2},
+                        ],
+                    }
+                })
+            }
             _ => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -635,17 +688,26 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
             }
             Some("block_flow") => {
                 // Every strip value must be exactly what the mock node served
-                // in the live-verified shapes: per-block `transactions` array
-                // lengths, string `feeGrains`, and — because the real template
-                // exposes no transaction list — a null forming-tile count.
+                // in the live-verified upgraded shapes: the template's own
+                // txCount fills the forming tile, the auction floorGrains is
+                // preferred over the flat feeGrains estimate, the histogram
+                // packs to one projected pending block (2 pending txs, 1-tx
+                // capacity, first block is the forming one), and each sealed
+                // tile counts its `transactions` array.
                 assert_eq!(event.pointer("/template/height"), Some(&json!(HEIGHT)));
-                assert_eq!(event.pointer("/template/tx_count"), Some(&Value::Null));
+                assert_eq!(event.pointer("/template/tx_count"), Some(&json!(1)));
                 assert_eq!(event["tip_height"], json!(HEIGHT - 1));
-                assert_eq!(event["fee_grains"], json!(1_651_760));
+                assert_eq!(event["fee_grains"], json!(7_000));
+                assert_eq!(
+                    event["projected"],
+                    json!([{"tx_count": 1, "fee_min_grains": 0, "fee_max_grains": 0}])
+                );
                 let recent = event["recent"].as_array().expect("recent tiles");
                 assert!(!recent.is_empty());
                 assert_eq!(recent[0]["height"], json!(HEIGHT - 1));
                 assert_eq!(recent[0]["tx_count"], json!(2));
+                // header.hash is disclosed and none of these are ours, so
+                // the exact hash comparison keeps the highlight off.
                 assert_eq!(recent[0]["mine"], json!(false));
                 saw_block_flow = true;
             }
@@ -675,6 +737,7 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
                     "sov_getPeerInfo",
                     "sov_getMempoolSize",
                     "sov_estimateFee",
+                    "sov_getMempoolHistogram",
                     "sov_getBlockByHeight",
                     "sov_submitBlock",
                 ]
@@ -729,6 +792,118 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
     assert!(
         sha256d(&sealed_blob) <= fixture.target,
         "submitted nonce must meet the full big-endian SOV target"
+    );
+}
+
+/// The v0.1.99 parity RPCs are not yet deployed to the live network: a
+/// pre-upgrade node has no sov_getMempoolHistogram (method not found), no
+/// template txCount/txIds, no estimateFee floorGrains, and no header.hash.
+/// The miner must keep mining and degrade every consumer to its honest
+/// placeholder/fallback — no crash, no invented value.
+#[test]
+fn headless_miner_degrades_cleanly_on_a_pre_upgrade_node() {
+    let fixture = TemplateFixture::sov_pre_upgrade_legacy();
+    let (mock_node, _request_rx) = MockNode::start(fixture.clone());
+    let endpoint = format!("rpc://{}", mock_node.address);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xus-miner"))
+        .args([
+            "--headless",
+            "--json-events",
+            "--pool",
+            &endpoint,
+            "--user",
+            COINBASE,
+            "--workers",
+            "1",
+            "--reconnect-secs",
+            "1",
+            "--report-secs",
+            "1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn headless xus-miner");
+
+    let stdout = child.stdout.take().expect("miner telemetry stdout");
+    let (telemetry_tx, telemetry_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if telemetry_tx.send(value).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let stderr = child.stderr.take().expect("miner diagnostic stderr");
+    let stderr_log = Arc::new(Mutex::new(String::new()));
+    let stderr_sink = Arc::clone(&stderr_log);
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let mut log = stderr_sink.lock().expect("stderr log lock");
+            if log.len() < 64 * 1024 {
+                log.push_str(&line);
+                log.push('\n');
+            }
+        }
+    });
+    let mut child = ChildGuard(child);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_degraded_block_flow = false;
+    let mut saw_accepted_share = false;
+    while Instant::now() < deadline && !(saw_degraded_block_flow && saw_accepted_share) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = match telemetry_rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "miner telemetry ended unexpectedly against the legacy node; miner stderr:\n{}",
+                stderr_log.lock().expect("stderr log lock")
+            ),
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("block_flow") => {
+                // Honest degraded state, field by field: no template count →
+                // null (renders "—"); no floorGrains → the flat feeGrains
+                // fallback; no histogram method → NO projected tiles; the
+                // legacy header discloses no hash yet real sealed tiles
+                // still carry their `transactions` counts.
+                assert_eq!(event.pointer("/template/height"), Some(&json!(HEIGHT)));
+                assert_eq!(event.pointer("/template/tx_count"), Some(&Value::Null));
+                assert_eq!(event["fee_grains"], json!(1_651_760));
+                assert_eq!(event["projected"], json!([]));
+                let recent = event["recent"].as_array().expect("recent tiles");
+                assert!(!recent.is_empty());
+                assert_eq!(recent[0]["height"], json!(HEIGHT - 1));
+                assert_eq!(recent[0]["tx_count"], json!(2));
+                saw_degraded_block_flow = true;
+            }
+            Some("share") if event["accepted"].as_u64().unwrap_or_default() >= 1 => {
+                // The missing parity RPCs never block real work: the miner
+                // still seals and submits against the legacy node.
+                assert_eq!(event["rejected"], json!(0));
+                saw_accepted_share = true;
+            }
+            Some("engine_fatal") | Some("session_error") => panic!(
+                "miner failed against the legacy node instead of degrading: {event}; stderr:\n{}",
+                stderr_log.lock().expect("stderr log lock")
+            ),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_degraded_block_flow && saw_accepted_share,
+        "missing degraded telemetry (block_flow={saw_degraded_block_flow}, share={saw_accepted_share}); miner stderr:\n{}",
+        stderr_log.lock().expect("stderr log lock")
+    );
+    assert!(
+        child.0.try_wait().expect("poll miner child").is_none(),
+        "miner must stay alive against a pre-upgrade node"
     );
 }
 
