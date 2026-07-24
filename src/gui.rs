@@ -896,6 +896,62 @@ struct MeterSample {
     round_probability: Option<f64>,
 }
 
+/// One confirmed-block tile of the block-flow strip. Every field arrives from
+/// the engine's `block_flow` telemetry, which itself carries only values read
+/// from real node RPC responses; an unknown transaction count stays `None`
+/// and renders as "—".
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockFlowTile {
+    height: u64,
+    tx_count: Option<u64>,
+    mine: bool,
+}
+
+/// The mempool.space-style strip: recent confirmed blocks (newest first), the
+/// forming template block, and the node's single fee-for-inclusion estimate.
+///
+/// SEAM (out of scope here): mempool.space's several projected pending
+/// blocks need a mempool fee histogram the SOV node does not expose yet; see
+/// `src/blockflow.rs`. Only the one real forming tile is rendered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BlockFlowView {
+    tip_height: Option<u64>,
+    template_height: Option<u64>,
+    template_tx_count: Option<u64>,
+    fee_estimate: Option<u64>,
+    recent: Vec<BlockFlowTile>,
+}
+
+const MAX_FLOW_TILES: usize = 12;
+
+impl BlockFlowView {
+    fn from_telemetry(value: &Value) -> Self {
+        Self {
+            tip_height: value.get("tip_height").and_then(Value::as_u64),
+            template_height: value.pointer("/template/height").and_then(Value::as_u64),
+            template_tx_count: value.pointer("/template/tx_count").and_then(Value::as_u64),
+            fee_estimate: value.get("fee_estimate").and_then(Value::as_u64),
+            recent: value
+                .get("recent")
+                .and_then(Value::as_array)
+                .map(|tiles| {
+                    tiles
+                        .iter()
+                        .filter_map(|tile| {
+                            Some(BlockFlowTile {
+                                height: tile.get("height").and_then(Value::as_u64)?,
+                                tx_count: tile.get("tx_count").and_then(Value::as_u64),
+                                mine: tile.get("mine").and_then(Value::as_bool).unwrap_or(false),
+                            })
+                        })
+                        .take(MAX_FLOW_TILES)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MemorySnapshot {
     available: u64,
@@ -947,6 +1003,7 @@ struct MinerApp {
     logs: VecDeque<LogLine>,
     mempool_size: Option<u64>,
     peer_count: Option<u64>,
+    block_flow: Option<BlockFlowView>,
     meter_history: VecDeque<MeterSample>,
     last_metrics_at: Option<Instant>,
     ready_workers: u64,
@@ -1017,6 +1074,7 @@ impl Default for MinerApp {
             logs: VecDeque::new(),
             mempool_size: None,
             peer_count: None,
+            block_flow: None,
             meter_history: VecDeque::new(),
             last_metrics_at: None,
             ready_workers: 0,
@@ -1211,6 +1269,7 @@ impl MinerApp {
         self.last_error.clear();
         self.mempool_size = None;
         self.peer_count = None;
+        self.block_flow = None;
         self.meter_history.clear();
         self.last_metrics_at = None;
         self.ready_workers = 0;
@@ -2227,6 +2286,9 @@ impl MinerApp {
                 }
                 self.peer_count = next;
             }
+            Some("block_flow") => {
+                self.block_flow = Some(BlockFlowView::from_telemetry(value));
+            }
             Some("metrics") => {
                 let now = Instant::now();
                 let elapsed = self
@@ -2348,6 +2410,7 @@ impl MinerApp {
                 self.clear_active_work();
                 self.mempool_size = None;
                 self.peer_count = None;
+                self.block_flow = None;
                 let session_error = value.get("message").and_then(Value::as_str).map_or_else(
                     || "Pool session ended.".to_owned(),
                     |message| self.redact_sensitive_text(message),
@@ -3102,6 +3165,119 @@ impl MinerApp {
         });
     }
 
+    /// mempool.space-style block-flow strip: the forming template block, a
+    /// tip divider, then the most recent confirmed blocks (newest first).
+    /// Every rendered number is a real node RPC value relayed by the engine's
+    /// `block_flow` telemetry; anything the node did not supply shows "—".
+    fn block_flow_strip(&self, ui: &mut egui::Ui) {
+        if !is_direct_node_endpoint(&self.settings.pool) && self.block_flow.is_none() {
+            // Stratum pool mode has no read-only node RPC to observe blocks
+            // through; render nothing rather than an imitation.
+            return;
+        }
+        ui.add_space(12.0);
+        Frame::new()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::same(16))
+            .show(ui, |ui| {
+                let flow = self.block_flow.as_ref();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("BLOCK FLOW")
+                            .size(11.0)
+                            .strong()
+                            .color(MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let pending = self.mempool_size;
+                        telemetry_chip(
+                            ui,
+                            "MEMPOOL",
+                            &pending.map_or_else(|| "—".into(), |size| format!("{size} TX")),
+                            match pending {
+                                Some(0) | None => MUTED,
+                                Some(_) => GREEN,
+                            },
+                            "Pending transactions reported by the connected SOV node (sov_health / sov_getMempoolSize).",
+                        );
+                        telemetry_chip(
+                            ui,
+                            "TIP TO GET IN",
+                            &flow
+                                .and_then(|flow| flow.fee_estimate)
+                                .map_or_else(|| "—".into(), format_count),
+                            AMBER,
+                            "sov_estimateFee: the node's current fee/tip to be included in the next block under the v0.1.98 blockspace auction (dynamic floor). Base units; '—' when the node does not expose the RPC.",
+                        );
+                    });
+                });
+                ui.add_space(10.0);
+                match flow {
+                    Some(flow) => {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("block-flow-strip")
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let pulse = ui.input(|input| input.time);
+                                    flow_block_tile(
+                                        ui,
+                                        &flow
+                                            .template_height
+                                            .map_or_else(|| "—".into(), |height| format!("#{height}")),
+                                        flow.template_tx_count,
+                                        "FORMING",
+                                        AMBER,
+                                        FlowTileKind::Forming { pulse },
+                                    );
+                                    flow_tip_divider(ui);
+                                    for (index, tile) in
+                                        flow.recent.iter().take(MAX_FLOW_TILES).enumerate()
+                                    {
+                                        let fade =
+                                            (1.0 - index as f32 * 0.07).clamp(0.45, 1.0);
+                                        flow_block_tile(
+                                            ui,
+                                            &format!("#{}", tile.height),
+                                            tile.tx_count,
+                                            if tile.mine { "★ YOURS" } else { "SEALED" },
+                                            if tile.mine {
+                                                GREEN
+                                            } else {
+                                                PURPLE.gamma_multiply(fade)
+                                            },
+                                            if tile.mine {
+                                                FlowTileKind::Mine
+                                            } else {
+                                                FlowTileKind::Confirmed
+                                            },
+                                        );
+                                    }
+                                });
+                            });
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new(
+                                "Awaiting real block data from the connected SOV node…",
+                            )
+                            .size(10.0)
+                            .color(MUTED),
+                        );
+                    }
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Real node data only — template txs from sov_getBlockTemplate, sealed-block txs from sov_getBlockByHeight; '—' means the node did not supply that value. Your accepted blocks are highlighted.",
+                    )
+                    .size(9.0)
+                    .color(MUTED),
+                );
+            });
+    }
+
     fn dashboard(&mut self, ui: &mut egui::Ui) {
         self.header(ui);
         ui.add_space(14.0);
@@ -3140,6 +3316,8 @@ impl MinerApp {
             );
             metric_card(&mut columns[3], "UPTIME", &self.uptime(), AMBER);
         });
+
+        self.block_flow_strip(ui);
 
         ui.add_space(12.0);
         Frame::new()
@@ -3624,6 +3802,96 @@ fn heartbeat_card(
                 });
             });
         });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FlowTileKind {
+    /// The block the network is assembling right now (from the template).
+    Forming { pulse: f64 },
+    /// A confirmed block sealed by someone else.
+    Confirmed,
+    /// A confirmed block this miner sealed (accepted submission).
+    Mine,
+}
+
+/// One block tile of the flow strip. `tx_count: None` renders the neutral
+/// placeholder "—"; a count is only ever a real `txIds`/`txCount` value.
+fn flow_block_tile(
+    ui: &mut egui::Ui,
+    height_label: &str,
+    tx_count: Option<u64>,
+    caption: &str,
+    accent: Color32,
+    kind: FlowTileKind,
+) {
+    let emphasized = !matches!(kind, FlowTileKind::Confirmed);
+    let stroke_color = match kind {
+        FlowTileKind::Forming { pulse } => {
+            // Subtle breathing border on the forming tile only; pure paint
+            // work on the existing repaint cadence, no extra polling.
+            let wave = (((pulse * 1.4).sin() * 0.5 + 0.5) * 0.35 + 0.5) as f32;
+            accent.gamma_multiply(wave)
+        }
+        FlowTileKind::Mine => accent.gamma_multiply(0.95),
+        FlowTileKind::Confirmed => accent.gamma_multiply(0.45),
+    };
+    ui.allocate_ui_with_layout(
+        Vec2::new(88.0, 98.0),
+        Layout::top_down(Align::Center),
+        |ui| {
+            Frame::new()
+                .fill(accent.gamma_multiply(if emphasized { 0.16 } else { 0.08 }))
+                .stroke(Stroke::new(
+                    if emphasized { 1.5 } else { 1.0 },
+                    stroke_color,
+                ))
+                .corner_radius(CornerRadius::same(9))
+                .inner_margin(Margin::symmetric(6, 9))
+                .show(ui, |ui| {
+                    ui.set_min_size(Vec2::new(74.0, 78.0));
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(height_label)
+                                .size(9.0)
+                                .monospace()
+                                .color(if emphasized { TEXT } else { MUTED }),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(tx_count.map_or_else(|| "—".into(), format_count))
+                                .size(19.0)
+                                .strong()
+                                .monospace()
+                                .color(accent),
+                        );
+                        ui.label(RichText::new("TXS").size(7.5).color(MUTED));
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new(caption)
+                                .size(8.0)
+                                .strong()
+                                .color(if emphasized { accent } else { MUTED }),
+                        );
+                    });
+                });
+        },
+    );
+}
+
+/// Dashed vertical divider between the forming block and the sealed chain
+/// tip, echoing mempool.space's mempool/chain boundary.
+fn flow_tip_divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 98.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let x = rect.center().x;
+    let mut y = rect.top() + 6.0;
+    while y + 6.0 < rect.bottom() {
+        painter.line_segment(
+            [egui::pos2(x, y), egui::pos2(x, y + 6.0)],
+            Stroke::new(1.4, BORDER),
+        );
+        y += 11.0;
+    }
 }
 
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -5409,6 +5677,96 @@ mod tests {
             mining_meter(ui, &history, 2, 220.0);
         });
         assert!(output.shapes.len() > 20);
+    }
+
+    #[test]
+    fn block_flow_telemetry_keeps_placeholders_and_the_mine_highlight() {
+        let mut app = MinerApp::default();
+        assert!(app.block_flow.is_none());
+        app.apply_telemetry(&json!({
+            "event": "block_flow",
+            "tip_height": 42,
+            "template": {"height": 43, "tx_count": 2},
+            "fee_estimate": 1_000,
+            "recent": [
+                {"height": 42, "tx_count": 3, "mine": true},
+                {"height": 41, "tx_count": null, "mine": false},
+                {"height": 40},
+                {"tx_count": 9},
+            ],
+        }));
+        let flow = app.block_flow.clone().expect("block flow view");
+        assert_eq!(flow.tip_height, Some(42));
+        assert_eq!(flow.template_height, Some(43));
+        assert_eq!(flow.template_tx_count, Some(2));
+        assert_eq!(flow.fee_estimate, Some(1_000));
+        assert_eq!(
+            flow.recent,
+            vec![
+                BlockFlowTile {
+                    height: 42,
+                    tx_count: Some(3),
+                    mine: true
+                },
+                // Unknown counts remain None (rendered "—"), never invented.
+                BlockFlowTile {
+                    height: 41,
+                    tx_count: None,
+                    mine: false
+                },
+                BlockFlowTile {
+                    height: 40,
+                    tx_count: None,
+                    mine: false
+                },
+                // A tile without a real height is dropped, not fabricated.
+            ]
+        );
+
+        // Missing template/fee data keeps every placeholder empty.
+        app.apply_telemetry(&json!({
+            "event": "block_flow",
+            "template": {},
+            "recent": [],
+        }));
+        let flow = app.block_flow.clone().expect("block flow view");
+        assert_eq!(flow, BlockFlowView::default());
+
+        // The rendered strip is bounded even against a hostile event.
+        let oversized: Vec<Value> = (0..64)
+            .map(|height| json!({"height": height, "tx_count": 1}))
+            .collect();
+        app.apply_telemetry(&json!({
+            "event": "block_flow",
+            "recent": oversized,
+        }));
+        assert_eq!(
+            app.block_flow.as_ref().map(|flow| flow.recent.len()),
+            Some(MAX_FLOW_TILES)
+        );
+    }
+
+    #[test]
+    fn block_flow_clears_with_the_session_and_on_engine_restart() {
+        let mut app = MinerApp::default();
+        let populate = json!({
+            "event": "block_flow",
+            "tip_height": 5,
+            "template": {"height": 6, "tx_count": 0},
+            "recent": [{"height": 5, "tx_count": 1, "mine": false}],
+        });
+        app.apply_telemetry(&populate);
+        assert!(app.block_flow.is_some());
+
+        // A lost node session must not keep presenting stale flow data.
+        app.apply_telemetry(&json!({"event": "session_error", "message": "node gone"}));
+        assert!(app.block_flow.is_none());
+
+        app.apply_telemetry(&populate);
+        assert!(app.block_flow.is_some());
+        // A fresh engine start clears the previous node's strip entirely.
+        app.reset_telemetry();
+        assert!(app.block_flow.is_none());
     }
 
     #[test]

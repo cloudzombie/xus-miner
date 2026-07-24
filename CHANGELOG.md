@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.4
+
+- Add a mempool.space-style **block-flow strip** to the GUI dashboard for
+  direct-node sessions: the forming template block (real transaction count
+  from `sov_getBlockTemplate`'s `txIds`), a tip divider, and the most recent
+  confirmed blocks as tiles with their real heights and transaction counts
+  read from `sov_getBlockByHeight`. Blocks this miner sealed — accepted
+  `sov_submitBlock` submissions whose confirmed hash the node echoed — are
+  highlighted, matched by block hash (height only when the node does not
+  disclose a hash, so a same-height reorg never mislabels someone else's
+  block). A reorg detected by a changed hash invalidates every cached
+  descendant so stale tiles are refetched instead of shown.
+- Add mempool-pressure and fee-to-get-in chips: pending-transaction count
+  from the node (`sov_health` every poll, refreshed by `sov_getMempoolSize`
+  where available) and the node's single `sov_estimateFee` estimate — the
+  tip/dynamic-floor "tip ≥ X to make the next block" indicator of the
+  v0.1.98 blockspace auction.
+- Every rendered number is a real node RPC value; anything a node does not
+  supply (older node, missing RPC, failed or slow call) renders as the
+  neutral placeholder "—", never an invented or estimated-looking value.
+  All new calls are read-only, optional, strictly bounded (1-second
+  timeouts, at most four block fetches per template refresh inside a
+  2-second budget), run on the existing template-refresh cadence after work
+  installation, and can never delay hashing.
+- Documented seam, deliberately NOT built: mempool.space's several projected
+  pending blocks bucketed by fee rate require a mempool fee-histogram RPC
+  that the SOV node does not expose today (`sov_getMempoolSize` returns one
+  count, `sov_estimateFee` one estimate). Exposing a histogram is an
+  additive node change owned by the SOV repository; when it exists, extend
+  the engine's `block_flow` telemetry and render the projected tiles beside
+  the single real forming tile (see `src/blockflow.rs`).
+
 ## 0.1.3
 
 - Add persistent crash-diagnostic logging for both the GUI and the isolated

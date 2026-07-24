@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod blockflow;
 mod diag;
 mod gui;
 mod pow;
@@ -753,6 +754,9 @@ struct State {
     peers_known: AtomicBool,
     round: Mutex<RoundStats>,
     confirmed_coinbase: RwLock<Option<String>>,
+    /// Blocks this miner sealed and the node confirmed accepted; feeds the
+    /// "yours" highlight of the block-flow strip.
+    sealed_blocks: Mutex<blockflow::SealedBlocks>,
     json_events: bool,
 }
 
@@ -775,8 +779,16 @@ impl State {
             peers_known: AtomicBool::new(false),
             round: Mutex::new(RoundStats::default()),
             confirmed_coinbase: RwLock::new(None),
+            sealed_blocks: Mutex::new(blockflow::SealedBlocks::default()),
             json_events,
         }
+    }
+
+    fn record_sealed_block(&self, height: u64, hash: String) {
+        self.sealed_blocks
+            .lock()
+            .expect("sealed blocks lock")
+            .record(height, hash);
     }
 
     fn emit(&self, event: Value) {
@@ -1190,9 +1202,13 @@ fn run_rpc_session(
         let mut chain_height = None;
         let mut announced = false;
         let mut refreshed = Instant::now() - Duration::from_secs(31);
+        // Block-flow strip state: a bounded cache of recently confirmed blocks
+        // and the last emitted snapshot (so an unchanged strip is not re-sent).
+        let mut recent_blocks = blockflow::RecentBlocks::default();
+        let mut last_block_flow: Option<Value> = None;
         loop {
-            // One lightweight health call supplies both values used by the dashboard;
-            // mempool visualization adds no extra polling or node lock acquisition.
+            // One lightweight health call supplies the tip height and the
+            // node's real mempool count every cycle.
             let health = rpc_call(&cfg.pool, "sov_health", json!({}))?;
             let current_height = health
                 .get("height")
@@ -1234,14 +1250,18 @@ fn run_rpc_session(
                     .ensure_safe(job.algo)
                     .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                 previous_id = job.id.clone();
+                let template_height = job.height;
+                // Real transaction count of the block being formed, straight
+                // from the template the node just served (its txIds/txCount).
+                let template_tx_count = blockflow::tx_count(&value);
                 state.install_job(job);
                 chain_height = Some(current_height);
                 refreshed = Instant::now();
                 // Optional dashboard enrichment comes after work installation so
                 // an older/slow node can never delay hashing a valid template.
-                // Run both bounded reads together so one slow optional method
-                // cannot add its timeout to the other and hold up tip polling.
-                let (network, peer_info) = thread::scope(|scope| {
+                // Run the bounded reads together so one slow optional method
+                // cannot add its timeout to the others and hold up tip polling.
+                let (network, peer_info, fee_reply, mempool_reply) = thread::scope(|scope| {
                     let network = thread::Builder::new()
                         .name("xus-rpc-difficulty".into())
                         .spawn_scoped(scope, || {
@@ -1262,6 +1282,29 @@ fn run_rpc_session(
                                 Duration::from_secs(1),
                             )
                         });
+                    // Optional block-flow enrichment: the real fee floor to
+                    // make the next block and the node's own mempool counter.
+                    // Both fail soft (placeholder), never blocking work.
+                    let fee = thread::Builder::new()
+                        .name("xus-rpc-fee".into())
+                        .spawn_scoped(scope, || {
+                            rpc_call_with_timeout(
+                                &cfg.pool,
+                                "sov_estimateFee",
+                                json!({}),
+                                Duration::from_secs(1),
+                            )
+                        });
+                    let mempool = thread::Builder::new()
+                        .name("xus-rpc-mempool".into())
+                        .spawn_scoped(scope, || {
+                            rpc_call_with_timeout(
+                                &cfg.pool,
+                                "sov_getMempoolSize",
+                                json!({}),
+                                Duration::from_secs(1),
+                            )
+                        });
                     let network = match network {
                         Ok(handle) => handle.join().ok().and_then(|result| result.ok()),
                         Err(error) => {
@@ -1276,7 +1319,15 @@ fn run_rpc_session(
                             None
                         }
                     };
-                    (network, peers)
+                    let fee = fee
+                        .ok()
+                        .and_then(|handle| handle.join().ok())
+                        .and_then(|result| result.ok());
+                    let mempool = mempool
+                        .ok()
+                        .and_then(|handle| handle.join().ok())
+                        .and_then(|result| result.ok());
+                    (network, peers, fee, mempool)
                 });
                 if let Some(network) = network {
                     state.emit(json!({
@@ -1298,6 +1349,65 @@ fn run_rpc_session(
                     "event": "peers",
                     "count": peer_count,
                 }));
+                // Dedicated mempool RPC (when the node has it) refreshes the
+                // same counter the required health poll keeps live; both are
+                // real node responses, never a synthesized value.
+                if let Some(size) = mempool_reply.as_ref().and_then(blockflow::mempool_size) {
+                    state.mempool_size.store(size, Ordering::Relaxed);
+                    state.mempool_known.store(true, Ordering::Release);
+                }
+                // Backfill the confirmed strip from real blocks. Bounded per
+                // refresh (call cap + one wall-clock budget), fail-soft, and
+                // strictly read-only; a missing RPC leaves placeholder tiles.
+                let backfill_deadline = Instant::now() + Duration::from_secs(2);
+                for height in recent_blocks.refresh_targets(current_height) {
+                    if Instant::now() >= backfill_deadline {
+                        break;
+                    }
+                    match rpc_call_with_timeout(
+                        &cfg.pool,
+                        "sov_getBlockByHeight",
+                        json!({ "height": height }),
+                        Duration::from_secs(1),
+                    ) {
+                        Ok(block) => recent_blocks.insert(
+                            current_height,
+                            height,
+                            blockflow::BlockInfo {
+                                hash: blockflow::block_hash(&block),
+                                tx_count: blockflow::tx_count(&block),
+                            },
+                        ),
+                        // An older node without this RPC (or a slow reply)
+                        // ends this cycle's backfill; tiles stay placeholders.
+                        Err(_) => break,
+                    }
+                }
+                let block_flow = {
+                    let sealed = state.sealed_blocks.lock().expect("sealed blocks lock");
+                    let tiles = recent_blocks.tiles(current_height, &sealed);
+                    json!({
+                        "event": "block_flow",
+                        "tip_height": current_height,
+                        "template": {
+                            "height": template_height,
+                            "tx_count": template_tx_count,
+                        },
+                        "fee_estimate": fee_reply.as_ref().and_then(blockflow::fee_estimate),
+                        "recent": tiles
+                            .iter()
+                            .map(|tile| json!({
+                                "height": tile.height,
+                                "tx_count": tile.tx_count,
+                                "mine": tile.mine,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                };
+                if last_block_flow.as_ref() != Some(&block_flow) {
+                    state.emit(block_flow.clone());
+                    last_block_flow = Some(block_flow);
+                }
             }
             thread::sleep(Duration::from_secs(2));
         }
@@ -1532,6 +1642,10 @@ fn worker_loop(state: Arc<State>, worker: u64) {
                     match submission {
                         Ok(()) => {
                             state.accepted.fetch_add(1, Ordering::Relaxed);
+                            // The node's reply was verified to echo this exact
+                            // locally sealed header hash; remember it so the
+                            // block-flow strip can highlight our own block.
+                            state.record_sealed_block(current.height, template_id_for_blob(&blob));
                             state.emit(json!({"event":"share", "submitted":state.submitted.load(Ordering::Relaxed), "accepted":state.accepted.load(Ordering::Relaxed), "rejected":state.rejected.load(Ordering::Relaxed)}));
                             state.clear_job_if_current(current);
                         }

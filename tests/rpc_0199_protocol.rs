@@ -85,6 +85,9 @@ impl TemplateFixture {
             "versionBits": VERSION_BITS,
             "blob": hex::encode(&blob),
             "nonceOffset": blob.len() - 8,
+            // Real template transaction identifiers; the miner's block-flow
+            // strip must report their count for the forming block.
+            "txIds": ["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)],
         });
         Self {
             blob,
@@ -447,6 +450,35 @@ fn handle_rpc_connection(
                 "syncing": false,
             }
         }),
+        "sov_getMempoolSize" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": 2,
+        }),
+        "sov_estimateFee" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"minTip": 1_000},
+        }),
+        "sov_getBlockByHeight" => match params.get("height").and_then(Value::as_u64) {
+            Some(height) if height < HEIGHT => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "height": height,
+                    "hash": format!("{height:064x}"),
+                    "txIds": ["dd".repeat(32), "ee".repeat(32)],
+                }
+            }),
+            _ => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32602,
+                    "message": "unknown or unconfirmed height",
+                }
+            }),
+        },
         "sov_submitBlock" => {
             let is_sha_fixture =
                 fixture.response.get("powAlgo").and_then(Value::as_str) == Some("Sha256d");
@@ -556,7 +588,10 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
     let mut saw_job = false;
     let mut saw_peers = false;
     let mut saw_accepted_share = false;
-    while Instant::now() < deadline && !(saw_job && saw_peers && saw_accepted_share) {
+    let mut saw_block_flow = false;
+    while Instant::now() < deadline
+        && !(saw_job && saw_peers && saw_accepted_share && saw_block_flow)
+    {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let event = match telemetry_rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
             Ok(event) => event,
@@ -581,12 +616,26 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
                 assert_eq!(event["rejected"], json!(0));
                 saw_accepted_share = true;
             }
+            Some("block_flow") => {
+                // Every strip value must be exactly what the mock node served:
+                // template txIds count, per-block txIds counts, fee estimate.
+                assert_eq!(event.pointer("/template/height"), Some(&json!(HEIGHT)));
+                assert_eq!(event.pointer("/template/tx_count"), Some(&json!(3)));
+                assert_eq!(event["tip_height"], json!(HEIGHT - 1));
+                assert_eq!(event["fee_estimate"], json!(1_000));
+                let recent = event["recent"].as_array().expect("recent tiles");
+                assert!(!recent.is_empty());
+                assert_eq!(recent[0]["height"], json!(HEIGHT - 1));
+                assert_eq!(recent[0]["tx_count"], json!(2));
+                assert_eq!(recent[0]["mine"], json!(false));
+                saw_block_flow = true;
+            }
             _ => {}
         }
     }
     assert!(
-        saw_job && saw_peers && saw_accepted_share,
-        "missing required telemetry (job={saw_job}, peers={saw_peers}, share={saw_accepted_share}); miner stderr:\n{}",
+        saw_job && saw_peers && saw_accepted_share && saw_block_flow,
+        "missing required telemetry (job={saw_job}, peers={saw_peers}, share={saw_accepted_share}, block_flow={saw_block_flow}); miner stderr:\n{}",
         stderr_log.lock().expect("stderr log lock")
     );
 
@@ -605,6 +654,9 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
                     "sov_getBlockTemplate",
                     "sov_getDifficulty",
                     "sov_getPeerInfo",
+                    "sov_getMempoolSize",
+                    "sov_estimateFee",
+                    "sov_getBlockByHeight",
                     "sov_submitBlock",
                 ]
                 .iter()
