@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.1.4
+
+- **Fix a field GUI crash present in v0.1.3** (captured by the v0.1.3 crash
+  log on a live macOS session, platform-independent): the live-meter's
+  height-change markers used `bool::then_some(height.expect(...))`, whose
+  argument is evaluated **eagerly** — so one meter sample with no height
+  (the engine legitimately reports `height: null` between jobs, after an
+  accepted block, and while reconnecting) panicked the dashboard paint path
+  (`height checked`) and aborted the whole application on the next repaint.
+  The marker derivation is now lazy and total (`filter`/`map`, extracted as
+  a pure helper), with a regression test that replays the previously fatal
+  jobless-sample history through the real paint path.
+- Add a mempool.space-style **block-flow strip** to the GUI dashboard for
+  direct-node sessions: the forming template block, a tip divider, and the
+  most recent confirmed blocks as tiles with their real heights and
+  transaction counts — the length of the `transactions` array that
+  `sov_getBlockByHeight` returns (live-verified shape:
+  `{"header": {...}, "transactions": [...]}`; a `sov_getBlockDigest`-style
+  `txIds` array is accepted equivalently). The live block template exposes
+  NO transaction list or count (only its `txRoot` commitment), so the
+  forming tile honestly shows "—" for its count — a real data gap, not a
+  fabricated number. Blocks this miner sealed — accepted `sov_submitBlock`
+  submissions whose confirmed hash the node echoed — are highlighted,
+  matched by block hash when a response discloses one and by accepted
+  height otherwise (the live shape discloses no block hash). A reorg
+  detected by a changed hash invalidates every cached descendant so stale
+  tiles are refetched instead of shown.
+- Add mempool-pressure and fee-to-get-in chips: pending-transaction count
+  from the node (`sov_health` every poll, refreshed by `sov_getMempoolSize`,
+  whose live reply is a bare integer) and the node's `sov_estimateFee`
+  `feeGrains` value (live shape: a decimal string in grains), rendered in
+  XUS (1 XUS = 10^8 grains) — the "fee ≥ X to make the next block"
+  indicator of the v0.1.98 blockspace auction. A nonzero fee below display
+  precision renders as "<0.00001 XUS", never as free.
+- Every rendered number is a real node RPC value; anything a node does not
+  supply (older node, missing RPC, failed or slow call) renders as the
+  neutral placeholder "—", never an invented or estimated-looking value.
+  All new calls are read-only, optional, strictly bounded (1-second
+  timeouts, at most four block fetches per template refresh inside a
+  2-second budget), run on the existing template-refresh cadence after work
+  installation, and can never delay hashing.
+- Documented seam, deliberately NOT built: mempool.space's several projected
+  pending blocks bucketed by fee rate require a mempool fee-histogram RPC
+  that the SOV node does not expose today (`sov_getMempoolSize` returns one
+  count, `sov_estimateFee` one estimate). Exposing a histogram is an
+  additive node change owned by the SOV repository; when it exists, extend
+  the engine's `block_flow` telemetry and render the projected tiles beside
+  the single real forming tile (see `src/blockflow.rs`).
+
 ## 0.1.3
 
 - Add persistent crash-diagnostic logging for both the GUI and the isolated
