@@ -70,6 +70,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Prove macOS memory telemetry excludes sysinfo
+        if: startsWith(matrix.os, 'macos-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          tree="$(cargo tree --locked --target "${host}" --edges normal)"
+          if [[ "${tree}" == *"sysinfo v"* ]]; then
+            echo "sysinfo must not be linked into a macOS XUS Miner build" >&2
+            exit 1
+          fi
+      - name: Prove native Apple Silicon runner
+        if: matrix.os == 'macos-15'
+        shell: bash
+        run: test "$(uname -m)" = arm64
       - name: Test locked release source
         run: cargo test --locked --bin xus-miner
       - name: Test external mining protocol
@@ -79,10 +94,22 @@ jobs:
       - name: Validate fast RandomX mining vector (shared full dataset)
         timeout-minutes: 12
         run: cargo test --locked --release --bin xus-miner randomx_mainnet_job_uses_the_exact_sov_mining_seal -- --ignored --test-threads=1
-      - name: Soak two-worker direct RPC RandomX engine (Windows)
+      - name: Soak two-worker direct RPC RandomX engine for 90 seconds (Windows and Apple Silicon)
+        if: matrix.os == 'windows-2025' || matrix.os == 'macos-15'
+        timeout-minutes: 15
+        run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_stability_window -- --ignored --test-threads=1
+      - name: Soak one-worker optimized RandomX recovery for 90 seconds (Windows)
         if: matrix.os == 'windows-2025'
-        timeout-minutes: 12
-        run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_short_window -- --ignored --test-threads=1
+        timeout-minutes: 15
+        env:
+          XUS_TEST_RANDOMX_ONE_WORKER: "1"
+        run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_stability_window -- --ignored --test-threads=1
+      - name: Soak one-worker light-memory RandomX recovery for 90 seconds (Windows)
+        if: matrix.os == 'windows-2025'
+        timeout-minutes: 15
+        env:
+          XUS_TEST_RANDOMX_LIGHT: "1"
+        run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_stability_window -- --ignored --test-threads=1
       - name: Build locked release binary
         run: cargo build --locked --release
       - name: Confirm embedded application version
@@ -105,8 +132,12 @@ jobs:
           VERSION: ${{ needs.verify-version.outputs.version }}
         run: |
           mkdir -p dist
-          platform="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
           arch="$(uname -m)"
+          if [[ "${RUNNER_OS}" == "macOS" && "${arch}" == "arm64" ]]; then
+            platform="macos-apple-silicon"
+          else
+            platform="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
+          fi
           tar -czf "dist/xus-miner-v${VERSION}-${platform}-${arch}.tar.gz" \
             -C target/release xus-miner
         if: runner.os != 'Windows'

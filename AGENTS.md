@@ -17,6 +17,16 @@ This repository owns only the standalone XUS Miner client.
   allocation-checked RandomX C-API ownership module at
   `src/randomx_native.rs`. Do not broaden that allowance or add another native
   boundary.
+- macOS builds must keep `sysinfo` out of their compiled dependency tree and
+  must not call `host_statistics64` for RAM telemetry. Preserve the bounded
+  and deadline-limited `/usr/bin/memory_pressure -Q` probe, background periodic
+  refresh, and CI guard.
+- Preserve the GUI/engine process boundary, bounded five-attempt recovery,
+  operator Stop latch, failed-cleanup child quarantine, and the Windows
+  one-worker optimized then portable light-memory RandomX recovery path.
+  Preserve the GUI-parent pipe watchdog so a GUI crash cannot orphan its
+  engine. Normal mining must remain optimized, and CI must execute two-worker
+  optimized, one-worker optimized, and light-memory Windows soaks.
 - If a miner change appears to require chaincode changes, stop and ask the user
   to authorize a separate task in the SOV repository. Do not cross the boundary
   from this repository.

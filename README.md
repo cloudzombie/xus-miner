@@ -54,6 +54,26 @@ then run `cargo build --locked --release`; the executable is
 `target\release\xus-miner.exe`. Native macOS and Windows builds are exercised by
 CI.
 
+The primary macOS release archive is named
+`macos-apple-silicon-arm64` and is built natively for Apple Silicon. Its release
+gate runs the full RandomX vector and a two-worker direct-RPC soak on an arm64
+runner. On macOS, RAM telemetry uses Apple's fixed
+`/usr/bin/memory_pressure -Q` utility; `sysinfo` is excluded from the compiled
+dependency tree so SDK/runtime changes to `vm_statistics64` cannot corrupt the
+GUI process. Its output capture is fixed-size, the helper has a 500 ms deadline,
+and periodic probes run off the GUI thread.
+
+On Windows, the RandomX engine remains isolated from the GUI. If that engine
+exits unexpectedly, the GUI retains the diagnostic tail and attempts up to five
+supervised restarts with 2–32 second backoff. A recovery child uses one effective
+worker without changing the saved worker setting. An unclassified exit gets one
+optimized one-worker retry, matching the conservative configuration used to
+stabilize affected systems. A repeated exit, recognized native execution fault,
+or native memory/commit-exhaustion status goes directly to portable light mode
+without a full-dataset allocation. The normal path stays optimized. A missing
+runtime DLL is terminal instead of being retried. Stop cancels every queued
+recovery, including an exit/drain race.
+
 The GUI provides:
 
 - visible connection, authentication, reconnecting, mining, and failure states;
@@ -70,12 +90,15 @@ The GUI provides:
 - an unmistakable green, pulsing `BLOCK FOUND` confirmation for 30 seconds when
   the direct SOV node accepts this miner's exact sealed block;
 - bounded engine logs, an explicit shared-dataset RandomX memory estimate, and a
-  RAM-only operating-system scan every ten seconds;
+  RAM-only operating-system scan every ten seconds (Apple's safe external
+  memory-pressure probe on macOS);
 - honest worker-readiness telemetry that distinguishes the shared fast dataset
   from the lower-memory fallback, while keeping a live node link visibly
   connected if one worker enters a degraded state;
 - selectable engine logs, copied diagnostics, and crash reports that scrub the
   password and endpoint userinfo; embedded endpoint credentials are rejected;
+- bounded automatic engine recovery with logged one-worker optimized and
+  portable light-memory Windows tiers;
 - a template-confirmed Coinbase field in Active Work, diagnostics, and the
   startup engine log;
 - validated pool, worker, thread, reconnect, and telemetry settings;
@@ -88,7 +111,9 @@ The GUI passes the password to its child engine over standard input instead of
 exposing it in process arguments. Closing the window requests child termination
 and release of its RandomX memory. If the operating system cannot prove that
 termination completed, the GUI keeps the child quarantined and restart disabled
-instead of risking a duplicate engine.
+instead of risking a duplicate engine. A flushed parent-pipe heartbeat also
+forces a GUI-launched engine to exit if the GUI process or its telemetry reader
+vanishes unexpectedly, preventing an invisible orphan miner.
 
 Mining is probabilistic: the displayed solo block ETA is `expected hashes ÷
 smoothed local hashes/second`, not a guaranteed countdown. The round meter uses
@@ -146,21 +171,47 @@ preflight immediately before accepting its first RandomX job, including when it
 is launched without the GUI. `--confirm-randomx-memory` is accepted only as a
 non-persistent fallback when the operating-system scan is unavailable; it
 cannot override a valid low-memory reading.
+`--randomx-light` disables CPU-specific RandomX acceleration and avoids the full
+dataset. It is the slower recovery tier used after a failed one-worker optimized
+retry or immediately for recognized Windows native execution and
+memory/commit-exhaustion statuses.
+
+### Crash diagnostics
+
+Both the GUI and the isolated engine append timestamped diagnostic logs to
+`~/.xus-miner/logs/` (`%USERPROFILE%\.xus-miner\logs\` on Windows); the active
+file path is printed on stderr at startup and the ten newest files are kept.
+Every line names the miner version, operating system, and architecture, the
+startup header records detected CPU features, and a panic writes its full
+backtrace to the file before the process exits. Set `XUS_MINER_LOG=debug` for
+verbose engine-lifecycle detail when reporting a problem; the default level is
+`info`. Credentials are never written: the Stratum password stays on stdin and
+GUI log lines are redacted before they are mirrored.
 
 ## Current constraints
 
 - The connection is plaintext TCP. Use a trusted network or a secured tunnel.
 - Workers use independent, allocation-checked RandomX VMs backed by one shared
   read-only dataset (approximately 2.3 GiB total plus a conservative 32 MiB
-  allowance per worker). The default is one worker. Neither the GUI nor
-  headless engine silently changes the chosen worker count; RandomX
-  initialization is blocked when the live RAM preflight cannot preserve the
-  larger of 1.5 GiB or 10% of installed RAM (capped at 4 GiB).
+  allowance per worker). The default is one worker. Normal GUI launches and
+  manual headless launches keep the selected worker count. Supervised Windows
+  recovery explicitly and visibly uses one effective worker while preserving
+  the saved preference; its light tier budgets a 256 MiB cache instead of the
+  full dataset. RandomX initialization is blocked when the live RAM preflight
+  cannot preserve the larger of 1.5 GiB or 10% of installed RAM (capped at
+  4 GiB).
 - The current bridge records shares but has no PPLNS payout implementation. Its
   configured coinbase account receives the block. A public operator must not
   promise automatic or trustless payouts until that layer exists.
 - This is a correctness-first reference miner, not yet an XMRig-performance
   replacement.
+- No application can honestly guarantee that an operating system, native
+  dependency, or failing hardware will never terminate a process. Windows
+  physical-RAM preflight also cannot prove system-wide commit availability.
+  XUS Miner therefore fails closed on low physical RAM, records Windows native
+  status codes (including commit exhaustion), isolates the engine, falls back
+  to low-memory mode when those statuses are observed, and bounds recovery
+  attempts instead of entering an infinite restart loop.
 
 ## Verification
 

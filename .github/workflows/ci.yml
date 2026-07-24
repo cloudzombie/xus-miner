@@ -52,6 +52,21 @@ jobs:
           persist-credentials: false
       - name: Install Rust checks
         run: rustup component add rustfmt clippy
+      - name: Prove macOS memory telemetry excludes sysinfo
+        if: startsWith(matrix.os, 'macos-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          tree="$(cargo tree --locked --target "${host}" --edges normal)"
+          if [[ "${tree}" == *"sysinfo v"* ]]; then
+            echo "sysinfo must not be linked into a macOS XUS Miner build" >&2
+            exit 1
+          fi
+      - name: Prove native Apple Silicon runner
+        if: matrix.os == 'macos-15'
+        shell: bash
+        run: test "$(uname -m)" = arm64
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
@@ -65,9 +80,21 @@ jobs:
       - name: Validate fast RandomX mining vector (shared full dataset)
         timeout-minutes: 12
         run: cargo test --locked --release --bin xus-miner randomx_mainnet_job_uses_the_exact_sov_mining_seal -- --ignored --test-threads=1
-      - name: Soak two-worker direct RPC RandomX engine (Windows)
+      - name: Soak two-worker direct RPC RandomX engine for 90 seconds (Windows and Apple Silicon)
+        if: matrix.os == 'windows-2025' || matrix.os == 'macos-15'
+        timeout-minutes: 15
+        run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_stability_window -- --ignored --test-threads=1
+      - name: Soak one-worker optimized RandomX recovery for 90 seconds (Windows)
         if: matrix.os == 'windows-2025'
-        timeout-minutes: 12
-        run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_short_window -- --ignored --test-threads=1
+        timeout-minutes: 15
+        env:
+          XUS_TEST_RANDOMX_ONE_WORKER: "1"
+        run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_stability_window -- --ignored --test-threads=1
+      - name: Soak one-worker light-memory RandomX recovery for 90 seconds (Windows)
+        if: matrix.os == 'windows-2025'
+        timeout-minutes: 15
+        env:
+          XUS_TEST_RANDOMX_LIGHT: "1"
+        run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_stability_window -- --ignored --test-threads=1
       - name: Build release
         run: cargo build --locked --release

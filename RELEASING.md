@@ -27,7 +27,10 @@ version.
 The workflow accepts no version input: it derives `vX.Y.Z` from `Cargo.toml`,
 refuses reused versions or any ref other than current `main`, rebuilds and tests
 on Linux, Apple Silicon macOS, Intel macOS, and Windows, and confirms each
-compiled binary reports the exact same version. Only after those gates does it
+compiled binary reports the exact same version. Windows additionally passes
+separate optimized two-worker, optimized-recovery one-worker, and portable
+light-recovery one-worker RandomX stability soaks; Apple Silicon passes the
+optimized two-worker soak. Only after those gates does it
 create the matching tag, checksums, provenance attestations, and GitHub release.
 Only that final source-free publish job receives a repository-scoped write
 token; all source/build jobs remain read-only. The tag reference is created
