@@ -2,6 +2,16 @@
 
 ## 0.1.4
 
+- **Fix a field GUI crash present in v0.1.3** (captured by the v0.1.3 crash
+  log on a live macOS session, platform-independent): the live-meter's
+  height-change markers used `bool::then_some(height.expect(...))`, whose
+  argument is evaluated **eagerly** — so one meter sample with no height
+  (the engine legitimately reports `height: null` between jobs, after an
+  accepted block, and while reconnecting) panicked the dashboard paint path
+  (`height checked`) and aborted the whole application on the next repaint.
+  The marker derivation is now lazy and total (`filter`/`map`, extracted as
+  a pure helper), with a regression test that replays the previously fatal
+  jobless-sample history through the real paint path.
 - Add a mempool.space-style **block-flow strip** to the GUI dashboard for
   direct-node sessions: the forming template block, a tip divider, and the
   most recent confirmed blocks as tiles with their real heights and

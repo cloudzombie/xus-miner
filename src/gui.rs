@@ -3970,6 +3970,30 @@ fn chart_grid(painter: &egui::Painter, rect: egui::Rect) {
     }
 }
 
+/// Sample indices where the observed chain height changed to a new known
+/// value, with that height. A sample without a height (the engine reports
+/// `height: null` between jobs, on reconnect, and while waiting for work)
+/// yields no marker.
+///
+/// FIELD-CRASH REGRESSION (v0.1.3): this was previously written as
+/// `cond.then_some(current.height.expect("height checked"))` inside the paint
+/// path — but `bool::then_some` evaluates its argument EAGERLY, so the
+/// `expect` ran even when the condition was false and a single `None`-height
+/// sample panicked the entire GUI on every repaint. Keep this lazy.
+fn height_change_markers(history: &VecDeque<MeterSample>) -> Vec<(usize, u64)> {
+    history
+        .iter()
+        .zip(history.iter().skip(1))
+        .enumerate()
+        .filter_map(|(index, (previous, current))| {
+            current
+                .height
+                .filter(|height| previous.height != Some(*height))
+                .map(|height| (index + 1, height))
+        })
+        .collect()
+}
+
 fn mining_meter(ui: &mut egui::Ui, history: &VecDeque<MeterSample>, report_secs: u64, height: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -4111,15 +4135,7 @@ fn mining_meter(ui: &mut egui::Ui, history: &VecDeque<MeterSample>, report_secs:
         }
     }
 
-    let markers: Vec<_> = history
-        .iter()
-        .zip(history.iter().skip(1))
-        .enumerate()
-        .filter_map(|(index, (previous, current))| {
-            (current.height.is_some() && current.height != previous.height)
-                .then_some((index + 1, current.height.expect("height checked")))
-        })
-        .collect();
+    let markers = height_change_markers(history);
     let marker_skip = markers.len().saturating_sub(6);
     for (ordinal, (index, block_height)) in markers.iter().skip(marker_skip).enumerate() {
         let x = x_for(*index);
@@ -5768,6 +5784,44 @@ mod tests {
             app.block_flow.as_ref().map(|flow| flow.recent.len()),
             Some(MAX_FLOW_TILES)
         );
+    }
+
+    fn meter_sample(height: Option<u64>) -> MeterSample {
+        MeterSample {
+            hashrate: 100.0,
+            smoothed_hashrate: 100.0,
+            mempool: Some(0),
+            height,
+            round_probability: Some(0.1),
+        }
+    }
+
+    #[test]
+    fn height_markers_never_panic_on_jobless_samples_and_mark_real_changes() {
+        // v0.1.3 field crash: a `None`-height sample (engine between jobs /
+        // reconnecting) panicked the GUI paint path via an eagerly evaluated
+        // `then_some(...expect(...))`. This input previously aborted.
+        let history: VecDeque<MeterSample> = VecDeque::from(vec![
+            meter_sample(Some(10)),
+            meter_sample(None),
+            meter_sample(None),
+            meter_sample(Some(11)),
+            meter_sample(Some(11)),
+            meter_sample(Some(12)),
+        ]);
+        assert_eq!(height_change_markers(&history), vec![(3, 11), (5, 12)]);
+
+        let all_jobless: VecDeque<MeterSample> =
+            VecDeque::from(vec![meter_sample(None), meter_sample(None)]);
+        assert_eq!(height_change_markers(&all_jobless), vec![]);
+        assert_eq!(height_change_markers(&VecDeque::new()), vec![]);
+
+        // The full meter must paint, not panic, with jobless samples present.
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            mining_meter(ui, &history, 2, 220.0);
+        });
+        assert!(output.shapes.len() > 10);
     }
 
     #[test]
