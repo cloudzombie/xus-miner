@@ -345,6 +345,11 @@ pub(crate) fn info(message: &str) {
     log(Level::Info, message);
 }
 
+// `debug` completes the level API (error/warn/info/debug); today its only
+// caller is the macOS `memory_pressure` probe, so it is dead on non-macOS
+// targets. Allow it there only — the lint stays active on macOS so a real
+// unused-debug regression is still caught.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn debug(message: &str) {
     log(Level::Debug, message);
 }
