@@ -1,6 +1,7 @@
 use borsh::BorshSerialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -206,7 +207,7 @@ fn process_log_tails(stdout_tail: &Arc<Mutex<String>>, stderr_tail: &Arc<Mutex<S
 
 fn observe_randomx_telemetry(
     line: &str,
-    fast_shared_ready: &mut [bool; 2],
+    fast_shared_ready: &mut [bool],
     saw_positive_hashrate: &mut bool,
 ) -> Result<(), String> {
     let Ok(event) = serde_json::from_str::<Value>(line) else {
@@ -222,10 +223,15 @@ fn observe_randomx_telemetry(
                     "RandomX worker_ready telemetry reported unexpected worker {worker}"
                 ));
             }
-            if event["mode"].as_str() != Some("fast-shared") {
+            let expected_mode = if env::var_os("XUS_TEST_RANDOMX_LIGHT").is_some() {
+                "light-recovery"
+            } else {
+                "fast-shared"
+            };
+            if event["mode"].as_str() != Some(expected_mode) {
                 return Err(format!(
-                    "RandomX worker {worker} reported mode={} instead of mode=\"fast-shared\"",
-                    event["mode"]
+                    "RandomX worker {worker} reported mode={} instead of mode=\"{expected_mode}\"",
+                    event["mode"],
                 ));
             }
             fast_shared_ready[worker as usize] = true;
@@ -240,14 +246,11 @@ fn observe_randomx_telemetry(
             ));
         }
         Some("session_error") => {
-            return Err(format!(
-                "two-worker RandomX RPC session failed: {}",
-                event["message"]
-            ));
+            return Err(format!("RandomX RPC session failed: {}", event["message"]));
         }
         Some("engine_fatal") => {
             return Err(format!(
-                "two-worker RandomX engine reported a fatal error: {}",
+                "RandomX engine reported a fatal error: {}",
                 event["message"]
             ));
         }
@@ -259,14 +262,14 @@ fn observe_randomx_telemetry(
 fn receive_randomx_telemetry(
     telemetry_rx: &mpsc::Receiver<String>,
     timeout: Duration,
-    fast_shared_ready: &mut [bool; 2],
+    fast_shared_ready: &mut [bool],
     saw_positive_hashrate: &mut bool,
 ) -> Result<(), String> {
     let first = match telemetry_rx.recv_timeout(timeout) {
         Ok(line) => line,
         Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return Err("two-worker RandomX telemetry stream disconnected".into());
+            return Err("RandomX telemetry stream disconnected".into());
         }
     };
     observe_randomx_telemetry(&first, fast_shared_ready, saw_positive_hashrate)?;
@@ -277,7 +280,7 @@ fn receive_randomx_telemetry(
             }
             Err(mpsc::TryRecvError::Empty) => return Ok(()),
             Err(mpsc::TryRecvError::Disconnected) => {
-                return Err("two-worker RandomX telemetry stream disconnected".into());
+                return Err("RandomX telemetry stream disconnected".into());
             }
         }
     }
@@ -660,28 +663,37 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
 
 #[test]
 #[ignore = "long soak for RandomX worker startup and engine stability"]
-fn headless_randomx_direct_rpc_engine_stays_alive_for_short_window() {
+fn headless_randomx_direct_rpc_engine_stays_alive_for_stability_window() {
     let fixture = TemplateFixture::sov_0_1_99_randomx();
     // Keep the event receiver alive: the mock deliberately refuses to answer
     // after its observer disconnects.
     let (mock_node, request_rx) = MockNode::start(fixture.clone());
     let endpoint = format!("rpc://{}", mock_node.address);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_xus-miner"))
-        .args([
-            "--headless",
-            "--json-events",
-            "--pool",
-            &endpoint,
-            "--user",
-            COINBASE,
-            "--workers",
-            "2",
-            "--reconnect-secs",
-            "1",
-            "--report-secs",
-            "1",
-        ])
+    let light_recovery = env::var_os("XUS_TEST_RANDOMX_LIGHT").is_some();
+    let one_worker_recovery =
+        light_recovery || env::var_os("XUS_TEST_RANDOMX_ONE_WORKER").is_some();
+    let worker_count = if one_worker_recovery { 1_u64 } else { 2_u64 };
+    let worker_count_text = worker_count.to_string();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xus-miner"));
+    command.args([
+        "--headless",
+        "--json-events",
+        "--pool",
+        &endpoint,
+        "--user",
+        COINBASE,
+        "--workers",
+        &worker_count_text,
+        "--reconnect-secs",
+        "1",
+        "--report-secs",
+        "1",
+    ]);
+    if light_recovery {
+        command.arg("--randomx-light");
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -743,7 +755,7 @@ fn headless_randomx_direct_rpc_engine_stays_alive_for_short_window() {
     });
     let mut child = ChildGuard(child);
 
-    let mut fast_shared_ready = [false; 2];
+    let mut fast_shared_ready = vec![false; worker_count as usize];
     let mut saw_positive_hashrate = false;
     let mut failure = None;
     let startup_deadline = Instant::now() + Duration::from_secs(240);
@@ -752,22 +764,20 @@ fn headless_randomx_direct_rpc_engine_stays_alive_for_short_window() {
     {
         if telemetry_overflowed.load(Ordering::Acquire) {
             failure = Some(format!(
-                "two-worker RandomX telemetry exceeded the bounded queue capacity of \
+                "RandomX telemetry exceeded the bounded queue capacity of \
                  {TELEMETRY_QUEUE_CAPACITY}"
             ));
             break;
         }
         match child.0.try_wait() {
             Ok(Some(status)) => {
-                failure = Some(format!(
-                    "two-worker RandomX child exited during startup: {status}"
-                ));
+                failure = Some(format!("RandomX child exited during startup: {status}"));
                 break;
             }
             Ok(None) => {}
             Err(error) => {
                 failure = Some(format!(
-                    "failed to poll two-worker RandomX child during startup: {error}"
+                    "failed to poll RandomX child during startup: {error}"
                 ));
                 break;
             }
@@ -784,11 +794,10 @@ fn headless_randomx_direct_rpc_engine_stays_alive_for_short_window() {
         }
     }
     if failure.is_none() && !fast_shared_ready.iter().all(|value| *value) {
-        failure =
-            Some("both RandomX workers must explicitly report mode=\"fast-shared\"".to_owned());
+        failure = Some("every RandomX worker must explicitly report its expected mode".to_owned());
     }
     if failure.is_none() && !saw_positive_hashrate {
-        failure = Some("two-worker RandomX engine never reported positive hashrate".to_owned());
+        failure = Some("RandomX engine never reported positive hashrate".to_owned());
     }
 
     let mut saw_stability_hashrate = false;
@@ -804,11 +813,11 @@ fn headless_randomx_direct_rpc_engine_stays_alive_for_short_window() {
         }
     }
     if failure.is_none() {
-        let stability_deadline = Instant::now() + Duration::from_secs(30);
+        let stability_deadline = Instant::now() + Duration::from_secs(90);
         while Instant::now() < stability_deadline {
             if telemetry_overflowed.load(Ordering::Acquire) {
                 failure = Some(format!(
-                    "two-worker RandomX telemetry exceeded the bounded queue capacity of \
+                    "RandomX telemetry exceeded the bounded queue capacity of \
                      {TELEMETRY_QUEUE_CAPACITY} during the stability window"
                 ));
                 break;
@@ -816,14 +825,14 @@ fn headless_randomx_direct_rpc_engine_stays_alive_for_short_window() {
             match child.0.try_wait() {
                 Ok(Some(status)) => {
                     failure = Some(format!(
-                        "two-worker RandomX child terminated during stability window: {status}"
+                        "RandomX child terminated during stability window: {status}"
                     ));
                     break;
                 }
                 Ok(None) => {}
                 Err(error) => {
                     failure = Some(format!(
-                        "failed to poll two-worker RandomX child during stability window: {error}"
+                        "failed to poll RandomX child during stability window: {error}"
                     ));
                     break;
                 }
@@ -843,7 +852,7 @@ fn headless_randomx_direct_rpc_engine_stays_alive_for_short_window() {
 
     let _ = child.0.kill();
     if let Err(error) = child.0.wait() {
-        failure.get_or_insert_with(|| format!("failed to reap two-worker RandomX child: {error}"));
+        failure.get_or_insert_with(|| format!("failed to reap RandomX child: {error}"));
     }
     if stdout_reader.join().is_err() {
         failure.get_or_insert_with(|| "miner stdout reader thread panicked".to_owned());
@@ -863,14 +872,26 @@ fn headless_randomx_direct_rpc_engine_stays_alive_for_short_window() {
     if telemetry_overflowed.load(Ordering::Acquire) {
         failure.get_or_insert_with(|| {
             format!(
-                "two-worker RandomX telemetry exceeded the bounded queue capacity of \
+                "RandomX telemetry exceeded the bounded queue capacity of \
                  {TELEMETRY_QUEUE_CAPACITY}"
             )
         });
     }
     if failure.is_none() && !saw_stability_hashrate {
-        failure =
-            Some("two-worker RandomX engine reported no positive hashrate during stability".into());
+        failure = Some("RandomX engine reported no positive hashrate during stability".into());
+    }
+    if failure.is_none() {
+        let output = stdout_tail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expected_backend = if light_recovery {
+            r#""randomx_backend":"light-recovery""#
+        } else {
+            r#""randomx_backend":"optimized""#
+        };
+        if !output.contains(expected_backend) {
+            failure = Some("RandomX soak did not confirm the requested backend".into());
+        }
     }
     if let Some(error) = failure {
         panic!("{error}\n{}", process_log_tails(&stdout_tail, &stderr_tail));

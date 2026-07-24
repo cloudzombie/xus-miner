@@ -20,7 +20,7 @@ separate, explicitly authorized SOV task.
 
 ## Direct-node JSON-RPC contract
 
-XUS Miner 0.1.2 retains the 0.1.1 compatibility baseline for the current SOV
+XUS Miner 0.1.3 retains the 0.1.1 compatibility baseline for the current SOV
 `release/v0.1.99` branch at
 `752b75bb9dcfa6392136fae3faad1ec515719c2a`. At validation time that SOV branch
 had not yet been published as an immutable `v0.1.99` tag. Its mining RPC and

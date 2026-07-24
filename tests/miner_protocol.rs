@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct ChildGuard(Child);
 
@@ -18,6 +18,62 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn gui_parent_pipe_watchdog_prevents_an_orphan_engine() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xus-miner"))
+        .args([
+            "--headless",
+            "--json-events",
+            "--parent-pipe-watchdog",
+            "--pool",
+            "127.0.0.1:1",
+            "--user",
+            "watchdog-test",
+            "--workers",
+            "1",
+            "--reconnect-secs",
+            "1",
+            "--report-secs",
+            "60",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn supervised xus-miner");
+    let stdout = child.stdout.take().expect("miner supervision pipe");
+    let mut reader = BufReader::new(stdout);
+    let mut startup_line = String::new();
+    reader
+        .read_line(&mut startup_line)
+        .expect("read miner startup event");
+    let startup: Value = serde_json::from_str(&startup_line).expect("valid startup JSON");
+    assert_eq!(startup["event"], json!("startup"));
+
+    // Closing the GUI's read end must make the next watchdog heartbeat fail
+    // and terminate the engine instead of leaving a background miner behind.
+    drop(reader);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        match child.try_wait().expect("poll watchdog child") {
+            Some(status) => {
+                assert_eq!(
+                    status.code(),
+                    Some(70),
+                    "broken supervision pipe must use the dedicated orphan-prevention exit code"
+                );
+                break;
+            }
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("engine did not exit after its GUI supervision pipe closed");
+            }
+        }
     }
 }
 

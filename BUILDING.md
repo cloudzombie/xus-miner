@@ -28,9 +28,15 @@ else in the application.
 
 At runtime the GUI refreshes only the operating system's RAM counters every ten
 seconds and immediately before Start. The isolated/headless engine checks the
-same counters again immediately before its first RandomX job. Neither path
-inventories processes, CPU, disks, network interfaces, users, or swap, and
-neither performs GPU work.
+same counters again immediately before its first RandomX job. Windows and Linux
+use the RAM-only `sysinfo` feature. macOS excludes `sysinfo` from the compiled
+dependency tree and parses bounded output from Apple's absolute-path
+`/usr/bin/memory_pressure -Q` utility with an empty environment; this avoids
+placing `vm_statistics64` SDK/runtime ABI changes inside the miner process. The
+helper has fixed-size stdout/stderr capture and a 500 ms deadline; periodic GUI
+refreshes run in a background probe.
+Neither path inventories processes, CPU, disks, network interfaces, users, or
+swap, and neither performs GPU work.
 
 For the strongest isolation, use an attested GitHub release built on an
 ephemeral hosted runner where SOV is absent. A local Cargo build executes locked
@@ -53,6 +59,11 @@ cargo build --locked --release
 ./target/release/xus-miner
 ```
 
+The primary GitHub macOS archive is `macos-apple-silicon-arm64`. Release CI
+asserts a native arm64 runner, validates the full shared RandomX dataset, and
+soaks two simultaneous direct-RPC workers. This is the archive intended for M3,
+M4, and later Apple Silicon systems; it does not require Rosetta.
+
 ## Windows 10/11 (64-bit)
 
 Install:
@@ -69,6 +80,21 @@ From a Developer PowerShell:
 cargo build --locked --release
 .\target\release\xus-miner.exe
 ```
+
+The Windows release gate runs separate 90-second steady-hashing soaks for the
+two-worker optimized backend, the one-worker optimized recovery backend, and the
+one-worker portable light-memory backend. At runtime the GUI supervises the
+isolated engine with at most five restart attempts. Every Windows recovery child
+uses one effective worker without overwriting the saved worker preference. An
+unclassified exit gets one optimized retry. A repeated exit, recognized native
+execution fault, or native memory/commit-exhaustion status selects
+`--randomx-light`, which budgets a 256 MiB cache and does not allocate the full
+dataset. Ordinary launches retain CPU-specific acceleration and the selected
+worker count.
+Operator Stop always cancels the recovery latch. GUI-spawned Windows engines run
+below normal process priority so the operator console stays responsive under
+sustained hashing load. Their flushed parent-pipe heartbeat exits the child if
+the GUI or telemetry reader disappears, preventing an orphan engine.
 
 ## Linux (X11)
 
@@ -95,8 +121,25 @@ cargo audit --deny warnings
 cargo build --locked --release
 ```
 
-The full-dataset RandomX equivalence test is intentionally ignored in ordinary
-CI because it allocates roughly 2.3 GiB:
+The ignored stability soak is exercised by CI in optimized mode on Windows and
+Apple Silicon and again in both one-worker recovery configurations on Windows:
+
+```sh
+cargo test --locked --release --test rpc_0199_protocol \
+  headless_randomx_direct_rpc_engine_stays_alive_for_stability_window \
+  -- --ignored --test-threads=1
+XUS_TEST_RANDOMX_ONE_WORKER=1 cargo test --locked --release \
+  --test rpc_0199_protocol \
+  headless_randomx_direct_rpc_engine_stays_alive_for_stability_window \
+  -- --ignored --test-threads=1
+XUS_TEST_RANDOMX_LIGHT=1 cargo test --locked --release \
+  --test rpc_0199_protocol \
+  headless_randomx_direct_rpc_engine_stays_alive_for_stability_window \
+  -- --ignored --test-threads=1
+```
+
+The full-dataset RandomX equivalence test is ignored by an ordinary `cargo test`
+because it allocates roughly 2.3 GiB; CI and Release exercise it explicitly:
 
 ```sh
 cargo test --locked --release randomx_mainnet_job_uses_the_exact_sov_mining_seal \

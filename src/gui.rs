@@ -1,8 +1,8 @@
 #[cfg(test)]
 use crate::gib_to_bytes;
 use crate::{
-    memory_headroom_bytes, randomx_memory_bytes, BYTES_PER_GIB, MIN_MEMORY_HEADROOM_GIB,
-    RANDOMX_DATASET_GIB, RANDOMX_WORKER_MIB,
+    diag, memory_headroom_bytes, randomx_memory_bytes, randomx_memory_bytes_for, BYTES_PER_GIB,
+    MIN_MEMORY_HEADROOM_GIB, RANDOMX_DATASET_GIB, RANDOMX_LIGHT_CACHE_MIB, RANDOMX_WORKER_MIB,
 };
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke,
@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(not(target_os = "macos"))]
 use sysinfo::{MemoryRefreshKind, System};
 
 const WINDOW_TITLE: &str = "XUS Miner";
@@ -33,6 +34,10 @@ const CHILD_OUTPUT_QUEUE_CAPACITY: usize = 256;
 const MAX_PROCESS_MESSAGES_PER_FRAME: usize = 64;
 const OUTPUT_DISCONNECT_GRACE: Duration = Duration::from_millis(500);
 const OBSERVATION_FAILURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const ENGINE_RESTART_BASE_SECS: u64 = 2;
+const ENGINE_RESTART_MAX_SECS: u64 = 60;
+const MAX_AUTOMATIC_ENGINE_RESTARTS: u32 = 5;
+const ENGINE_STABILITY_RESET: Duration = Duration::from_secs(5 * 60);
 const MAX_CRASH_REPORT_BYTES: usize = 128 * 1024;
 const MAX_CRASH_REPORT_LOG_LINES: usize = 100;
 const MAX_METER_SAMPLES: usize = 180;
@@ -598,7 +603,10 @@ fn windows_ntstatus_description(code: u32) -> Option<&'static str> {
         0xC000_0005 => Some("access violation (native memory fault)"),
         0xC000_0017 => Some("not enough virtual memory"),
         0xC000_001D => Some("illegal CPU instruction"),
+        0xC000_009A => Some("insufficient system resources"),
         0xC000_00FD => Some("stack overflow"),
+        0xC000_012C => Some("pagefile quota exceeded"),
+        0xC000_012D => Some("system commitment limit reached"),
         0xC000_0135 => Some("required DLL was not found"),
         0xC000_0374 => Some("heap corruption"),
         0xC000_0409 => Some("fail-fast termination or stack buffer overrun"),
@@ -657,6 +665,70 @@ fn exit_status_matches_requested_stop(status: &ExitStatus) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn exit_status_matches_requested_stop(_status: &ExitStatus) -> bool {
     false
+}
+
+fn automatic_restart_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    Duration::from_secs(
+        ENGINE_RESTART_BASE_SECS
+            .saturating_mul(1_u64 << shift)
+            .min(ENGINE_RESTART_MAX_SECS),
+    )
+}
+
+#[cfg(windows)]
+fn exit_status_is_native_execution_failure(status: &ExitStatus) -> bool {
+    matches!(
+        status.code().map(|code| code as u32),
+        Some(0xC000_0005 | 0xC000_001D | 0xC000_0374 | 0xC000_0409)
+    )
+}
+
+#[cfg(windows)]
+fn exit_status_requires_light_randomx(status: &ExitStatus) -> bool {
+    matches!(
+        status.code().map(|code| code as u32),
+        Some(0xC000_0017 | 0xC000_009A | 0xC000_012C | 0xC000_012D)
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryEscalation {
+    Keep,
+    #[cfg(windows)]
+    Light,
+    #[cfg(windows)]
+    Terminal,
+}
+
+#[cfg(windows)]
+fn recovery_escalation(
+    status: &ExitStatus,
+    light: bool,
+    prior_attempts: u32,
+) -> RecoveryEscalation {
+    if status.code().is_some_and(|code| code as u32 == 0xC000_0135) {
+        return RecoveryEscalation::Terminal;
+    }
+    if light {
+        return RecoveryEscalation::Keep;
+    }
+    if exit_status_requires_light_randomx(status)
+        || exit_status_is_native_execution_failure(status)
+        || prior_attempts >= 1
+    {
+        return RecoveryEscalation::Light;
+    }
+    RecoveryEscalation::Keep
+}
+
+#[cfg(not(windows))]
+fn recovery_escalation(
+    _status: &ExitStatus,
+    _light: bool,
+    _prior_attempts: u32,
+) -> RecoveryEscalation {
+    RecoveryEscalation::Keep
 }
 
 /// Attempts termination and only performs a blocking reap after termination is
@@ -830,6 +902,9 @@ struct MemorySnapshot {
     total: u64,
 }
 
+#[cfg(target_os = "macos")]
+type MemoryProbeReceiver = Receiver<Result<(u64, u64), String>>;
+
 struct MinerApp {
     settings: Settings,
     phase: Phase,
@@ -841,7 +916,13 @@ struct MinerApp {
     reader_threads: Vec<thread::JoinHandle<()>>,
     output_disconnected_at: Option<Instant>,
     requested_stop: bool,
+    automatic_recovery_enabled: bool,
+    automatic_restart_at: Option<Instant>,
+    automatic_restart_attempts: u32,
+    single_worker_recovery: bool,
+    light_randomx_recovery: bool,
     started_at: Option<Instant>,
+    stable_hashing_since: Option<Instant>,
     hashrate: f64,
     smoothed_hashrate: f64,
     total_hashes: u64,
@@ -875,7 +956,10 @@ struct MinerApp {
     engine_fatal_seen: bool,
     reveal_password: bool,
     memory_acknowledged: bool,
+    #[cfg(not(target_os = "macos"))]
     memory_system: System,
+    #[cfg(target_os = "macos")]
+    memory_probe: Option<Receiver<Result<(u64, u64), String>>>,
     memory_snapshot: Option<MemorySnapshot>,
     last_memory_refresh: Option<Instant>,
     node_link_live: bool,
@@ -883,8 +967,14 @@ struct MinerApp {
 
 impl Default for MinerApp {
     fn default() -> Self {
+        #[cfg(not(target_os = "macos"))]
         let mut memory_system = System::new();
+        #[cfg(not(target_os = "macos"))]
         let memory_snapshot = capture_memory_snapshot(&mut memory_system);
+        #[cfg(target_os = "macos")]
+        let memory_snapshot = crate::query_memory_counters()
+            .ok()
+            .and_then(|(available, total)| memory_snapshot_from_readings(available, total));
         Self {
             settings: load_settings(),
             phase: Phase::Idle,
@@ -896,7 +986,13 @@ impl Default for MinerApp {
             reader_threads: Vec::new(),
             output_disconnected_at: None,
             requested_stop: false,
+            automatic_recovery_enabled: false,
+            automatic_restart_at: None,
+            automatic_restart_attempts: 0,
+            single_worker_recovery: false,
+            light_randomx_recovery: false,
             started_at: None,
+            stable_hashing_since: None,
             hashrate: 0.0,
             smoothed_hashrate: 0.0,
             total_hashes: 0,
@@ -930,7 +1026,10 @@ impl Default for MinerApp {
             engine_fatal_seen: false,
             reveal_password: false,
             memory_acknowledged: false,
+            #[cfg(not(target_os = "macos"))]
             memory_system,
+            #[cfg(target_os = "macos")]
+            memory_probe: None,
             memory_snapshot,
             last_memory_refresh: Some(Instant::now()),
             node_link_live: false,
@@ -939,19 +1038,88 @@ impl Default for MinerApp {
 }
 
 impl MinerApp {
-    fn is_running(&self) -> bool {
+    fn effective_engine_workers(&self) -> u64 {
+        #[cfg(windows)]
+        if self.single_worker_recovery {
+            return 1;
+        }
+        self.settings.workers
+    }
+
+    fn has_live_engine_state(&self) -> bool {
         self.child.is_some()
             || self.quarantined_child.is_some()
             || self.pending_exit.is_some()
             || self.pending_observation_failure.is_some()
     }
 
+    fn is_running(&self) -> bool {
+        self.has_live_engine_state() || self.automatic_restart_at.is_some()
+    }
+
     fn refresh_memory_now(&mut self) {
-        self.memory_snapshot = capture_memory_snapshot(&mut self.memory_system);
+        #[cfg(target_os = "macos")]
+        {
+            let result =
+                self.memory_probe
+                    .take()
+                    .map_or_else(crate::query_memory_counters, |receiver| {
+                        receiver
+                            .recv_timeout(Duration::from_millis(600))
+                            .map_err(|error| {
+                                format!("macOS memory probe did not finish: {error}")
+                            })?
+                    });
+            self.memory_snapshot = result
+                .ok()
+                .and_then(|(available, total)| memory_snapshot_from_readings(available, total));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.memory_snapshot = capture_memory_snapshot(&mut self.memory_system);
+        }
         self.last_memory_refresh = Some(Instant::now());
     }
 
+    #[cfg(target_os = "macos")]
+    fn poll_memory_probe(&mut self) {
+        let Some(receiver) = self.memory_probe.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.memory_snapshot = result
+                    .ok()
+                    .and_then(|(available, total)| memory_snapshot_from_readings(available, total));
+            }
+            Err(TryRecvError::Empty) => self.memory_probe = Some(receiver),
+            Err(TryRecvError::Disconnected) => self.memory_snapshot = None,
+        }
+    }
+
     fn refresh_memory_if_due(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.poll_memory_probe();
+            if self.memory_probe.is_none()
+                && self
+                    .last_memory_refresh
+                    .is_none_or(|last| last.elapsed() >= MEMORY_REFRESH_INTERVAL)
+            {
+                self.memory_probe = spawn_memory_probe()
+                    .inspect_err(|error| {
+                        diag::warn(&format!(
+                            "cannot start the background macOS memory probe: {error}"
+                        ));
+                    })
+                    .ok();
+                self.last_memory_refresh = Some(Instant::now());
+                if self.memory_probe.is_none() {
+                    self.memory_snapshot = None;
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         if self
             .last_memory_refresh
             .is_none_or(|last| last.elapsed() >= MEMORY_REFRESH_INTERVAL)
@@ -961,16 +1129,21 @@ impl MinerApp {
     }
 
     fn memory_preflight_error(&self) -> Option<String> {
-        let workers = self.settings.workers;
-        let randomx_estimate = randomx_memory_bytes(workers);
+        let workers = self.effective_engine_workers();
+        let randomx_estimate = randomx_memory_bytes_for(workers, self.light_randomx_recovery);
         match self.memory_snapshot {
             Some(snapshot)
                 if snapshot.available
                     < randomx_estimate + memory_headroom_bytes(snapshot.total) =>
             {
                 Some(format!(
-                    "Start blocked: RandomX may need about {} total (one shared {RANDOMX_DATASET_GIB:.1} GiB dataset + {RANDOMX_WORKER_MIB:.0} MiB per worker), plus {} of system headroom, but the live scan reports only {} available for {workers} worker{}.",
+                    "Start blocked: RandomX may need about {} total ({} + {RANDOMX_WORKER_MIB:.0} MiB per worker), plus {} of system headroom, but the live scan reports only {} available for {workers} worker{}.",
                     format_memory(randomx_estimate),
+                    if self.light_randomx_recovery {
+                        format!("portable {RANDOMX_LIGHT_CACHE_MIB:.0} MiB light cache")
+                    } else {
+                        format!("one shared {RANDOMX_DATASET_GIB:.1} GiB dataset")
+                    },
                     format_memory(memory_headroom_bytes(snapshot.total)),
                     format_memory(snapshot.available),
                     if workers == 1 { "" } else { "s" },
@@ -978,21 +1151,27 @@ impl MinerApp {
             }
             Some(_) => None,
             None if !self.memory_acknowledged => Some(format!(
-                "The operating-system memory scan is unavailable. Confirm at least {:.1} GiB is available before starting {workers} RandomX worker{} (one shared dataset, not one dataset per worker).",
+                "The operating-system memory scan is unavailable. Confirm at least {:.1} GiB is available before starting {workers} RandomX worker{} ({}).",
                 randomx_estimate as f64 / BYTES_PER_GIB + MIN_MEMORY_HEADROOM_GIB,
                 if workers == 1 { "" } else { "s" },
+                if self.light_randomx_recovery {
+                    "portable light cache; no full dataset"
+                } else {
+                    "one shared dataset, not one dataset per worker"
+                },
             )),
             None => None,
         }
     }
 
     fn memory_preflight_summary(&self) -> String {
-        let dataset = randomx_memory_bytes(self.settings.workers);
+        let estimate =
+            randomx_memory_bytes_for(self.effective_engine_workers(), self.light_randomx_recovery);
         self.memory_snapshot.map_or_else(
             || {
                 format!(
                     "Memory preflight manually confirmed: {} RandomX estimate plus at least {:.1} GiB reserved.",
-                    format_memory(dataset),
+                    format_memory(estimate),
                     MIN_MEMORY_HEADROOM_GIB,
                 )
             },
@@ -1001,7 +1180,7 @@ impl MinerApp {
                     "Memory preflight PASS: {} available / {} total; {} RandomX estimate + {} reserved.",
                     format_memory(snapshot.available),
                     format_memory(snapshot.total),
-                    format_memory(dataset),
+                    format_memory(estimate),
                     format_memory(memory_headroom_bytes(snapshot.total)),
                 )
             },
@@ -1042,6 +1221,7 @@ impl MinerApp {
         self.output_disconnected_at = None;
         self.pending_observation_failure = None;
         self.node_link_live = false;
+        self.stable_hashing_since = None;
     }
 
     fn clear_active_work(&mut self) {
@@ -1055,15 +1235,17 @@ impl MinerApp {
         self.round_hashes = 0;
         self.round_probability = None;
         self.height_started_at = None;
+        self.stable_hashing_since = None;
     }
 
     fn mark_worker_unready(&mut self, worker: u64) {
         self.ready_worker_ids.remove(&worker);
         self.ready_workers = self.ready_worker_ids.len() as u64;
+        self.stable_hashing_since = None;
     }
 
     fn mark_worker_ready(&mut self, worker: u64) -> bool {
-        if worker >= self.settings.workers || self.engine_fatal_seen {
+        if worker >= self.effective_engine_workers() || self.engine_fatal_seen {
             return false;
         }
         let newly_ready = self.ready_worker_ids.insert(worker);
@@ -1128,6 +1310,16 @@ impl MinerApp {
         if text.trim().is_empty() {
             return;
         }
+        // Mirror the already-redacted operator log into the persistent
+        // diagnostic file so a GUI-side failure is reconstructable offline.
+        diag::log(
+            if error {
+                diag::Level::Warn
+            } else {
+                diag::Level::Debug
+            },
+            &format!("gui-log: {text}"),
+        );
         self.logs.push_back(LogLine {
             at: Instant::now(),
             text,
@@ -1143,17 +1335,21 @@ impl MinerApp {
         command
             .arg("--headless")
             .arg("--json-events")
+            .arg("--parent-pipe-watchdog")
             .arg("--password-stdin")
             .arg("--pool")
             .arg(self.settings.pool.trim())
             .arg("--user")
             .arg(self.settings.user.trim())
             .arg("--workers")
-            .arg(self.settings.workers.to_string())
+            .arg(self.effective_engine_workers().to_string())
             .arg("--reconnect-secs")
             .arg(self.settings.reconnect_secs.to_string())
             .arg("--report-secs")
             .arg(self.settings.report_secs.to_string());
+        if self.light_randomx_recovery {
+            command.arg("--randomx-light");
+        }
         if self.memory_snapshot.is_none() && self.memory_acknowledged {
             command.arg("--confirm-randomx-memory");
         }
@@ -1164,21 +1360,93 @@ impl MinerApp {
         command
     }
 
+    fn schedule_automatic_restart(&mut self, reason: &str) {
+        if self.requested_stop || !self.automatic_recovery_enabled {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            // Every Windows recovery uses the conservative worker count that
+            // stabilized affected operator systems. This changes only the
+            // child launch; the saved preference remains untouched.
+            self.single_worker_recovery = true;
+        }
+        if self.automatic_restart_attempts >= MAX_AUTOMATIC_ENGINE_RESTARTS {
+            self.automatic_recovery_enabled = false;
+            self.automatic_restart_at = None;
+            diag::error(&format!(
+                "automatic engine recovery exhausted after {MAX_AUTOMATIC_ENGINE_RESTARTS} attempts; final reason: {reason}"
+            ));
+            self.phase = Phase::Error;
+            self.last_error = format!(
+                "{reason} Automatic recovery stopped after {} attempts; review the saved crash reports before restarting.",
+                MAX_AUTOMATIC_ENGINE_RESTARTS,
+            );
+            self.push_log(self.last_error.clone(), true);
+            return;
+        }
+        self.automatic_restart_attempts += 1;
+        let delay = automatic_restart_delay(self.automatic_restart_attempts);
+        diag::warn(&format!(
+            "automatic engine recovery {}/{MAX_AUTOMATIC_ENGINE_RESTARTS} scheduled in {} s (single-worker={} light={}): {reason}",
+            self.automatic_restart_attempts,
+            delay.as_secs(),
+            self.single_worker_recovery,
+            self.light_randomx_recovery,
+        ));
+        self.automatic_restart_at = Some(Instant::now() + delay);
+        self.phase = Phase::Reconnecting;
+        self.last_error = reason.to_owned();
+        self.push_log(
+            format!(
+                "Automatic engine recovery {}/{} scheduled in {} seconds{}.",
+                self.automatic_restart_attempts,
+                MAX_AUTOMATIC_ENGINE_RESTARTS,
+                delay.as_secs(),
+                if self.light_randomx_recovery {
+                    " using one-worker portable light-memory RandomX"
+                } else if self.single_worker_recovery {
+                    " using one-worker optimized RandomX"
+                } else {
+                    ""
+                },
+            ),
+            false,
+        );
+    }
+
+    fn fail_engine_start(&mut self, error: String, automatic: bool) {
+        self.phase = Phase::Error;
+        self.last_error.clone_from(&error);
+        self.push_log(error.clone(), true);
+        if automatic {
+            self.schedule_automatic_restart(&error);
+        }
+    }
+
     fn start(&mut self) {
         if self.is_running() {
             return;
         }
+        self.automatic_restart_attempts = 0;
+        self.single_worker_recovery = false;
+        self.light_randomx_recovery = false;
+        self.automatic_recovery_enabled = true;
+        self.start_engine(false);
+    }
+
+    fn start_engine(&mut self, automatic: bool) {
+        if self.has_live_engine_state() {
+            return;
+        }
+        self.automatic_restart_at = None;
         if let Err(error) = self.settings.validate() {
-            self.last_error.clone_from(&error);
-            self.phase = Phase::Error;
-            self.push_log(error, true);
+            self.fail_engine_start(error, automatic);
             return;
         }
         self.refresh_memory_now();
         if let Some(error) = self.memory_preflight_error() {
-            self.last_error.clone_from(&error);
-            self.phase = Phase::Error;
-            self.push_log(error, true);
+            self.fail_engine_start(error, automatic);
             return;
         }
         let memory_preflight = self.memory_preflight_summary();
@@ -1190,40 +1458,74 @@ impl MinerApp {
         self.phase = Phase::Starting;
         self.requested_stop = false;
         self.started_at = Some(Instant::now());
-        self.logs.clear();
-        self.push_log("Starting isolated mining engine…", false);
+        if !automatic {
+            self.logs.clear();
+        }
+        self.push_log(
+            if automatic {
+                "Restarting the isolated mining engine under GUI supervision…"
+            } else {
+                "Starting isolated mining engine…"
+            },
+            false,
+        );
+        if self.light_randomx_recovery {
+            self.push_log(
+                format!(
+                    "Windows recovery is locked to portable light-memory RandomX with {}/{} effective worker; no full dataset will be allocated or retried.",
+                    self.effective_engine_workers(),
+                    self.settings.workers,
+                ),
+                false,
+            );
+        } else if self.single_worker_recovery {
+            self.push_log(
+                format!(
+                    "Windows recovery is using the optimized RandomX backend with {}/{} effective worker; the saved preference is unchanged.",
+                    self.effective_engine_workers(),
+                    self.settings.workers,
+                ),
+                false,
+            );
+        }
         self.push_log(memory_preflight, false);
 
         let executable = match env::current_exe() {
             Ok(path) => path,
             Err(error) => {
-                self.phase = Phase::Error;
-                self.last_error = format!("Cannot locate miner executable: {error}");
-                self.push_log(self.last_error.clone(), true);
+                self.fail_engine_start(
+                    format!("Cannot locate miner executable: {error}"),
+                    automatic,
+                );
                 return;
             }
         };
         let mut command = self.headless_command(&executable);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // Keep the UI and Windows scheduler responsive under sustained
+            // hashing load. This affects only the isolated engine child.
+            const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+            command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+        }
 
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                self.phase = Phase::Error;
-                self.last_error = format!("Cannot start mining engine: {error}");
-                self.push_log(self.last_error.clone(), true);
+                self.fail_engine_start(format!("Cannot start mining engine: {error}"), automatic);
                 return;
             }
         };
 
         if let Some(mut stdin) = child.stdin.take() {
             if let Err(error) = stdin.write_all(self.settings.password.as_bytes()) {
-                self.phase = Phase::Error;
-                self.last_error = format!("Cannot pass credentials to mining engine: {error}");
+                let mut failure = format!("Cannot pass credentials to mining engine: {error}");
                 if let Err(cleanup_error) = terminate_and_reap_child(&mut child) {
-                    self.last_error
-                        .push_str(&format!(" Child cleanup failed: {cleanup_error}."));
+                    failure.push_str(&format!(" Child cleanup failed: {cleanup_error}."));
+                    self.quarantined_child = Some(child);
                 }
-                self.push_log(self.last_error.clone(), true);
+                self.fail_engine_start(failure, automatic);
                 return;
             }
         }
@@ -1307,6 +1609,7 @@ impl MinerApp {
             let reaped = cleanup.is_ok();
             if let Err(error) = cleanup {
                 reader_start_errors.push(format!("Child cleanup failed: {error}."));
+                self.quarantined_child = Some(child);
             }
             let mut detached_readers = 0_usize;
             for handle in reader_threads {
@@ -1324,18 +1627,30 @@ impl MinerApp {
                     "{detached_readers} output reader(s) could not be joined without blocking."
                 ));
             }
-            self.phase = Phase::Error;
-            self.last_error = reader_start_errors.join(" ");
-            self.push_log(self.last_error.clone(), true);
+            self.fail_engine_start(reader_start_errors.join(" "), automatic);
             return;
         }
 
+        diag::info(&format!(
+            "engine child started: pid={} automatic-recovery-restart={automatic} effective-workers={} light-recovery={}",
+            child.id(),
+            self.effective_engine_workers(),
+            self.light_randomx_recovery,
+        ));
         self.receiver = Some(receiver);
         self.reader_threads = reader_threads;
         self.child = Some(child);
     }
 
     fn stop(&mut self) {
+        diag::info("operator Stop requested; recovery latch cleared");
+        self.automatic_recovery_enabled = false;
+        let canceled_recovery = self.automatic_restart_at.take().is_some();
+        if canceled_recovery {
+            self.automatic_restart_attempts = 0;
+            self.node_link_live = false;
+            self.push_log("Automatic engine recovery canceled by the operator.", false);
+        }
         if self.child.is_none() {
             if let Some(mut child) = self.quarantined_child.take() {
                 self.push_log("Retrying cleanup of the unobserved mining engine…", false);
@@ -1355,6 +1670,19 @@ impl MinerApp {
                         self.push_log(self.last_error.clone(), true);
                         self.quarantined_child = Some(child);
                     }
+                }
+            }
+            if self.pending_exit.is_some() || self.pending_observation_failure.is_some() {
+                self.phase = Phase::Stopping;
+                self.push_log(
+                    "Stop acknowledged; waiting for final engine output without automatic restart.",
+                    false,
+                );
+            } else if self.quarantined_child.is_none() {
+                self.phase = Phase::Idle;
+                self.last_error.clear();
+                if canceled_recovery {
+                    self.push_log("Mining stopped.", false);
                 }
             }
             return;
@@ -1508,6 +1836,8 @@ impl MinerApp {
             ),
             Err(error) => self.push_log(format!("Could not save crash report: {error}"), true),
         }
+        let failure = self.last_error.clone();
+        self.schedule_automatic_restart(&failure);
     }
 
     fn finish_exited_child(&mut self, status: ExitStatus) {
@@ -1529,6 +1859,10 @@ impl MinerApp {
         } else {
             self.phase = Phase::Error;
             let detail = describe_exit_status(&status);
+            diag::error(&format!(
+                "engine child exited unexpectedly: {detail}; requested-stop={} attempts-so-far={} light-recovery={}",
+                self.requested_stop, self.automatic_restart_attempts, self.light_randomx_recovery,
+            ));
             self.last_error = format!("Mining engine exited unexpectedly: {detail}.");
             self.push_log(self.last_error.clone(), true);
             match self.write_crash_report(&detail) {
@@ -1538,6 +1872,48 @@ impl MinerApp {
                 ),
                 Err(error) => self.push_log(format!("Could not save crash report: {error}"), true),
             }
+            match recovery_escalation(
+                &status,
+                self.light_randomx_recovery,
+                self.automatic_restart_attempts,
+            ) {
+                RecoveryEscalation::Keep =>
+                {
+                    #[cfg(windows)]
+                    if !self.single_worker_recovery {
+                        self.single_worker_recovery = true;
+                        self.push_log(
+                            "Windows engine recovery is retrying the optimized backend with one effective worker; the saved worker preference is unchanged.",
+                            true,
+                        );
+                    }
+                }
+                #[cfg(windows)]
+                RecoveryEscalation::Light => {
+                    self.single_worker_recovery = true;
+                    self.light_randomx_recovery = true;
+                    self.push_log(
+                        if exit_status_requires_light_randomx(&status) {
+                            "Windows reported native memory/commit exhaustion. Recovery will use one-worker portable light mode without allocating or retrying the full dataset."
+                        } else if exit_status_is_native_execution_failure(&status) {
+                            "Windows reported a native execution failure. Recovery will bypass the accelerated full-dataset path and use one-worker portable light mode."
+                        } else {
+                            "The one-worker optimized recovery also exited. Recovery is escalating to one-worker portable light mode without a full-dataset retry."
+                        },
+                        true,
+                    );
+                }
+                #[cfg(windows)]
+                RecoveryEscalation::Terminal => {
+                    self.automatic_recovery_enabled = false;
+                    self.push_log(
+                        "Windows reports that a required runtime DLL is missing; automatic retries are stopped because the executable environment must be repaired.",
+                        true,
+                    );
+                }
+            }
+            let failure = self.last_error.clone();
+            self.schedule_automatic_restart(&failure);
         }
     }
 
@@ -1646,6 +2022,14 @@ impl MinerApp {
             self.output_disconnected_at = None;
         }
 
+        let restart_due = self
+            .automatic_restart_at
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if restart_due && !self.has_live_engine_state() {
+            self.automatic_restart_at = None;
+            self.start_engine(true);
+        }
+
         if self.is_running() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
@@ -1664,6 +2048,12 @@ impl MinerApp {
                 self.node_link_live = false;
                 self.enter_connection_phase(Phase::Connecting);
                 self.push_log("Mining engine online.", false);
+                if value.get("randomx_backend").and_then(Value::as_str) == Some("light-recovery") {
+                    self.push_log(
+                        "RandomX portable light-memory recovery backend confirmed by the engine.",
+                        false,
+                    );
+                }
             }
             Some("connecting") => {
                 self.node_link_live = false;
@@ -1685,10 +2075,17 @@ impl MinerApp {
                 if let Some(worker) = value.get("worker").and_then(Value::as_u64) {
                     self.mark_worker_unready(worker);
                     self.push_log(
-                        format!(
-                            "Worker {} is preparing RandomX (shared {RANDOMX_DATASET_GIB:.1} GiB dataset; ~{RANDOMX_WORKER_MIB:.0} MiB worker overhead)…",
-                            worker + 1,
-                        ),
+                        if self.light_randomx_recovery {
+                            format!(
+                                "Worker {} is preparing the portable RandomX light cache; full-dataset allocation and retry are disabled…",
+                                worker + 1,
+                            )
+                        } else {
+                            format!(
+                                "Worker {} is preparing RandomX (shared {RANDOMX_DATASET_GIB:.1} GiB dataset; ~{RANDOMX_WORKER_MIB:.0} MiB worker overhead)…",
+                                worker + 1,
+                            )
+                        },
                         false,
                     );
                 }
@@ -1704,7 +2101,7 @@ impl MinerApp {
                 if let Some(worker) = value
                     .get("worker")
                     .and_then(Value::as_u64)
-                    .filter(|worker| *worker < self.settings.workers)
+                    .filter(|worker| *worker < self.effective_engine_workers())
                 {
                     let message = value
                         .get("message")
@@ -1909,6 +2306,24 @@ impl MinerApp {
                 while self.meter_history.len() > MAX_METER_SAMPLES {
                     self.meter_history.pop_front();
                 }
+                let proven_stable = self.hashrate > 0.0
+                    && self.node_link_live
+                    && self.worker_errors.is_empty()
+                    && self.ready_workers == self.effective_engine_workers();
+                if proven_stable {
+                    let stable_since = self.stable_hashing_since.get_or_insert(now);
+                    if self.automatic_restart_attempts > 0
+                        && stable_since.elapsed() >= ENGINE_STABILITY_RESET
+                    {
+                        self.automatic_restart_attempts = 0;
+                        self.push_log(
+                            "Mining engine sustained five minutes of confirmed hashing; automatic recovery budget reset.",
+                            false,
+                        );
+                    }
+                } else {
+                    self.stable_hashing_since = None;
+                }
             }
             Some("share") => {
                 self.submitted = value
@@ -2029,6 +2444,7 @@ impl MinerApp {
              engine_exit: {exit_detail}\n\
              endpoint: {}\n\
              configured_workers: {}\n\
+             effective_workers: {}\n\
              phase: {}\n\
              \nRECENT ENGINE LOG (up to the last {} bounded lines)\n",
             env!("CARGO_PKG_VERSION"),
@@ -2036,6 +2452,7 @@ impl MinerApp {
             env::consts::ARCH,
             sanitize_endpoint(&self.settings.pool),
             self.settings.workers,
+            self.effective_engine_workers(),
             self.phase.label(),
             MAX_CRASH_REPORT_LOG_LINES,
         );
@@ -2168,7 +2585,7 @@ impl MinerApp {
             self.network_difficulty.as_deref().unwrap_or("unavailable"),
             self.total_hashes,
             self.ready_workers,
-            self.settings.workers,
+            self.effective_engine_workers(),
             system_memory,
             peers,
             mempool,
@@ -2604,7 +3021,7 @@ impl MinerApp {
                         "{} • {}/{} workers",
                         format_hashrate(self.hashrate),
                         self.ready_workers,
-                        self.settings.workers,
+                        self.effective_engine_workers(),
                     )
                 } else if connected {
                     "Preparing workers".into()
@@ -3039,6 +3456,9 @@ impl eframe::App for MinerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_memory_if_due();
         self.poll_process(ctx);
+        if !self.telemetry_is_fresh() {
+            self.stable_hashing_since = None;
+        }
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 
@@ -3611,6 +4031,19 @@ fn activity_legend_item(ui: &mut egui::Ui, color: Color32, label: &str, meaning:
         });
 }
 
+#[cfg(target_os = "macos")]
+fn spawn_memory_probe() -> Result<MemoryProbeReceiver, String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("xus-memory-probe".into())
+        .spawn(move || {
+            let _ = sender.send(crate::query_memory_counters());
+        })
+        .map_err(|error| format!("cannot start the macOS memory probe: {error}"))?;
+    Ok(receiver)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn capture_memory_snapshot(system: &mut System) -> Option<MemorySnapshot> {
     system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
     memory_snapshot_from_readings(system.available_memory(), system.total_memory())
@@ -3935,10 +4368,22 @@ mod tests {
         app.start();
         assert!(app.child.is_none());
         assert!(app.quarantined_child.is_some());
+        app.automatic_restart_at = Some(Instant::now());
+        app.start_engine(true);
+        assert!(
+            app.child.is_none(),
+            "automatic recovery must not launch beside an unobserved child"
+        );
+        assert!(app.quarantined_child.is_some());
 
         let mut child = app.quarantined_child.take().unwrap();
         let _ = child.kill();
         let _ = child.wait();
+        assert!(
+            app.automatic_restart_at.is_some(),
+            "the recovery request may remain queued once cleanup is proven"
+        );
+        app.stop();
         assert!(!app.is_running());
     }
 
@@ -4123,6 +4568,70 @@ mod tests {
             Some("heap corruption")
         );
         assert_eq!(windows_ntstatus_description(7), None);
+
+        use std::os::windows::process::ExitStatusExt;
+        assert!(exit_status_is_native_execution_failure(
+            &ExitStatus::from_raw(0xC000_0005)
+        ));
+        assert!(exit_status_is_native_execution_failure(
+            &ExitStatus::from_raw(0xC000_001D)
+        ));
+        assert!(exit_status_requires_light_randomx(&ExitStatus::from_raw(
+            0xC000_0017
+        )));
+        for status in [0xC000_009A, 0xC000_012C, 0xC000_012D] {
+            assert!(exit_status_requires_light_randomx(&ExitStatus::from_raw(
+                status
+            )));
+        }
+        let unknown = ExitStatus::from_raw(7);
+        assert_eq!(
+            recovery_escalation(&unknown, false, 0),
+            RecoveryEscalation::Keep
+        );
+        assert_eq!(
+            recovery_escalation(&unknown, false, 1),
+            RecoveryEscalation::Light
+        );
+        assert_eq!(
+            recovery_escalation(&ExitStatus::from_raw(0xC000_0005), false, 0),
+            RecoveryEscalation::Light
+        );
+        assert_eq!(
+            recovery_escalation(&unknown, true, 1),
+            RecoveryEscalation::Keep
+        );
+        assert_eq!(
+            recovery_escalation(&ExitStatus::from_raw(0xC000_0135), false, 0,),
+            RecoveryEscalation::Terminal
+        );
+        assert_eq!(
+            recovery_escalation(&ExitStatus::from_raw(0xC000_0135), true, 4,),
+            RecoveryEscalation::Terminal
+        );
+
+        let mut app = MinerApp::default();
+        app.settings.workers = 2;
+        app.single_worker_recovery = true;
+        assert_eq!(app.effective_engine_workers(), 1);
+        let args = app
+            .headless_command(Path::new("xus-miner-test"))
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let worker_flag = args.iter().position(|arg| arg == "--workers").unwrap();
+        assert_eq!(args.get(worker_flag + 1).map(String::as_str), Some("1"));
+        assert!(!args.iter().any(|arg| arg == "--randomx-light"));
+        app.light_randomx_recovery = true;
+        let light_args = app
+            .headless_command(Path::new("xus-miner-test"))
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(light_args.iter().any(|arg| arg == "--randomx-light"));
+        app.apply_telemetry(&json!({"event": "worker_ready", "worker": 0}));
+        app.apply_telemetry(&json!({"event": "worker_ready", "worker": 1}));
+        assert_eq!(app.ready_workers, 1);
     }
 
     #[test]
@@ -4383,6 +4892,16 @@ mod tests {
             .unwrap()
             .contains("Start blocked"));
 
+        let light_exact = randomx_memory_bytes_for(3, true) + reserve;
+        app.memory_snapshot = Some(MemorySnapshot {
+            available: light_exact,
+            total,
+        });
+        app.light_randomx_recovery = true;
+        assert_eq!(app.memory_preflight_error(), None);
+        app.light_randomx_recovery = false;
+        assert!(app.memory_preflight_error().is_some());
+
         let no_capacity = MemorySnapshot {
             available: reserve,
             total,
@@ -4435,15 +4954,117 @@ mod tests {
             .any(|arg| arg == "--confirm-randomx-memory"));
 
         app.memory_acknowledged = true;
-        let args = args(&app);
+        let command_args = args(&app);
         assert_eq!(
-            args.iter()
+            command_args
+                .iter()
                 .filter(|arg| *arg == "--confirm-randomx-memory")
                 .count(),
             1
         );
-        assert!(args.iter().any(|arg| arg == "--password-stdin"));
-        assert!(!args.iter().any(|arg| arg == &app.settings.password));
+        assert!(command_args.iter().any(|arg| arg == "--password-stdin"));
+        assert!(command_args
+            .iter()
+            .any(|arg| arg == "--parent-pipe-watchdog"));
+        assert!(!command_args.iter().any(|arg| arg == &app.settings.password));
+
+        assert!(!command_args.iter().any(|arg| arg == "--randomx-light"));
+        app.light_randomx_recovery = true;
+        let recovery_args = args(&app);
+        assert_eq!(
+            recovery_args
+                .iter()
+                .filter(|arg| *arg == "--randomx-light")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn automatic_engine_recovery_is_bounded_and_cancelable() {
+        assert_eq!(automatic_restart_delay(1), Duration::from_secs(2));
+        assert_eq!(automatic_restart_delay(2), Duration::from_secs(4));
+        assert_eq!(automatic_restart_delay(6), Duration::from_secs(60));
+        assert_eq!(automatic_restart_delay(u32::MAX), Duration::from_secs(60));
+
+        let mut app = MinerApp::default();
+        app.automatic_recovery_enabled = true;
+        for attempt in 1..=MAX_AUTOMATIC_ENGINE_RESTARTS {
+            app.automatic_restart_at = None;
+            app.schedule_automatic_restart("synthetic native failure");
+            assert_eq!(app.automatic_restart_attempts, attempt);
+            assert!(app.automatic_restart_at.is_some());
+            assert!(app.is_running());
+        }
+        app.automatic_restart_at = None;
+        app.schedule_automatic_restart("persistent native failure");
+        assert!(app.automatic_restart_at.is_none());
+        assert_eq!(app.phase, Phase::Error);
+        assert!(app.last_error.contains("stopped after 5 attempts"));
+
+        app.automatic_restart_attempts = 1;
+        app.automatic_restart_at = Some(Instant::now() + Duration::from_secs(30));
+        app.stop();
+        assert!(app.automatic_restart_at.is_none());
+        assert_eq!(app.automatic_restart_attempts, 0);
+        assert_eq!(app.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn recovery_budget_resets_only_after_proven_stable_hashing() {
+        let mut app = MinerApp::default();
+        app.settings.workers = 1;
+        app.automatic_restart_attempts = 2;
+        app.started_at = Some(Instant::now() - Duration::from_secs(10 * 60));
+        app.node_link_live = true;
+        app.ready_worker_ids.insert(0);
+        app.ready_workers = 1;
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "hashrate": 0.0,
+            "total_hashes": 0,
+            "height": null,
+        }));
+        assert_eq!(
+            app.automatic_restart_attempts, 2,
+            "process uptime without hashing must not replenish recovery"
+        );
+
+        app.stable_hashing_since =
+            Some(Instant::now() - ENGINE_STABILITY_RESET - Duration::from_secs(1));
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "hashrate": 100.0,
+            "total_hashes": 100,
+            "height": 42,
+        }));
+        assert_eq!(app.automatic_restart_attempts, 0);
+    }
+
+    #[test]
+    fn stop_latches_recovery_off_while_an_exit_is_still_draining() {
+        let status = Command::new(env::current_exe().unwrap())
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        let mut app = MinerApp::default();
+        app.automatic_recovery_enabled = true;
+        app.automatic_restart_at = Some(Instant::now() + Duration::from_secs(30));
+        app.pending_exit = Some(status);
+
+        app.stop();
+
+        assert!(!app.automatic_recovery_enabled);
+        assert!(app.automatic_restart_at.is_none());
+        assert!(app.pending_exit.is_some());
+        assert_eq!(app.phase, Phase::Stopping);
+        app.schedule_automatic_restart("late crash drain");
+        assert!(
+            app.automatic_restart_at.is_none(),
+            "Stop must suppress recovery even when an exit finishes afterward"
+        );
     }
 
     #[test]

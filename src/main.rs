@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod diag;
 mod gui;
 mod pow;
 // RandomX exposes a C API. Keep the required unsafe ownership proof isolated
@@ -21,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(not(target_os = "macos"))]
 use sysinfo::{MemoryRefreshKind, System};
 use wire::{template_id_for_blob, validate_account_id, BlockHeaderWire};
 
@@ -36,6 +38,7 @@ const MAX_RPC_RESPONSE_BYTES: usize = MAX_RPC_HEADER_BYTES + MAX_RPC_BODY_BYTES;
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 const BYTES_PER_MIB: f64 = 1_048_576.0;
 pub(crate) const RANDOMX_DATASET_GIB: f64 = 2.3;
+pub(crate) const RANDOMX_LIGHT_CACHE_MIB: f64 = 256.0;
 pub(crate) const RANDOMX_WORKER_MIB: f64 = 32.0;
 const MIN_MEMORY_HEADROOM_GIB: f64 = 1.5;
 const MAX_MEMORY_HEADROOM_GIB: f64 = 4.0;
@@ -44,29 +47,237 @@ const WORK_BATCH: u64 = 256;
 const LOGIN_ID: u64 = 1;
 const KEEPALIVE_ID: u64 = 2;
 const FIRST_SUBMIT_ID: u64 = 1_000;
+#[cfg(target_os = "macos")]
+const MACOS_MEMORY_PRESSURE_PATH: &str = "/usr/bin/memory_pressure";
+#[cfg(target_os = "macos")]
+const MAX_MACOS_MEMORY_PRESSURE_BYTES: usize = 4 * 1024;
+#[cfg(target_os = "macos")]
+const MACOS_MEMORY_PRESSURE_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_memory_pressure(raw: &str) -> Result<(u64, u64), String> {
+    let mut total = None;
+    let mut free_percent = None;
+    for line in raw.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("The system has ") {
+            total = rest
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok());
+        } else if let Some(rest) = line.strip_prefix("System-wide memory free percentage:") {
+            free_percent = rest
+                .trim()
+                .strip_suffix('%')
+                .and_then(|value| value.trim().parse::<u64>().ok());
+        }
+    }
+
+    let total = total.filter(|value| *value > 0).ok_or_else(|| {
+        "memory_pressure output did not contain a positive physical-memory total".to_owned()
+    })?;
+    let free_percent = free_percent.filter(|value| *value <= 100).ok_or_else(|| {
+        "memory_pressure output did not contain a valid free percentage".to_owned()
+    })?;
+    let available = ((u128::from(total) * u128::from(free_percent)) / 100) as u64;
+    Ok((available, total))
+}
+
+#[cfg(target_os = "macos")]
+fn read_bounded_command_stream<R: Read>(
+    mut stream: R,
+    label: &'static str,
+) -> Result<Vec<u8>, String> {
+    let mut captured = Vec::with_capacity(MAX_MACOS_MEMORY_PRESSURE_BYTES);
+    let mut buffer = [0_u8; 1024];
+    let mut oversized = false;
+    loop {
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read memory_pressure {label}: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MAX_MACOS_MEMORY_PRESSURE_BYTES.saturating_sub(captured.len());
+        let retained = remaining.min(count);
+        captured.extend_from_slice(&buffer[..retained]);
+        oversized |= retained < count;
+    }
+    if oversized {
+        Err(format!(
+            "memory_pressure {label} exceeded {MAX_MACOS_MEMORY_PRESSURE_BYTES} bytes"
+        ))
+    } else {
+        Ok(captured)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn query_memory_counters() -> Result<(u64, u64), String> {
+    let started = Instant::now();
+    let result = query_memory_counters_impl();
+    match &result {
+        Ok((available, total)) => diag::debug(&format!(
+            "memory_pressure probe ok in {} ms: available={available} total={total}",
+            started.elapsed().as_millis(),
+        )),
+        Err(error) => diag::warn(&format!(
+            "memory_pressure probe failed after {} ms: {error}",
+            started.elapsed().as_millis(),
+        )),
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn query_memory_counters_impl() -> Result<(u64, u64), String> {
+    // libc 0.2.189 expanded vm_statistics64 for the macOS 27 SDK. Calling
+    // host_statistics64 with that newer count on macOS 26 makes the kernel
+    // report a potentially memory-corrupting ABI mismatch. Keep Apple memory
+    // telemetry entirely outside application FFI and invoke the fixed,
+    // absolute-path operating-system utility with an empty environment.
+    let mut child = process::Command::new(MACOS_MEMORY_PRESSURE_PATH)
+        .arg("-Q")
+        .env_clear()
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot run {MACOS_MEMORY_PRESSURE_PATH}: {error}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "memory_pressure stdout pipe was not created".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "memory_pressure stderr pipe was not created".to_owned())?;
+    let stdout_reader = thread::Builder::new()
+        .name("xus-memory-pressure-out".into())
+        .spawn(move || read_bounded_command_stream(stdout, "stdout"))
+        .map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            format!("cannot start memory_pressure stdout reader: {error}")
+        })?;
+    let stderr_reader = match thread::Builder::new()
+        .name("xus-memory-pressure-err".into())
+        .spawn(move || read_bounded_command_stream(stderr, "stderr"))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            return Err(format!(
+                "cannot start memory_pressure stderr reader: {error}"
+            ));
+        }
+    };
+
+    let deadline = Instant::now() + MACOS_MEMORY_PRESSURE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => {
+                return match child.kill().and_then(|()| child.wait()) {
+                    Ok(_) => {
+                        let _ = stdout_reader.join();
+                        let _ = stderr_reader.join();
+                        Err(format!(
+                            "memory_pressure exceeded its {} ms deadline",
+                            MACOS_MEMORY_PRESSURE_TIMEOUT.as_millis(),
+                        ))
+                    }
+                    Err(error) => {
+                        // Do not join readers whose pipe owner could still be
+                        // live. Dropping the handles detaches them and keeps a
+                        // failed OS cleanup from freezing the GUI indefinitely.
+                        drop(stdout_reader);
+                        drop(stderr_reader);
+                        Err(format!(
+                            "memory_pressure exceeded its {} ms deadline; cleanup failed: {error}",
+                            MACOS_MEMORY_PRESSURE_TIMEOUT.as_millis(),
+                        ))
+                    }
+                };
+            }
+            Err(error) => {
+                return match child.kill().and_then(|()| child.wait()) {
+                    Ok(_) => {
+                        let _ = stdout_reader.join();
+                        let _ = stderr_reader.join();
+                        Err(format!("cannot observe memory_pressure: {error}"))
+                    }
+                    Err(cleanup_error) => {
+                        drop(stdout_reader);
+                        drop(stderr_reader);
+                        Err(format!(
+                            "cannot observe memory_pressure: {error}; cleanup failed: {cleanup_error}"
+                        ))
+                    }
+                };
+            }
+        }
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "memory_pressure stdout reader panicked".to_owned())??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "memory_pressure stderr reader panicked".to_owned())??;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
+        return Err(format!(
+            "{MACOS_MEMORY_PRESSURE_PATH} returned {status}: {}",
+            detail.trim()
+        ));
+    }
+    let body = std::str::from_utf8(&stdout)
+        .map_err(|error| format!("memory_pressure returned invalid UTF-8: {error}"))?;
+    parse_macos_memory_pressure(body)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn query_memory_counters() -> Result<(u64, u64), String> {
+    let mut system = System::new();
+    system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    let available = system.available_memory();
+    let total = system.total_memory();
+    if total == 0 || available > total {
+        return Err(
+            "operating-system RAM scan returned unavailable or inconsistent readings; refusing to start headless RandomX workers".into(),
+        );
+    }
+    Ok((available, total))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HeadlessMemoryPreflight {
     available: Option<u64>,
     total: Option<u64>,
-    dataset: u64,
+    engine: u64,
     reserve: u64,
 }
 
 struct RandomxMemoryGate {
     workers: u64,
+    force_light: bool,
     unavailable_scan_confirmed: bool,
     approved: Option<HeadlessMemoryPreflight>,
-    system: System,
 }
 
 impl RandomxMemoryGate {
-    fn new(workers: u64, unavailable_scan_confirmed: bool) -> Self {
+    fn new(workers: u64, force_light: bool, unavailable_scan_confirmed: bool) -> Self {
         Self {
             workers,
+            force_light,
             unavailable_scan_confirmed,
             approved: None,
-            system: System::new(),
         }
     }
 
@@ -74,27 +285,48 @@ impl RandomxMemoryGate {
         if algo != PowAlgo::RandomX || self.approved.is_some() {
             return Ok(());
         }
-        // Match the GUI's sterile scan: RAM counters only. Do not enumerate
-        // processes, CPU, disks, networks, users, or swap.
-        self.system
-            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+        let (available, total) = match query_memory_counters() {
+            Ok(counters) => counters,
+            Err(error) => {
+                diag::warn(&format!(
+                    "memory preflight scan unavailable before the first RandomX job: {error}"
+                ));
+                (0, 0)
+            }
+        };
         let preflight = resolve_headless_memory(
             self.workers,
-            self.system.available_memory(),
-            self.system.total_memory(),
+            self.force_light,
+            available,
+            total,
             self.unavailable_scan_confirmed,
-        )?;
+        )
+        .inspect_err(|error| {
+            diag::error(&format!(
+                "memory preflight refused RandomX start for {} worker(s): {error}",
+                self.workers
+            ));
+        })?;
+        diag::info(&format!(
+            "memory preflight approved: workers={} force-light={} available={:?} total={:?} engine-bytes={} reserve-bytes={}",
+            self.workers,
+            self.force_light,
+            preflight.available,
+            preflight.total,
+            preflight.engine,
+            preflight.reserve,
+        ));
         match (preflight.available, preflight.total) {
             (Some(available), Some(total)) => eprintln!(
                 "memory preflight PASS: {:.1} GiB available / {:.1} GiB total; {:.1} GiB RandomX estimate + {:.1} GiB reserved",
                 available as f64 / BYTES_PER_GIB,
                 total as f64 / BYTES_PER_GIB,
-                preflight.dataset as f64 / BYTES_PER_GIB,
+                preflight.engine as f64 / BYTES_PER_GIB,
                 preflight.reserve as f64 / BYTES_PER_GIB,
             ),
             _ => eprintln!(
                 "memory preflight manually confirmed: {:.1} GiB RandomX estimate + at least {:.1} GiB reserved",
-                preflight.dataset as f64 / BYTES_PER_GIB,
+                preflight.engine as f64 / BYTES_PER_GIB,
                 preflight.reserve as f64 / BYTES_PER_GIB,
             ),
         }
@@ -111,6 +343,7 @@ struct Config {
     workers: u64,
     reconnect_secs: u64,
     report_secs: u64,
+    randomx_light: bool,
 }
 
 impl Default for Config {
@@ -124,6 +357,7 @@ impl Default for Config {
             workers: 1,
             reconnect_secs: 5,
             report_secs: 10,
+            randomx_light: false,
         }
     }
 }
@@ -139,6 +373,7 @@ fn usage() -> &'static str {
        --password <value>       Stratum password [x]\n\
        --password-stdin         Read the Stratum password from standard input\n\
        --workers <n>            Mining threads [1; one ~2.3 GiB dataset is shared]\n\
+       --randomx-light          Portable low-memory RandomX recovery (slower)\n\
        --confirm-randomx-memory Confirm required RAM only if the OS scan is unavailable\n\
        --reconnect-secs <n>     Delay after disconnect [5]\n\
        --report-secs <n>        Hashrate reporting interval [10]\n\
@@ -179,6 +414,7 @@ where
             "--workers" => {
                 cfg.workers = parse_u64("--workers", &value("--workers", &mut args), 1, 64)
             }
+            "--randomx-light" => cfg.randomx_light = true,
             "--reconnect-secs" => {
                 cfg.reconnect_secs = parse_u64(
                     "--reconnect-secs",
@@ -545,7 +781,19 @@ impl State {
 
     fn emit(&self, event: Value) {
         if self.json_events {
-            println!("{event}");
+            let mut stdout = io::stdout().lock();
+            if writeln!(stdout, "{event}")
+                .and_then(|()| stdout.flush())
+                .is_err()
+            {
+                // JSON stdout is the GUI supervision pipe when launched by the
+                // desktop app. A broken pipe means the parent/reader vanished;
+                // exit the isolated engine so it cannot become an orphan.
+                diag::error(
+                    "telemetry stdout pipe is broken (GUI parent or reader is gone); exiting the isolated engine with status 70",
+                );
+                process::exit(70);
+            }
         }
     }
 
@@ -1209,6 +1457,9 @@ fn worker_loop(state: Arc<State>, worker: u64) {
                     });
                     if should_report {
                         eprintln!("worker {worker}: proof-of-work engine unavailable: {error}");
+                        diag::warn(&format!(
+                            "worker {worker}: proof-of-work engine unavailable: {error}"
+                        ));
                         state.emit(json!({
                             "event": "worker_error",
                             "worker": worker,
@@ -1234,12 +1485,20 @@ fn worker_loop(state: Arc<State>, worker: u64) {
                     || *mode != seal.mode
             }) {
                 ready_state = Some((current.algo, current.pow_key.clone(), seal.mode));
+                diag::info(&format!(
+                    "worker {worker}: sealing engine ready: algo={:?} mode={}",
+                    current.algo,
+                    seal.mode.telemetry_name(),
+                ));
                 match seal.mode {
                     MiningMode::RandomXFastShared => eprintln!(
                         "worker {worker}: RandomX VM ready on the shared full dataset; hashing"
                     ),
                     MiningMode::RandomXLightFallback => eprintln!(
                         "worker {worker}: RandomX VM ready in light-memory fallback; hashing while fast mode retries"
+                    ),
+                    MiningMode::RandomXLightRecovery => eprintln!(
+                        "worker {worker}: RandomX VM ready in locked portable light-memory recovery; hashing without a full-dataset retry"
                     ),
                     MiningMode::Sha256d => {
                         eprintln!("worker {worker}: SHA-256d engine ready; hashing")
@@ -1279,6 +1538,9 @@ fn worker_loop(state: Arc<State>, worker: u64) {
                         Err(error) => {
                             state.rejected.fetch_add(1, Ordering::Relaxed);
                             eprintln!("block submission rejected: {error}");
+                            diag::warn(&format!(
+                                "worker {worker}: block submission rejected: {error}"
+                            ));
                         }
                     }
                     nonce = nonce.wrapping_add(1);
@@ -1346,6 +1608,9 @@ fn worker_supervisor(state: Arc<State>, worker: u64) {
         eprintln!(
             "worker {worker}: recovered from an internal panic ({message}); restarting in {retry_secs} seconds"
         );
+        diag::error(&format!(
+            "worker {worker}: recovered from an internal panic ({message}); supervised restart {restarts} in {retry_secs} seconds"
+        ));
         state.emit(json!({
             "event": "worker_error",
             "worker": worker,
@@ -1371,13 +1636,6 @@ fn reporter_loop(state: Arc<State>, every: Duration) {
             .expect("job lock")
             .as_ref()
             .map_or_else(|| "-".into(), |job| job.height.to_string());
-        eprintln!(
-            "height {height} | {rate:.2} H/s | total {} | shares {}/{}/{} submitted/accepted/rejected",
-            state.total_hashes.load(Ordering::Relaxed),
-            state.submitted.load(Ordering::Relaxed),
-            state.accepted.load(Ordering::Relaxed),
-            state.rejected.load(Ordering::Relaxed),
-        );
         state.emit(json!({
             "event": "metrics",
             "hashrate": rate,
@@ -1399,6 +1657,13 @@ fn reporter_loop(state: Arc<State>, every: Duration) {
             "peer_count": state.peers_known.load(Ordering::Acquire)
                 .then(|| state.peer_count.load(Ordering::Relaxed)),
         }));
+        eprintln!(
+            "height {height} | {rate:.2} H/s | total {} | shares {}/{}/{} submitted/accepted/rejected",
+            state.total_hashes.load(Ordering::Relaxed),
+            state.submitted.load(Ordering::Relaxed),
+            state.accepted.load(Ordering::Relaxed),
+            state.rejected.load(Ordering::Relaxed),
+        );
     }
 }
 
@@ -1411,8 +1676,16 @@ fn mib_to_bytes(mib: f64) -> u64 {
 }
 
 pub(crate) fn randomx_memory_bytes(workers: u64) -> u64 {
-    gib_to_bytes(RANDOMX_DATASET_GIB)
-        .saturating_add(mib_to_bytes(RANDOMX_WORKER_MIB).saturating_mul(workers))
+    randomx_memory_bytes_for(workers, false)
+}
+
+pub(crate) fn randomx_memory_bytes_for(workers: u64, force_light: bool) -> u64 {
+    let shared = if force_light {
+        mib_to_bytes(RANDOMX_LIGHT_CACHE_MIB)
+    } else {
+        gib_to_bytes(RANDOMX_DATASET_GIB)
+    };
+    shared.saturating_add(mib_to_bytes(RANDOMX_WORKER_MIB).saturating_mul(workers))
 }
 
 fn memory_headroom_bytes(total: u64) -> u64 {
@@ -1424,6 +1697,7 @@ fn memory_headroom_bytes(total: u64) -> u64 {
 
 fn validate_headless_memory(
     workers: u64,
+    force_light: bool,
     available: u64,
     total: u64,
 ) -> Result<HeadlessMemoryPreflight, String> {
@@ -1433,14 +1707,19 @@ fn validate_headless_memory(
                 .into(),
         );
     }
-    let dataset = randomx_memory_bytes(workers);
+    let engine = randomx_memory_bytes_for(workers, force_light);
     let reserve = memory_headroom_bytes(total);
-    let required = dataset.saturating_add(reserve);
+    let required = engine.saturating_add(reserve);
     if available < required {
+        let profile = if force_light {
+            "portable light-memory RandomX"
+        } else {
+            "shared full-dataset RandomX"
+        };
         return Err(format!(
-            "the shared RandomX engine for {workers} worker{} may need ≈{:.1} GiB plus {:.1} GiB of system headroom, but only {:.1} GiB is available; refusing to start",
+            "the {profile} engine for {workers} worker{} may need ≈{:.1} GiB plus {:.1} GiB of system headroom, but only {:.1} GiB is available; refusing to start",
             if workers == 1 { "" } else { "s" },
-            dataset as f64 / BYTES_PER_GIB,
+            engine as f64 / BYTES_PER_GIB,
             reserve as f64 / BYTES_PER_GIB,
             available as f64 / BYTES_PER_GIB,
         ));
@@ -1448,19 +1727,20 @@ fn validate_headless_memory(
     Ok(HeadlessMemoryPreflight {
         available: Some(available),
         total: Some(total),
-        dataset,
+        engine,
         reserve,
     })
 }
 
 fn resolve_headless_memory(
     workers: u64,
+    force_light: bool,
     available: u64,
     total: u64,
     unavailable_scan_confirmed: bool,
 ) -> Result<HeadlessMemoryPreflight, String> {
     if total > 0 && available <= total {
-        return validate_headless_memory(workers, available, total);
+        return validate_headless_memory(workers, force_light, available, total);
     }
     if !unavailable_scan_confirmed {
         return Err(
@@ -1471,7 +1751,7 @@ fn resolve_headless_memory(
     Ok(HeadlessMemoryPreflight {
         available: None,
         total: None,
-        dataset: randomx_memory_bytes(workers),
+        engine: randomx_memory_bytes_for(workers, force_light),
         reserve: gib_to_bytes(MIN_MEMORY_HEADROOM_GIB),
     })
 }
@@ -1479,22 +1759,48 @@ fn resolve_headless_memory(
 fn run_headless(
     cfg: Config,
     json_events: bool,
+    parent_pipe_watchdog: bool,
     unavailable_scan_confirmed: bool,
 ) -> Result<(), String> {
+    if parent_pipe_watchdog && !json_events {
+        return Err("parent-pipe watchdog requires JSON event output".into());
+    }
+    randomx_native::configure_runtime_mode(cfg.randomx_light)?;
+    let randomx_backend = if cfg.randomx_light {
+        "light-recovery"
+    } else {
+        "optimized"
+    };
     eprintln!(
-        "xus-miner {VERSION} | pool {} | user {} | workers {}",
-        cfg.pool, cfg.user, cfg.workers
+        "xus-miner {VERSION} | pool {} | user {} | workers {} | RandomX {randomx_backend}",
+        cfg.pool, cfg.user, cfg.workers,
     );
+    diag::info(&format!(
+        "engine starting: workers={} backend={randomx_backend} report-secs={} reconnect-secs={} parent-pipe-watchdog={parent_pipe_watchdog}",
+        cfg.workers, cfg.report_secs, cfg.reconnect_secs,
+    ));
 
     let state = Arc::new(State::new(json_events));
-    let mut memory_gate = RandomxMemoryGate::new(cfg.workers, unavailable_scan_confirmed);
+    let mut memory_gate =
+        RandomxMemoryGate::new(cfg.workers, cfg.randomx_light, unavailable_scan_confirmed);
     state.emit(json!({
         "event": "startup",
         "version": VERSION,
         "pool": cfg.pool,
         "user": cfg.user,
         "workers": cfg.workers,
+        "randomx_backend": randomx_backend,
     }));
+    if parent_pipe_watchdog {
+        let watchdog_state = Arc::clone(&state);
+        thread::Builder::new()
+            .name("xus-parent-watchdog".into())
+            .spawn(move || loop {
+                thread::sleep(Duration::from_secs(2));
+                watchdog_state.emit(json!({"event": "parent_watchdog"}));
+            })
+            .map_err(|error| format!("cannot start parent-pipe watchdog: {error}"))?;
+    }
     for worker in 0..cfg.workers {
         let worker_state = Arc::clone(&state);
         if let Err(error) = thread::Builder::new()
@@ -1503,6 +1809,7 @@ fn run_headless(
         {
             let message = format!("cannot start mining worker {worker}: {error}");
             eprintln!("{message}");
+            diag::error(&message);
             state.emit(json!({"event":"engine_fatal", "message":message}));
             return Err(message);
         }
@@ -1551,20 +1858,29 @@ fn run_headless(
 fn main() {
     let mut raw: Vec<String> = env::args().skip(1).collect();
     if raw.is_empty() || raw.iter().any(|arg| arg == "--gui") {
+        diag::init("gui");
         if let Err(error) = gui::run() {
             eprintln!("{error}");
+            diag::error(&format!("GUI terminated with an error: {error}"));
             process::exit(1);
         }
+        diag::info("GUI closed normally");
         return;
     }
+    diag::init("engine");
 
     let json_events = raw.iter().any(|arg| arg == "--json-events");
     let password_stdin = raw.iter().any(|arg| arg == "--password-stdin");
+    let parent_pipe_watchdog = raw.iter().any(|arg| arg == "--parent-pipe-watchdog");
     let unavailable_scan_confirmed = raw.iter().any(|arg| arg == "--confirm-randomx-memory");
     raw.retain(|arg| {
         !matches!(
             arg.as_str(),
-            "--headless" | "--json-events" | "--password-stdin" | "--confirm-randomx-memory"
+            "--headless"
+                | "--json-events"
+                | "--password-stdin"
+                | "--parent-pipe-watchdog"
+                | "--confirm-randomx-memory"
         )
     });
     let mut cfg = parse_args_from(raw);
@@ -1583,8 +1899,14 @@ fn main() {
         }
         cfg.password = password;
     }
-    if let Err(error) = run_headless(cfg, json_events, unavailable_scan_confirmed) {
+    if let Err(error) = run_headless(
+        cfg,
+        json_events,
+        parent_pipe_watchdog,
+        unavailable_scan_confirmed,
+    ) {
         eprintln!("fatal mining engine error: {error}");
+        diag::error(&format!("fatal mining engine error: {error}"));
         process::exit(1);
     }
 }
@@ -1592,6 +1914,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_randomx_recovery_is_explicit_and_off_by_default() {
+        assert!(!Config::default().randomx_light);
+
+        let light = parse_args_from(["--randomx-light".to_owned()]);
+        assert!(light.randomx_light);
+    }
 
     fn valid_job() -> Value {
         json!({
@@ -1674,22 +2004,74 @@ mod tests {
             mib_to_bytes(RANDOMX_WORKER_MIB * 2.0),
             "workers must share one full dataset instead of allocating one each"
         );
-        let preflight = resolve_headless_memory(3, required, total, false).unwrap();
-        assert_eq!(preflight.dataset, randomx_memory_bytes(3));
+        let preflight = resolve_headless_memory(3, false, required, total, false).unwrap();
+        assert_eq!(preflight.engine, randomx_memory_bytes(3));
         assert_eq!(preflight.reserve, reserve);
         assert_eq!(preflight.available, Some(required));
         assert_eq!(preflight.total, Some(total));
-        assert!(resolve_headless_memory(3, required - 1, total, true)
+        assert!(resolve_headless_memory(3, false, required - 1, total, true)
             .unwrap_err()
             .contains("refusing to start"));
-        assert!(resolve_headless_memory(1, 1, 0, false)
+        assert!(resolve_headless_memory(1, false, 1, 0, false)
             .unwrap_err()
             .contains("explicit memory confirmation"));
-        let confirmed = resolve_headless_memory(1, 1, 0, true).unwrap();
+        let confirmed = resolve_headless_memory(1, false, 1, 0, true).unwrap();
         assert_eq!(confirmed.available, None);
         assert_eq!(confirmed.total, None);
         assert_eq!(confirmed.reserve, gib_to_bytes(1.5));
-        assert!(resolve_headless_memory(1, total + 1, total, false).is_err());
+        assert!(resolve_headless_memory(1, false, total + 1, total, false).is_err());
+
+        let light_required = randomx_memory_bytes_for(1, true) + reserve;
+        assert!(
+            resolve_headless_memory(1, false, light_required, total, false).is_err(),
+            "full-dataset mode must remain blocked at light-only capacity"
+        );
+        let light = resolve_headless_memory(1, true, light_required, total, false).unwrap();
+        assert_eq!(light.engine, randomx_memory_bytes_for(1, true));
+        assert!(light.engine < randomx_memory_bytes(1));
+    }
+
+    #[test]
+    fn macos_memory_pressure_parser_is_bounded_and_strict() {
+        let output = "\
+The system has 25769803776 (1572864 pages with a page size of 16384).
+System-wide memory free percentage: 62%
+";
+        assert_eq!(
+            parse_macos_memory_pressure(output).unwrap(),
+            (15_977_278_341, 25_769_803_776)
+        );
+        assert!(parse_macos_memory_pressure(
+            "The system has 25769803776 pages\nSystem-wide memory free percentage: 101%\n"
+        )
+        .unwrap_err()
+        .contains("free percentage"));
+        assert!(parse_macos_memory_pressure(
+            "The system has 0 pages\nSystem-wide memory free percentage: 50%\n"
+        )
+        .unwrap_err()
+        .contains("physical-memory total"));
+        assert!(parse_macos_memory_pressure("unrecognized output")
+            .unwrap_err()
+            .contains("physical-memory total"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_memory_probe_repeats_without_entering_application_ffi() {
+        for _ in 0..32 {
+            let (available, total) = query_memory_counters().unwrap();
+            assert!(total >= gib_to_bytes(8.0));
+            assert!(available <= total);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_memory_probe_reader_never_retains_unbounded_output() {
+        let oversized = vec![b'x'; MAX_MACOS_MEMORY_PRESSURE_BYTES + 1];
+        let error = read_bounded_command_stream(io::Cursor::new(oversized), "test").unwrap_err();
+        assert!(error.contains("exceeded 4096 bytes"));
     }
 
     #[test]

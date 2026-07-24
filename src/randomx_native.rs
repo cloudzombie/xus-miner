@@ -10,10 +10,17 @@
 use randomx_rs::RandomXFlag;
 use std::ffi::{c_ulong, c_void};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) const FLAG_DEFAULT: u32 = 0;
 pub(crate) const FLAG_FULL_MEM: u32 = 1 << 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeMode {
+    force_light: bool,
+}
+
+static RUNTIME_MODE: OnceLock<RuntimeMode> = OnceLock::new();
 
 #[repr(C)]
 struct RandomxCacheOpaque {
@@ -59,8 +66,27 @@ unsafe extern "C" {
     );
 }
 
+pub(crate) fn configure_runtime_mode(force_light: bool) -> Result<(), String> {
+    let requested = RuntimeMode { force_light };
+    match RUNTIME_MODE.get() {
+        Some(existing) if *existing == requested => Ok(()),
+        Some(_) => Err("RandomX execution mode was already configured for this process".into()),
+        None => RUNTIME_MODE
+            .set(requested)
+            .map_err(|_| "RandomX execution mode could not be configured".to_owned()),
+    }
+}
+
 pub(crate) fn recommended_flags() -> u32 {
-    RandomXFlag::get_recommended_flags().bits()
+    if force_light_mining() {
+        FLAG_DEFAULT
+    } else {
+        RandomXFlag::get_recommended_flags().bits()
+    }
+}
+
+pub(crate) fn force_light_mining() -> bool {
+    RUNTIME_MODE.get().is_some_and(|mode| mode.force_light)
 }
 
 pub(crate) struct Cache {

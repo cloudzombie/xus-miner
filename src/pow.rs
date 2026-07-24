@@ -4,7 +4,10 @@
 //! `sha2`. It has no chain repository dependency and no capability to modify
 //! node consensus code.
 
-use crate::randomx_native::{recommended_flags, Cache, Dataset, Vm, FLAG_DEFAULT, FLAG_FULL_MEM};
+use crate::diag;
+use crate::randomx_native::{
+    force_light_mining, recommended_flags, Cache, Dataset, Vm, FLAG_DEFAULT, FLAG_FULL_MEM,
+};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -23,6 +26,7 @@ pub(crate) enum MiningMode {
     Sha256d,
     RandomXFastShared,
     RandomXLightFallback,
+    RandomXLightRecovery,
 }
 
 impl MiningMode {
@@ -31,6 +35,7 @@ impl MiningMode {
             Self::Sha256d => "sha256d",
             Self::RandomXFastShared => "fast-shared",
             Self::RandomXLightFallback => "light-fallback",
+            Self::RandomXLightRecovery => "light-recovery",
         }
     }
 }
@@ -46,6 +51,7 @@ enum RandomXMode {
     Light,
     FastShared,
     LightFallback,
+    LightRecovery,
 }
 
 struct RandomXEngine {
@@ -106,13 +112,26 @@ pub(crate) fn sha256d(data: &[u8]) -> [u8; 32] {
 
 fn build_fast_dataset(key: &[u8]) -> Result<Arc<Dataset>, String> {
     let optimized = recommended_flags();
-    let dataset = Dataset::new(optimized, key).or_else(|optimized_error| {
-        Dataset::new(FLAG_DEFAULT, key).map_err(|portable_error| {
-            format!(
-                "optimized dataset initialization failed ({optimized_error}); portable dataset initialization also failed ({portable_error})"
-            )
-        })
+    diag::info(&format!(
+        "RandomX full-dataset initialization starting: cache-flags={} (synchronous; the dataset publishes only after this returns)",
+        diag::describe_randomx_flags(optimized),
+    ));
+    let started = Instant::now();
+    // A full dataset initialized with FLAG_DEFAULT can take many minutes
+    // because RandomX loses its cache compiler. If optimized initialization is
+    // unavailable, fail promptly so the caller can enter bounded light mode
+    // instead of appearing hung at 0 H/s.
+    let dataset = Dataset::new(optimized, key).map_err(|error| {
+        diag::error(&format!(
+            "RandomX full-dataset initialization failed after {} ms: {error}",
+            started.elapsed().as_millis(),
+        ));
+        format!("optimized dataset initialization failed ({error})")
     })?;
+    diag::info(&format!(
+        "RandomX full-dataset initialization complete in {} ms",
+        started.elapsed().as_millis(),
+    ));
     Ok(Arc::new(dataset))
 }
 
@@ -161,6 +180,9 @@ fn shared_fast_dataset(key: &[u8]) -> Result<Arc<Dataset>, String> {
                 let reason =
                     "RandomX seed changed; releasing the previous shared dataset before rebuilding"
                         .to_owned();
+                diag::info(
+                    "RandomX seed changed; draining every worker off the previous shared dataset before rebuilding",
+                );
                 *state = Some(SharedDatasetState {
                     key: key.to_vec(),
                     outcome: SharedDatasetOutcome::Releasing {
@@ -295,9 +317,18 @@ fn release_fast_dataset_if_unused(key: &[u8], failure: &str) {
 
 fn build_light_cache(key: &[u8]) -> Result<(u32, Arc<Cache>), String> {
     let optimized = recommended_flags();
+    diag::info(&format!(
+        "RandomX light cache initialization: flags={}",
+        diag::describe_randomx_flags(optimized),
+    ));
     match Cache::new(optimized, key) {
         Ok(cache) => Ok((optimized, Arc::new(cache))),
         Err(optimized_error) => Cache::new(FLAG_DEFAULT, key)
+            .inspect(|_| {
+                diag::warn(&format!(
+                    "optimized RandomX light cache failed ({optimized_error}); using the portable DEFAULT cache"
+                ));
+            })
             .map(|cache| (FLAG_DEFAULT, Arc::new(cache)))
             .map_err(|portable_error| {
                 format!(
@@ -348,6 +379,9 @@ fn build_light_vm(key: &[u8], mode: RandomXMode) -> Result<RandomXEngine, String
 }
 
 fn build_mining_vm(key: &[u8]) -> Result<RandomXEngine, String> {
+    if force_light_mining() {
+        return build_light_vm(key, RandomXMode::LightRecovery);
+    }
     let fast = shared_fast_dataset(key).and_then(|dataset| {
         let optimized = recommended_flags() | FLAG_FULL_MEM;
         Vm::fast(optimized, Arc::clone(&dataset)).or_else(|optimized_error| {
@@ -365,6 +399,9 @@ fn build_mining_vm(key: &[u8]) -> Result<RandomXEngine, String> {
             retry_fast_at: None,
         }),
         Err(fast_error) => {
+            diag::warn(&format!(
+                "fast shared-dataset RandomX unavailable on this worker: {fast_error}"
+            ));
             // If no worker successfully attached a VM, release the manager's
             // full dataset before allocating the light cache. When another VM
             // still owns it, retaining it is required for that worker's safety.
@@ -469,6 +506,7 @@ where
                 mode: match mode {
                     RandomXMode::FastShared => MiningMode::RandomXFastShared,
                     RandomXMode::LightFallback => MiningMode::RandomXLightFallback,
+                    RandomXMode::LightRecovery => MiningMode::RandomXLightRecovery,
                     RandomXMode::Light => {
                         return Err(
                             "internal RandomX mode error: verifier VM entered mining path".into(),
@@ -516,5 +554,46 @@ mod tests {
             hex::encode(pow_hash(PowAlgo::RandomX, b"test key 000", b"This is a test").unwrap()),
             "639183aae1bf4c9a35884cb46b09cad9175f04efd7684e7262a0ac1c2f0b4e3f"
         );
+    }
+
+    /// Multi-worker lifecycle regression: several threads share one RandomX
+    /// key manager, hash concurrently, switch seeds together, and return to a
+    /// previous seed. Every digest must stay correct and no thread may crash,
+    /// proving the shared native allocation outlives every VM that uses it
+    /// while workers churn. The cheap light engine keeps this in the ordinary
+    /// suite; the full-dataset manager reuses the same Arc ownership pattern.
+    #[test]
+    fn concurrent_workers_share_and_churn_randomx_seeds_safely() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const WORKERS: usize = 4;
+        let seeds: [&[u8]; 3] = [b"churn seed A", b"churn seed B", b"churn seed A"];
+        let mut expected = Vec::new();
+        for seed in seeds {
+            expected.push(pow_hash(PowAlgo::RandomX, seed, b"stress input").unwrap());
+        }
+
+        let barrier = Barrier::new(WORKERS);
+        thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let barrier = &barrier;
+                let expected = &expected;
+                scope.spawn(move || {
+                    for (phase, seed) in seeds.iter().enumerate() {
+                        barrier.wait();
+                        for round in 0..3 {
+                            let digest = pow_hash(PowAlgo::RandomX, seed, b"stress input")
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "worker {worker} phase {phase} round {round} failed: {error}"
+                                    )
+                                });
+                            assert_eq!(digest, expected[phase]);
+                        }
+                    }
+                });
+            }
+        });
     }
 }
