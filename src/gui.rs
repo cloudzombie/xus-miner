@@ -918,7 +918,9 @@ struct BlockFlowView {
     tip_height: Option<u64>,
     template_height: Option<u64>,
     template_tx_count: Option<u64>,
-    fee_estimate: Option<u64>,
+    /// `sov_estimateFee`'s `feeGrains` for the next block, in grains
+    /// (1 XUS = 10^8 grains), relayed by the engine.
+    fee_grains: Option<u64>,
     recent: Vec<BlockFlowTile>,
 }
 
@@ -930,7 +932,7 @@ impl BlockFlowView {
             tip_height: value.get("tip_height").and_then(Value::as_u64),
             template_height: value.pointer("/template/height").and_then(Value::as_u64),
             template_tx_count: value.pointer("/template/tx_count").and_then(Value::as_u64),
-            fee_estimate: value.get("fee_estimate").and_then(Value::as_u64),
+            fee_grains: value.get("fee_grains").and_then(Value::as_u64),
             recent: value
                 .get("recent")
                 .and_then(Value::as_array)
@@ -3204,12 +3206,12 @@ impl MinerApp {
                         );
                         telemetry_chip(
                             ui,
-                            "TIP TO GET IN",
+                            "FEE TO GET IN",
                             &flow
-                                .and_then(|flow| flow.fee_estimate)
-                                .map_or_else(|| "—".into(), format_count),
+                                .and_then(|flow| flow.fee_grains)
+                                .map_or_else(|| "—".into(), format_grains_as_xus),
                             AMBER,
-                            "sov_estimateFee: the node's current fee/tip to be included in the next block under the v0.1.98 blockspace auction (dynamic floor). Base units; '—' when the node does not expose the RPC.",
+                            "sov_estimateFee feeGrains: the node's current fee to be included in the next block under the v0.1.98 blockspace auction (dynamic floor). Shown in XUS (1 XUS = 10^8 grains); '—' when the node does not expose the RPC.",
                         );
                     });
                 });
@@ -3270,7 +3272,7 @@ impl MinerApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(
-                        "Real node data only — template txs from sov_getBlockTemplate, sealed-block txs from sov_getBlockByHeight; '—' means the node did not supply that value. Your accepted blocks are highlighted.",
+                        "Real node data only — sealed-block tx counts from sov_getBlockByHeight; the forming tile shows '—' because the node's template discloses no tx list (only txRoot). '—' always means the node did not supply that value. Your accepted blocks are highlighted.",
                     )
                     .size(9.0)
                     .color(MUTED),
@@ -4429,6 +4431,26 @@ fn format_count(value: u64) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Render a grains amount as XUS (1 XUS = 10^8 grains) with up to five
+/// decimal places, trailing zeros trimmed. Used for the real
+/// `sov_estimateFee` `feeGrains` value only; unknown fees never reach here.
+fn format_grains_as_xus(grains: u64) -> String {
+    if grains > 0 && grains < 1_000 {
+        // A real, nonzero fee below the display precision must not be
+        // rounded down to a dishonest-looking zero.
+        return "<0.00001 XUS".into();
+    }
+    let xus = grains as f64 / 1e8;
+    let mut rendered = format!("{xus:.5}");
+    while rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.pop();
+    }
+    format!("{rendered} XUS")
 }
 
 pub fn run() -> Result<(), String> {
@@ -5686,8 +5708,10 @@ mod tests {
         app.apply_telemetry(&json!({
             "event": "block_flow",
             "tip_height": 42,
-            "template": {"height": 43, "tx_count": 2},
-            "fee_estimate": 1_000,
+            // The live template exposes no tx count (only txRoot); the
+            // engine relays null and the tile renders "—".
+            "template": {"height": 43, "tx_count": null},
+            "fee_grains": 1_651_760,
             "recent": [
                 {"height": 42, "tx_count": 3, "mine": true},
                 {"height": 41, "tx_count": null, "mine": false},
@@ -5698,8 +5722,8 @@ mod tests {
         let flow = app.block_flow.clone().expect("block flow view");
         assert_eq!(flow.tip_height, Some(42));
         assert_eq!(flow.template_height, Some(43));
-        assert_eq!(flow.template_tx_count, Some(2));
-        assert_eq!(flow.fee_estimate, Some(1_000));
+        assert_eq!(flow.template_tx_count, None);
+        assert_eq!(flow.fee_grains, Some(1_651_760));
         assert_eq!(
             flow.recent,
             vec![
@@ -5744,6 +5768,18 @@ mod tests {
             app.block_flow.as_ref().map(|flow| flow.recent.len()),
             Some(MAX_FLOW_TILES)
         );
+    }
+
+    #[test]
+    fn fee_grains_render_as_exact_xus() {
+        // 1651760 grains is the live-captured sov_estimateFee transfer fee.
+        assert_eq!(format_grains_as_xus(1_651_760), "0.01652 XUS");
+        assert_eq!(format_grains_as_xus(0), "0 XUS");
+        assert_eq!(format_grains_as_xus(100_000_000), "1 XUS");
+        assert_eq!(format_grains_as_xus(1_250_000_000), "12.5 XUS");
+        // A nonzero fee below display precision never reads as free.
+        assert_eq!(format_grains_as_xus(10), "<0.00001 XUS");
+        assert_eq!(format_grains_as_xus(1_000), "0.00001 XUS");
     }
 
     #[test]

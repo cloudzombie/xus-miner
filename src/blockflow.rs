@@ -37,42 +37,61 @@ fn block_facet(value: &Value) -> &Value {
     }
 }
 
-/// Real transaction count of a block or template response: the length of its
-/// `txIds` array, or an explicit integer `txCount`. Absent both, the count is
-/// unknown and the UI must show a placeholder.
+/// Real transaction count of a block response. The live SOV node's
+/// `sov_getBlockByHeight` returns `{"header": {...}, "transactions": [...]}`
+/// (verified against mainnet), so the count is the length of `transactions`.
+/// `sov_getBlockDigest`'s `txIds` array is accepted as the equivalent lighter
+/// shape. Absent both, the count is unknown and the UI must show a
+/// placeholder — never a guess.
+///
+/// NOTE: the current `sov_getBlockTemplate` reply exposes NO transaction list
+/// or count (only `txRoot`), so for the forming template block this returns
+/// `None` and the tile honestly renders "—" until the node ever discloses
+/// template transactions.
 pub(crate) fn tx_count(value: &Value) -> Option<u64> {
     let facet = block_facet(value);
+    if let Some(transactions) = facet.get("transactions").and_then(Value::as_array) {
+        return Some(transactions.len() as u64);
+    }
     if let Some(ids) = facet.get("txIds").and_then(Value::as_array) {
         return Some(ids.len() as u64);
     }
-    facet.get("txCount").and_then(Value::as_u64)
+    None
 }
 
-/// The block's own hash as disclosed by the node, if any.
+/// The block's own hash, when the node discloses one. The live
+/// `sov_getBlockByHeight` shape nests fields under `header` and does not
+/// return a top-level `hash`; accept `hash` at the top level, inside `block`,
+/// or inside `header` so any disclosing shape is used, else `None` (the
+/// "yours" highlight then falls back to the accepted height).
 pub(crate) fn block_hash(value: &Value) -> Option<String> {
-    block_facet(value)
+    let facet = block_facet(value);
+    facet
         .get("hash")
+        .or_else(|| facet.get("header").and_then(|header| header.get("hash")))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|hash| !hash.is_empty() && hash.len() <= MAX_HASH_CHARS)
         .map(str::to_owned)
 }
 
-/// A single fee-for-inclusion estimate from `sov_estimateFee`. The reply may
-/// be a bare integer or an object; only recognized numeric fields are
-/// accepted, and an unrecognized shape yields `None` (placeholder), never a
-/// guess.
-pub(crate) fn fee_estimate(value: &Value) -> Option<u64> {
+/// The fee-to-get-in from `sov_estimateFee`, in grains. The live node returns
+/// `{"feeGrains":"1651760","gasPriceGrains":"10","gasUsed":...,"kind":...}`
+/// (verified against mainnet): `feeGrains` is a decimal string. A bare
+/// integer, or an integer `feeGrains`, is also accepted. Anything else yields
+/// `None` (placeholder), never a guess.
+pub(crate) fn fee_grains(value: &Value) -> Option<u64> {
     if let Some(fee) = value.as_u64() {
         return Some(fee);
     }
-    ["minTip", "tipFloor", "feeFloor", "fee", "estimate"]
-        .iter()
-        .find_map(|key| value.get(key).and_then(Value::as_u64))
+    let fee = value.get("feeGrains")?;
+    fee.as_u64()
+        .or_else(|| fee.as_str().and_then(|raw| raw.trim().parse::<u64>().ok()))
 }
 
-/// The pending-transaction count from `sov_getMempoolSize`: a bare integer or
-/// a recognized numeric field of an object reply.
+/// The pending-transaction count from `sov_getMempoolSize`. The live node
+/// returns a bare integer (verified against mainnet); a recognized numeric
+/// field of an object reply is tolerated as a fallback.
 pub(crate) fn mempool_size(value: &Value) -> Option<u64> {
     if let Some(size) = value.as_u64() {
         return Some(size);
@@ -206,21 +225,31 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tx_count_comes_only_from_real_txids_or_txcount() {
+    fn tx_count_reads_the_live_transactions_shape_or_digest_txids() {
+        // Live mainnet `sov_getBlockByHeight`: {"header": {...},
+        // "transactions": [...]} — the count is the array length.
         assert_eq!(
-            tx_count(&json!({"height": 7, "txIds": ["aa", "bb", "cc"]})),
+            tx_count(&json!({
+                "header": {"height": 7, "txRoot": "22".repeat(32)},
+                "transactions": [{"kind": "transfer"}, {"kind": "transfer"}, {"kind": "tip"}],
+            })),
             Some(3)
         );
-        assert_eq!(tx_count(&json!({"txIds": []})), Some(0));
+        assert_eq!(tx_count(&json!({"transactions": []})), Some(0));
+        // `sov_getBlockDigest` equivalent: a txIds array.
+        assert_eq!(tx_count(&json!({"txIds": ["aa", "bb"]})), Some(2));
         assert_eq!(
-            tx_count(&json!({"block": {"height": 7, "txIds": ["aa"]}})),
+            tx_count(&json!({"block": {"height": 7, "transactions": [{}]}})),
             Some(1)
         );
-        assert_eq!(tx_count(&json!({"txCount": 12})), Some(12));
-        // Unknown stays unknown: no invented count.
-        assert_eq!(tx_count(&json!({"height": 7})), None);
-        assert_eq!(tx_count(&json!({"txIds": "aa,bb"})), None);
-        assert_eq!(tx_count(&json!({"txCount": -1})), None);
+        // Unknown stays unknown: no invented count. The live block template
+        // carries only txRoot — no list, no count — and must yield None.
+        assert_eq!(
+            tx_count(&json!({"height": 7, "txRoot": "22".repeat(32)})),
+            None
+        );
+        assert_eq!(tx_count(&json!({"transactions": "three"})), None);
+        assert_eq!(tx_count(&json!({"txCount": 12})), None);
     }
 
     #[test]
@@ -233,24 +262,43 @@ mod tests {
             block_hash(&json!({"block": {"hash": "cd"}})),
             Some("cd".into())
         );
+        assert_eq!(
+            block_hash(&json!({"header": {"hash": "ee".repeat(32)}})),
+            Some("ee".repeat(32))
+        );
         assert_eq!(block_hash(&json!({"hash": ""})), None);
         assert_eq!(block_hash(&json!({"hash": "ff".repeat(65)})), None);
-        assert_eq!(block_hash(&json!({"height": 3})), None);
+        // The live shape discloses no hash: fall back to None honestly.
+        assert_eq!(
+            block_hash(&json!({"header": {"height": 3}, "transactions": []})),
+            None
+        );
         assert_eq!(block_hash(&json!({"hash": 42})), None);
     }
 
     #[test]
-    fn fee_and_mempool_parsers_accept_numbers_and_known_fields_only() {
-        assert_eq!(fee_estimate(&json!(250)), Some(250));
-        assert_eq!(fee_estimate(&json!({"minTip": 1_000})), Some(1_000));
-        assert_eq!(fee_estimate(&json!({"feeFloor": 3})), Some(3));
-        assert_eq!(fee_estimate(&json!({"surprise": 9})), None);
-        assert_eq!(fee_estimate(&json!("250")), None);
-        assert_eq!(fee_estimate(&json!(-1)), None);
+    fn fee_and_mempool_parsers_match_the_live_node_shapes() {
+        // Live mainnet `sov_estimateFee`: feeGrains is a decimal string.
+        assert_eq!(
+            fee_grains(&json!({
+                "feeGrains": "1651760",
+                "gasPriceGrains": "10",
+                "gasUsed": 165_176,
+                "kind": "transfer",
+            })),
+            Some(1_651_760)
+        );
+        assert_eq!(fee_grains(&json!({"feeGrains": 250})), Some(250));
+        assert_eq!(fee_grains(&json!(250)), Some(250));
+        assert_eq!(fee_grains(&json!({"feeGrains": "abc"})), None);
+        assert_eq!(fee_grains(&json!({"feeGrains": "-5"})), None);
+        assert_eq!(fee_grains(&json!({"minTip": 1_000})), None);
+        assert_eq!(fee_grains(&json!("250")), None);
 
+        // Live mainnet `sov_getMempoolSize`: a bare integer.
+        assert_eq!(mempool_size(&json!(0)), Some(0));
         assert_eq!(mempool_size(&json!(17)), Some(17));
         assert_eq!(mempool_size(&json!({"size": 4})), Some(4));
-        assert_eq!(mempool_size(&json!({"pending": 0})), Some(0));
         assert_eq!(mempool_size(&json!({"txs": 9})), None);
         assert_eq!(mempool_size(&json!(null)), None);
     }

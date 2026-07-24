@@ -1251,8 +1251,12 @@ fn run_rpc_session(
                     .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                 previous_id = job.id.clone();
                 let template_height = job.height;
-                // Real transaction count of the block being formed, straight
-                // from the template the node just served (its txIds/txCount).
+                // Honest data gap, verified against the live node: the block
+                // template discloses NO transaction list or count — only its
+                // `txRoot` commitment — so this is `None` today and the
+                // forming tile renders "—" instead of a fabricated count. If
+                // a future node ever adds template transactions, this picks
+                // up the real value automatically.
                 let template_tx_count = blockflow::tx_count(&value);
                 state.install_job(job);
                 chain_height = Some(current_height);
@@ -1393,7 +1397,7 @@ fn run_rpc_session(
                             "height": template_height,
                             "tx_count": template_tx_count,
                         },
-                        "fee_estimate": fee_reply.as_ref().and_then(blockflow::fee_estimate),
+                        "fee_grains": fee_reply.as_ref().and_then(blockflow::fee_grains),
                         "recent": tiles
                             .iter()
                             .map(|tile| json!({

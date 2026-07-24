@@ -3,20 +3,27 @@
 ## 0.1.4
 
 - Add a mempool.space-style **block-flow strip** to the GUI dashboard for
-  direct-node sessions: the forming template block (real transaction count
-  from `sov_getBlockTemplate`'s `txIds`), a tip divider, and the most recent
-  confirmed blocks as tiles with their real heights and transaction counts
-  read from `sov_getBlockByHeight`. Blocks this miner sealed — accepted
-  `sov_submitBlock` submissions whose confirmed hash the node echoed — are
-  highlighted, matched by block hash (height only when the node does not
-  disclose a hash, so a same-height reorg never mislabels someone else's
-  block). A reorg detected by a changed hash invalidates every cached
-  descendant so stale tiles are refetched instead of shown.
+  direct-node sessions: the forming template block, a tip divider, and the
+  most recent confirmed blocks as tiles with their real heights and
+  transaction counts — the length of the `transactions` array that
+  `sov_getBlockByHeight` returns (live-verified shape:
+  `{"header": {...}, "transactions": [...]}`; a `sov_getBlockDigest`-style
+  `txIds` array is accepted equivalently). The live block template exposes
+  NO transaction list or count (only its `txRoot` commitment), so the
+  forming tile honestly shows "—" for its count — a real data gap, not a
+  fabricated number. Blocks this miner sealed — accepted `sov_submitBlock`
+  submissions whose confirmed hash the node echoed — are highlighted,
+  matched by block hash when a response discloses one and by accepted
+  height otherwise (the live shape discloses no block hash). A reorg
+  detected by a changed hash invalidates every cached descendant so stale
+  tiles are refetched instead of shown.
 - Add mempool-pressure and fee-to-get-in chips: pending-transaction count
-  from the node (`sov_health` every poll, refreshed by `sov_getMempoolSize`
-  where available) and the node's single `sov_estimateFee` estimate — the
-  tip/dynamic-floor "tip ≥ X to make the next block" indicator of the
-  v0.1.98 blockspace auction.
+  from the node (`sov_health` every poll, refreshed by `sov_getMempoolSize`,
+  whose live reply is a bare integer) and the node's `sov_estimateFee`
+  `feeGrains` value (live shape: a decimal string in grains), rendered in
+  XUS (1 XUS = 10^8 grains) — the "fee ≥ X to make the next block"
+  indicator of the v0.1.98 blockspace auction. A nonzero fee below display
+  precision renders as "<0.00001 XUS", never as free.
 - Every rendered number is a real node RPC value; anything a node does not
   supply (older node, missing RPC, failed or slow call) renders as the
   neutral placeholder "—", never an invented or estimated-looking value.

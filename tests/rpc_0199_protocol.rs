@@ -85,9 +85,9 @@ impl TemplateFixture {
             "versionBits": VERSION_BITS,
             "blob": hex::encode(&blob),
             "nonceOffset": blob.len() - 8,
-            // Real template transaction identifiers; the miner's block-flow
-            // strip must report their count for the forming block.
-            "txIds": ["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)],
+            // NOTE: the live sov_getBlockTemplate reply carries NO transaction
+            // list or count — only the txRoot commitment above — so the
+            // forming-block tile's tx count must stay a placeholder.
         });
         Self {
             blob,
@@ -450,24 +450,41 @@ fn handle_rpc_connection(
                 "syncing": false,
             }
         }),
+        // Live-verified shape: a bare integer count.
         "sov_getMempoolSize" => json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": 2,
         }),
+        // Live-verified shape: feeGrains is a decimal string in grains.
         "sov_estimateFee" => json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": {"minTip": 1_000},
+            "result": {
+                "feeGrains": "1651760",
+                "gasPriceGrains": "10",
+                "gasUsed": 165_176,
+                "kind": "transfer",
+            },
         }),
+        // Live-verified shape: {"header": {...}, "transactions": [...]} with
+        // no top-level hash and no txIds/txCount fields.
         "sov_getBlockByHeight" => match params.get("height").and_then(Value::as_u64) {
             Some(height) if height < HEIGHT => json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "height": height,
-                    "hash": format!("{height:064x}"),
-                    "txIds": ["dd".repeat(32), "ee".repeat(32)],
+                    "header": {
+                        "height": height,
+                        "prevHash": "11".repeat(32),
+                        "txRoot": "22".repeat(32),
+                        "timestampMs": TIMESTAMP_MS - 1,
+                        "proposer": COINBASE,
+                    },
+                    "transactions": [
+                        {"kind": "transfer", "nonce": 1},
+                        {"kind": "transfer", "nonce": 2},
+                    ],
                 }
             }),
             _ => json!({
@@ -617,12 +634,14 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
                 saw_accepted_share = true;
             }
             Some("block_flow") => {
-                // Every strip value must be exactly what the mock node served:
-                // template txIds count, per-block txIds counts, fee estimate.
+                // Every strip value must be exactly what the mock node served
+                // in the live-verified shapes: per-block `transactions` array
+                // lengths, string `feeGrains`, and — because the real template
+                // exposes no transaction list — a null forming-tile count.
                 assert_eq!(event.pointer("/template/height"), Some(&json!(HEIGHT)));
-                assert_eq!(event.pointer("/template/tx_count"), Some(&json!(3)));
+                assert_eq!(event.pointer("/template/tx_count"), Some(&Value::Null));
                 assert_eq!(event["tip_height"], json!(HEIGHT - 1));
-                assert_eq!(event["fee_estimate"], json!(1_000));
+                assert_eq!(event["fee_grains"], json!(1_651_760));
                 let recent = event["recent"].as_array().expect("recent tiles");
                 assert!(!recent.is_empty());
                 assert_eq!(recent[0]["height"], json!(HEIGHT - 1));
