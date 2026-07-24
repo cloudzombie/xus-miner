@@ -1251,12 +1251,11 @@ fn run_rpc_session(
                     .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                 previous_id = job.id.clone();
                 let template_height = job.height;
-                // Honest data gap, verified against the live node: the block
-                // template discloses NO transaction list or count — only its
-                // `txRoot` commitment — so this is `None` today and the
-                // forming tile renders "—" instead of a fabricated count. If
-                // a future node ever adds template transactions, this picks
-                // up the real value automatically.
+                // The upgraded node's template discloses `txCount` + `txIds`,
+                // which feed the forming tile's real count. A pre-upgrade
+                // template carries only its `txRoot` commitment, so this is
+                // `None` there and the forming tile honestly renders "—"
+                // instead of a fabricated count.
                 let template_tx_count = blockflow::tx_count(&value);
                 state.install_job(job);
                 chain_height = Some(current_height);
@@ -1265,74 +1264,92 @@ fn run_rpc_session(
                 // an older/slow node can never delay hashing a valid template.
                 // Run the bounded reads together so one slow optional method
                 // cannot add its timeout to the others and hold up tip polling.
-                let (network, peer_info, fee_reply, mempool_reply) = thread::scope(|scope| {
-                    let network = thread::Builder::new()
-                        .name("xus-rpc-difficulty".into())
-                        .spawn_scoped(scope, || {
-                            rpc_call_with_timeout(
-                                &cfg.pool,
-                                "sov_getDifficulty",
-                                json!({}),
-                                Duration::from_secs(1),
-                            )
-                        });
-                    let peers = thread::Builder::new()
-                        .name("xus-rpc-peers".into())
-                        .spawn_scoped(scope, || {
-                            rpc_call_with_timeout(
-                                &cfg.pool,
-                                "sov_getPeerInfo",
-                                json!({}),
-                                Duration::from_secs(1),
-                            )
-                        });
-                    // Optional block-flow enrichment: the real fee floor to
-                    // make the next block and the node's own mempool counter.
-                    // Both fail soft (placeholder), never blocking work.
-                    let fee = thread::Builder::new()
-                        .name("xus-rpc-fee".into())
-                        .spawn_scoped(scope, || {
-                            rpc_call_with_timeout(
-                                &cfg.pool,
-                                "sov_estimateFee",
-                                json!({}),
-                                Duration::from_secs(1),
-                            )
-                        });
-                    let mempool = thread::Builder::new()
-                        .name("xus-rpc-mempool".into())
-                        .spawn_scoped(scope, || {
-                            rpc_call_with_timeout(
-                                &cfg.pool,
-                                "sov_getMempoolSize",
-                                json!({}),
-                                Duration::from_secs(1),
-                            )
-                        });
-                    let network = match network {
-                        Ok(handle) => handle.join().ok().and_then(|result| result.ok()),
-                        Err(error) => {
-                            eprintln!("optional difficulty RPC worker unavailable: {error}");
-                            None
-                        }
-                    };
-                    let peers = match peers {
-                        Ok(handle) => handle.join().ok().and_then(|result| result.ok()),
-                        Err(error) => {
-                            eprintln!("optional peer RPC worker unavailable: {error}");
-                            None
-                        }
-                    };
-                    let fee = fee
-                        .ok()
-                        .and_then(|handle| handle.join().ok())
-                        .and_then(|result| result.ok());
-                    let mempool = mempool
-                        .ok()
-                        .and_then(|handle| handle.join().ok())
-                        .and_then(|result| result.ok());
-                    (network, peers, fee, mempool)
-                });
+                let (network, peer_info, fee_reply, mempool_reply, histogram_reply) =
+                    thread::scope(|scope| {
+                        let network = thread::Builder::new()
+                            .name("xus-rpc-difficulty".into())
+                            .spawn_scoped(scope, || {
+                                rpc_call_with_timeout(
+                                    &cfg.pool,
+                                    "sov_getDifficulty",
+                                    json!({}),
+                                    Duration::from_secs(1),
+                                )
+                            });
+                        let peers = thread::Builder::new()
+                            .name("xus-rpc-peers".into())
+                            .spawn_scoped(scope, || {
+                                rpc_call_with_timeout(
+                                    &cfg.pool,
+                                    "sov_getPeerInfo",
+                                    json!({}),
+                                    Duration::from_secs(1),
+                                )
+                            });
+                        // Optional block-flow enrichment: the real fee floor to
+                        // make the next block, the node's own mempool counter,
+                        // and the mempool fee histogram behind the projected
+                        // pending blocks. All fail soft (placeholder / no
+                        // projected tiles on a pre-upgrade node), never blocking
+                        // work.
+                        let fee = thread::Builder::new()
+                            .name("xus-rpc-fee".into())
+                            .spawn_scoped(scope, || {
+                                rpc_call_with_timeout(
+                                    &cfg.pool,
+                                    "sov_estimateFee",
+                                    json!({}),
+                                    Duration::from_secs(1),
+                                )
+                            });
+                        let mempool = thread::Builder::new()
+                            .name("xus-rpc-mempool".into())
+                            .spawn_scoped(scope, || {
+                                rpc_call_with_timeout(
+                                    &cfg.pool,
+                                    "sov_getMempoolSize",
+                                    json!({}),
+                                    Duration::from_secs(1),
+                                )
+                            });
+                        let histogram = thread::Builder::new()
+                            .name("xus-rpc-histogram".into())
+                            .spawn_scoped(scope, || {
+                                rpc_call_with_timeout(
+                                    &cfg.pool,
+                                    "sov_getMempoolHistogram",
+                                    json!({}),
+                                    Duration::from_secs(1),
+                                )
+                            });
+                        let network = match network {
+                            Ok(handle) => handle.join().ok().and_then(|result| result.ok()),
+                            Err(error) => {
+                                eprintln!("optional difficulty RPC worker unavailable: {error}");
+                                None
+                            }
+                        };
+                        let peers = match peers {
+                            Ok(handle) => handle.join().ok().and_then(|result| result.ok()),
+                            Err(error) => {
+                                eprintln!("optional peer RPC worker unavailable: {error}");
+                                None
+                            }
+                        };
+                        let fee = fee
+                            .ok()
+                            .and_then(|handle| handle.join().ok())
+                            .and_then(|result| result.ok());
+                        let mempool = mempool
+                            .ok()
+                            .and_then(|handle| handle.join().ok())
+                            .and_then(|result| result.ok());
+                        let histogram = histogram
+                            .ok()
+                            .and_then(|handle| handle.join().ok())
+                            .and_then(|result| result.ok());
+                        (network, peers, fee, mempool, histogram)
+                    });
                 if let Some(network) = network {
                     state.emit(json!({
                         "event": "network",
@@ -1387,6 +1404,15 @@ fn run_rpc_session(
                         Err(_) => break,
                     }
                 }
+                // Projected pending blocks: real histogram buckets packed by
+                // the node's own per-block capacity. A pre-upgrade node
+                // (method not found), a malformed reply, or an empty mempool
+                // packs to no tiles — the honest state, never invented ones.
+                let projected = histogram_reply
+                    .as_ref()
+                    .and_then(blockflow::mempool_histogram)
+                    .map(|histogram| blockflow::projected_blocks(&histogram))
+                    .unwrap_or_default();
                 let block_flow = {
                     let sealed = state.sealed_blocks.lock().expect("sealed blocks lock");
                     let tiles = recent_blocks.tiles(current_height, &sealed);
@@ -1397,7 +1423,17 @@ fn run_rpc_session(
                             "height": template_height,
                             "tx_count": template_tx_count,
                         },
-                        "fee_grains": fee_reply.as_ref().and_then(blockflow::fee_grains),
+                        // The auction floor (`floorGrains`) when the node
+                        // serves it; the flat `feeGrains` estimate otherwise.
+                        "fee_grains": fee_reply.as_ref().and_then(blockflow::fee_floor_grains),
+                        "projected": projected
+                            .iter()
+                            .map(|block| json!({
+                                "tx_count": block.tx_count,
+                                "fee_min_grains": block.fee_min_grains,
+                                "fee_max_grains": block.fee_max_grains,
+                            }))
+                            .collect::<Vec<_>>(),
                         "recent": tiles
                             .iter()
                             .map(|tile| json!({
