@@ -3791,11 +3791,16 @@ impl MinerApp {
                             .color(MUTED),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // The total is a cumulative fact, but a silent engine
+                        // must not present it as a live counter.
                         ui.label(
-                            RichText::new(format!(
-                                "{} total hashes",
-                                format_count(self.total_hashes)
-                            ))
+                            RichText::new(match self.headline_hashrate() {
+                                HashrateReadout::Stale(_) => format!(
+                                    "{} total hashes (telemetry silent)",
+                                    format_count(self.total_hashes)
+                                ),
+                                _ => format!("{} total hashes", format_count(self.total_hashes)),
+                            })
                             .size(11.0)
                             .color(MUTED),
                         );
@@ -3805,12 +3810,30 @@ impl MinerApp {
                 let eta = self.solo_block_eta_seconds();
                 let probability = self.current_round_probability();
                 ui.columns(4, |columns| {
+                    // Gated like the headline card: a wedged engine must not
+                    // keep its last smoothed number painted as live.
+                    let (smoothed_text, smoothed_detail, smoothed_color) =
+                        match self.headline_hashrate() {
+                            HashrateReadout::Live(_) => (
+                                format_hashrate(self.smoothed_hashrate),
+                                "8-second signal lock".to_owned(),
+                                CYAN,
+                            ),
+                            HashrateReadout::Stale(_) => (
+                                format!("{} STALE", format_hashrate(self.smoothed_hashrate)),
+                                "engine telemetry went silent".to_owned(),
+                                MUTED,
+                            ),
+                            HashrateReadout::Offline => {
+                                ("—".to_owned(), "no active engine".to_owned(), MUTED)
+                            }
+                        };
                     meter_readout(
                         &mut columns[0],
                         "SMOOTHED HASHRATE",
-                        &format_hashrate(self.smoothed_hashrate),
-                        "8-second signal lock",
-                        CYAN,
+                        &smoothed_text,
+                        &smoothed_detail,
+                        smoothed_color,
                     );
                     meter_readout(
                         &mut columns[1],
