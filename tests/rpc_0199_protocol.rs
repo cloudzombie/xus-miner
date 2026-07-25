@@ -1,6 +1,7 @@
 use borsh::BorshSerialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -54,6 +55,19 @@ struct TemplateFixture {
     /// upgraded mock discloses it as block HEIGHT's `header.hash` so the
     /// feed's exact-hash YOURS matching is exercised end to end.
     accepted_hash: Arc<Mutex<Option<String>>>,
+    /// Every tip height `sov_health` actually served, in order. Lets a test
+    /// wait deterministically (condition + deadline, never a bare sleep)
+    /// until the miner has been given a specific tip value to observe.
+    served_tips: Arc<Mutex<Vec<u64>>>,
+    /// Per-height `header.hash` overrides for `sov_getBlockByHeight`:
+    /// swapping the hash a height discloses drives a REAL reorg through the
+    /// production feed path.
+    hash_overrides: Arc<Mutex<BTreeMap<u64, String>>>,
+    /// When set, `sov_getBlockByHeight` answers every call with a JSON-RPC
+    /// error: the per-block detail fetch fails while the node itself still
+    /// discloses hashes — the transient-failure case that must never be
+    /// conflated with "node disclosed no hash".
+    fail_block_detail: Arc<AtomicBool>,
 }
 
 /// Miner-declared header timestamp the mock serves for `height`: the fixed
@@ -117,6 +131,9 @@ impl TemplateFixture {
             legacy: false,
             tip: Arc::new(AtomicU64::new(HEIGHT - 1)),
             accepted_hash: Arc::new(Mutex::new(None)),
+            served_tips: Arc::new(Mutex::new(Vec::new())),
+            hash_overrides: Arc::new(Mutex::new(BTreeMap::new())),
+            fail_block_detail: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -426,16 +443,24 @@ fn handle_rpc_connection(
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
 
     let response = match method {
-        "sov_health" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "ok": true,
-                "chainId": "sov-mainnet",
-                "height": fixture.tip.load(Ordering::Acquire),
-                "mempool": 2,
-            }
-        }),
+        "sov_health" => {
+            let tip = fixture.tip.load(Ordering::Acquire);
+            fixture
+                .served_tips
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(tip);
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "ok": true,
+                    "chainId": "sov-mainnet",
+                    "height": tip,
+                    "mempool": 2,
+                }
+            })
+        }
         "sov_getBlockTemplate" => {
             if params.get("coinbaseAccount").and_then(Value::as_str) != Some(COINBASE) {
                 json!({
@@ -534,6 +559,16 @@ fn handle_rpc_connection(
         // as `timestamp_ms` in milliseconds (verified against the live
         // mainnet node; disclosed by pre-upgrade nodes too). The upgraded
         // node additionally discloses the block's own hash inside `header`.
+        // A forced detail-fetch failure: the node is healthy and discloses
+        // hashes, but this specific per-block call fails this cycle.
+        "sov_getBlockByHeight" if fixture.fail_block_detail.load(Ordering::Acquire) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32000,
+                "message": "mock node forced a transient block-detail failure",
+            }
+        }),
         "sov_getBlockByHeight" => match params.get("height").and_then(Value::as_u64) {
             Some(height) if height <= fixture.tip.load(Ordering::Acquire) => {
                 let mut header = json!({
@@ -544,10 +579,17 @@ fn handle_rpc_connection(
                     "proposer": COINBASE,
                 });
                 if !fixture.legacy {
-                    // Block HEIGHT is the one this miner seals in the feed
+                    // A test-installed override (reorg drills) wins; else
+                    // block HEIGHT is the one this miner seals in the feed
                     // test: once a submission was accepted, the chain block
                     // at that height IS the accepted block, so its disclosed
                     // hash is the accepted sealed-header hash.
+                    let overridden = fixture
+                        .hash_overrides
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&height)
+                        .cloned();
                     let accepted = (height == HEIGHT)
                         .then(|| {
                             fixture
@@ -557,7 +599,9 @@ fn handle_rpc_connection(
                                 .clone()
                         })
                         .flatten();
-                    header["hash"] = json!(accepted.unwrap_or_else(|| format!("{height:064x}")));
+                    header["hash"] = json!(overridden
+                        .or(accepted)
+                        .unwrap_or_else(|| format!("{height:064x}")));
                 }
                 json!({
                     "jsonrpc": "2.0",
@@ -1160,6 +1204,434 @@ fn network_block_feed_reports_yours_gap_and_idempotent_network_blocks() {
         all_heights.len(),
         deduplicated,
         "a height+hash was reported twice: {chain_blocks:?}"
+    );
+}
+
+/// A spawned headless miner with its parsed JSON telemetry stream and a
+/// bounded stderr capture — shared plumbing for the feed drill tests below.
+struct HeadlessMiner {
+    _child: ChildGuard,
+    telemetry_rx: mpsc::Receiver<Value>,
+    stderr_log: Arc<Mutex<String>>,
+}
+
+fn spawn_headless_miner(endpoint: &str) -> HeadlessMiner {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xus-miner"))
+        .args([
+            "--headless",
+            "--json-events",
+            "--pool",
+            endpoint,
+            "--user",
+            COINBASE,
+            "--workers",
+            "1",
+            "--reconnect-secs",
+            "1",
+            "--report-secs",
+            "1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn headless xus-miner");
+
+    let stdout = child.stdout.take().expect("miner telemetry stdout");
+    let (telemetry_tx, telemetry_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if telemetry_tx.send(value).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let stderr = child.stderr.take().expect("miner diagnostic stderr");
+    let stderr_log = Arc::new(Mutex::new(String::new()));
+    let stderr_sink = Arc::clone(&stderr_log);
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let mut log = stderr_sink.lock().expect("stderr log lock");
+            if log.len() < 64 * 1024 {
+                log.push_str(&line);
+                log.push('\n');
+            }
+        }
+    });
+    HeadlessMiner {
+        _child: ChildGuard(child),
+        telemetry_rx,
+        stderr_log,
+    }
+}
+
+fn stderr_snapshot(stderr_log: &Arc<Mutex<String>>) -> String {
+    stderr_log
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Wait (condition + deadline, never a bare sleep) until the miner's stderr
+/// contains `needle`; returns the full captured stderr.
+fn wait_for_stderr(stderr_log: &Arc<Mutex<String>>, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let log = stderr_snapshot(stderr_log);
+        if log.contains(needle) {
+            return log;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stderr never contained {needle:?}; miner stderr:\n{log}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Wait until the mock has SERVED a `sov_health` reply carrying `tip` at or
+/// after index `from`. Because the mock answers health polls serially and
+/// the miner processes each reply before issuing its next poll, any tip
+/// change made after this returns is observed by the miner strictly after
+/// the awaited value.
+fn wait_for_served_tip(served_tips: &Arc<Mutex<Vec<u64>>>, from: usize, tip: u64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        {
+            let served = served_tips
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if served.iter().skip(from).any(|&served| served == tip) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mock never served sov_health tip {tip} after index {from}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// F2 regression (audit v0.1.6): a FAILED per-block detail fetch is not the
+/// same thing as a node that discloses no hash. When the fetch fails, the
+/// feed must (a) never claim "hash not disclosed by node", and (b) never
+/// print an unqualified ★ YOURS from the height fallback the failure made
+/// unverifiable — on an upgraded node a same-height reorg replacement could
+/// otherwise be mislabeled as this miner's block exactly when the node is
+/// busy. The event must carry the distinction additively
+/// (`detail_fetch_failed`, `mine_unverified`) without touching any existing
+/// field.
+#[test]
+fn detail_fetch_failure_is_reported_distinctly_and_never_upgrades_to_yours() {
+    let fixture = TemplateFixture::sov_0_1_99();
+    let tip = Arc::clone(&fixture.tip);
+    let accepted_hash = Arc::clone(&fixture.accepted_hash);
+    let fail_block_detail = Arc::clone(&fixture.fail_block_detail);
+    let (mock_node, _request_rx) = MockNode::start(fixture.clone());
+    let miner = spawn_headless_miner(&format!("rpc://{}", mock_node.address));
+
+    // Phase 1 — static tip: baseline announced and the deterministic
+    // nonce-zero submission accepted (the miner now has an accepted
+    // submission at HEIGHT on record).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_baseline = false;
+    let mut saw_accepted_share = false;
+    while Instant::now() < deadline && !(saw_baseline && saw_accepted_share) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = miner
+            .telemetry_rx
+            .recv_timeout(remaining.min(Duration::from_millis(500)))
+        else {
+            continue;
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("chain_baseline") => saw_baseline = true,
+            Some("share") if event["accepted"].as_u64().unwrap_or_default() >= 1 => {
+                saw_accepted_share = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_baseline && saw_accepted_share,
+        "no baseline + accepted submission; miner stderr:\n{}",
+        stderr_snapshot(&miner.stderr_log)
+    );
+    assert!(
+        accepted_hash.lock().expect("accepted hash lock").is_some(),
+        "mock recorded no accepted sealed hash"
+    );
+
+    // Phase 2 — the accepted block confirms as the new tip, but every
+    // per-block detail fetch fails. The node DOES disclose hashes; the
+    // miner just could not retrieve this one.
+    fail_block_detail.store(true, Ordering::Release);
+    tip.store(HEIGHT, Ordering::Release);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut announced: Option<Value> = None;
+    while Instant::now() < deadline && announced.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = miner
+            .telemetry_rx
+            .recv_timeout(remaining.min(Duration::from_millis(500)))
+        else {
+            continue;
+        };
+        if event.get("event").and_then(Value::as_str) == Some("chain_block")
+            && event["height"] == json!(HEIGHT)
+        {
+            announced = Some(event);
+        }
+    }
+    let Some(announced) = announced else {
+        panic!(
+            "the confirmed block was never announced; miner stderr:\n{}",
+            stderr_snapshot(&miner.stderr_log)
+        );
+    };
+    // The hash is unknown BECAUSE THE FETCH FAILED: the event must say so
+    // additively, must not assert a proven YOURS, and must keep every
+    // pre-existing field in place (height/hash/tx_count/timestamp_ms/mine).
+    assert_eq!(announced["hash"], Value::Null);
+    assert_eq!(announced["tx_count"], Value::Null);
+    assert_eq!(announced["timestamp_ms"], Value::Null);
+    assert_eq!(
+        announced["detail_fetch_failed"],
+        json!(true),
+        "the event must distinguish a failed fetch from an undisclosed hash: {announced}"
+    );
+    assert_eq!(
+        announced["mine"],
+        json!(false),
+        "an uncorroborated height match must not be asserted as a proven win: {announced}"
+    );
+    assert_eq!(
+        announced["mine_unverified"],
+        json!(true),
+        "the height match must still be reported as unverified: {announced}"
+    );
+
+    // The stderr line for that block must state the failure and must not
+    // claim the node withheld the hash, nor print an unqualified YOURS.
+    let log = wait_for_stderr(
+        &miner.stderr_log,
+        &format!("height {HEIGHT} | detail fetch failed"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        !log.contains("hash not disclosed by node"),
+        "a failed fetch must never be reported as the node withholding the hash:\n{log}"
+    );
+    assert!(
+        !log.contains("★ BLOCK FOUND (YOURS)"),
+        "a failed fetch must never print an unqualified YOURS:\n{log}"
+    );
+    assert!(
+        log.contains("possibly YOURS — unverified"),
+        "the qualified height-match wording is missing:\n{log}"
+    );
+
+    // The strip/graph substrate must carry the same honesty: the unfetched
+    // tile at HEIGHT is only an unverified height match, never `mine: true`.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut flow_tile: Option<Value> = None;
+    while Instant::now() < deadline && flow_tile.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = miner
+            .telemetry_rx
+            .recv_timeout(remaining.min(Duration::from_millis(500)))
+        else {
+            continue;
+        };
+        if event.get("event").and_then(Value::as_str) == Some("block_flow")
+            && event["tip_height"] == json!(HEIGHT)
+        {
+            let recent = event["recent"].as_array().expect("recent tiles").clone();
+            assert_eq!(recent[0]["height"], json!(HEIGHT));
+            flow_tile = recent.first().cloned();
+        }
+    }
+    let Some(flow_tile) = flow_tile else {
+        panic!(
+            "no block_flow at the new tip; miner stderr:\n{}",
+            stderr_snapshot(&miner.stderr_log)
+        );
+    };
+    assert_eq!(
+        flow_tile["mine"],
+        json!(false),
+        "an unfetched tile must not claim a proven YOURS: {flow_tile}"
+    );
+    assert_eq!(
+        flow_tile["mine_basis"],
+        json!("unverified"),
+        "the tile must carry the unverified height-match basis: {flow_tile}"
+    );
+}
+
+/// F5 (audit v0.1.6): drive a REAL reorg end to end through the production
+/// feed — tip regresses, the same height reappears with a different
+/// node-disclosed hash — and assert the `chain_reorg` event and log line
+/// fire exactly once, and that the replacement is never re-announced as a
+/// duplicate `chain_block`. Deterministic: every step waits on an observed
+/// condition (served health tips / received events), never on raced sleeps.
+#[test]
+fn network_block_feed_reports_a_real_reorg_and_never_a_duplicate_block() {
+    let fixture = TemplateFixture::sov_0_1_99();
+    let tip = Arc::clone(&fixture.tip);
+    let served_tips = Arc::clone(&fixture.served_tips);
+    let hash_overrides = Arc::clone(&fixture.hash_overrides);
+    let (mock_node, _request_rx) = MockNode::start(fixture.clone());
+    let miner = spawn_headless_miner(&format!("rpc://{}", mock_node.address));
+
+    let reorg_height = HEIGHT + 1;
+    let original_hash = format!("{reorg_height:064x}");
+    let replacement_hash = format!("bb{:062x}", reorg_height);
+
+    // Phase 1 — baseline, then advance the tip past HEIGHT so the reorg
+    // height is announced with the mock's original disclosed hash.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_baseline = false;
+    while Instant::now() < deadline && !saw_baseline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = miner
+            .telemetry_rx
+            .recv_timeout(remaining.min(Duration::from_millis(500)))
+        else {
+            continue;
+        };
+        if event.get("event").and_then(Value::as_str) == Some("chain_baseline") {
+            saw_baseline = true;
+        }
+    }
+    assert!(
+        saw_baseline,
+        "no baseline; miner stderr:\n{}",
+        stderr_snapshot(&miner.stderr_log)
+    );
+    tip.store(reorg_height, Ordering::Release);
+
+    let mut chain_blocks: Vec<Value> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_reorg_height = false;
+    while Instant::now() < deadline && !saw_reorg_height {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = miner
+            .telemetry_rx
+            .recv_timeout(remaining.min(Duration::from_millis(500)))
+        else {
+            continue;
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("chain_block") => {
+                if event["height"] == json!(reorg_height) {
+                    assert_eq!(
+                        event["hash"],
+                        json!(original_hash),
+                        "the original disclosed hash must be reported: {event}"
+                    );
+                    saw_reorg_height = true;
+                }
+                chain_blocks.push(event);
+            }
+            Some("chain_reorg") => {
+                panic!("no reorg happened yet: {event}")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_reorg_height,
+        "height {reorg_height} was never announced; miner stderr:\n{}",
+        stderr_snapshot(&miner.stderr_log)
+    );
+
+    // Phase 2 — the tip walks BACK below the reorg height. Wait until the
+    // mock has served that regressed tip, so the miner has observed it
+    // before the replacement branch re-advances.
+    let served_before_regression = served_tips
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len();
+    tip.store(HEIGHT, Ordering::Release);
+    wait_for_served_tip(&served_tips, served_before_regression, HEIGHT);
+
+    // Phase 3 — the replacement branch: the same height reappears with a
+    // DIFFERENT node-disclosed hash.
+    hash_overrides
+        .lock()
+        .expect("hash override lock")
+        .insert(reorg_height, replacement_hash.clone());
+    tip.store(reorg_height, Ordering::Release);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut reorg: Option<Value> = None;
+    while Instant::now() < deadline && reorg.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = miner
+            .telemetry_rx
+            .recv_timeout(remaining.min(Duration::from_millis(500)))
+        else {
+            continue;
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("chain_reorg") => reorg = Some(event),
+            Some("chain_block") => chain_blocks.push(event),
+            _ => {}
+        }
+    }
+    let Some(reorg) = reorg else {
+        panic!(
+            "the reorg was never announced; miner stderr:\n{}",
+            stderr_snapshot(&miner.stderr_log)
+        );
+    };
+    assert_eq!(reorg["height"], json!(reorg_height));
+    assert_eq!(reorg["old_hash"], json!(original_hash));
+    assert_eq!(reorg["new_hash"], json!(replacement_hash));
+
+    // The distinctly worded REORG log line reached stderr.
+    wait_for_stderr(
+        &miner.stderr_log,
+        &format!("REORG at height {reorg_height}"),
+        Duration::from_secs(10),
+    );
+
+    // Idempotence: drain a grace window; the replacement block must never
+    // surface as a duplicate block-found announcement, and no height may
+    // ever be announced twice.
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < drain_deadline {
+        let Ok(event) = miner.telemetry_rx.recv_timeout(Duration::from_millis(250)) else {
+            continue;
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("chain_block") => chain_blocks.push(event),
+            Some("chain_reorg") => panic!("the reorg must be announced exactly once: {event}"),
+            _ => {}
+        }
+    }
+    assert!(
+        !chain_blocks
+            .iter()
+            .any(|event| event["hash"] == json!(replacement_hash)),
+        "the reorg replacement was re-announced as a new block: {chain_blocks:?}"
+    );
+    let mut announced_heights: Vec<u64> = chain_blocks
+        .iter()
+        .filter_map(|event| event["height"].as_u64())
+        .collect();
+    announced_heights.sort_unstable();
+    let total = announced_heights.len();
+    announced_heights.dedup();
+    assert_eq!(
+        announced_heights.len(),
+        total,
+        "a height was announced twice: {chain_blocks:?}"
     );
 }
 

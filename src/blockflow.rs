@@ -21,7 +21,12 @@ use std::collections::VecDeque;
 /// GUI's block-time graph (a bounded, newest-right window); the flow strip
 /// renders only its own smaller tile cap from the same cache. Backfill stays
 /// rate-limited by `MAX_FETCH_PER_REFRESH`, so widening the window can never
-/// widen the per-refresh RPC load — a cold start simply fills across cycles.
+/// widen the per-refresh BACKFILL load — a cold start simply fills across
+/// cycles. The network block feed itself is a separate consumer and adds up
+/// to `MAX_GAP_BLOCKS` further `sov_getBlockByHeight` calls per tip advance,
+/// so the real bounded worst case is `MAX_FETCH_PER_REFRESH +
+/// MAX_GAP_BLOCKS` (4 + 4 = 8) detail calls per template refresh, each
+/// under a 1-second timeout inside its own 2-second wall-clock budget.
 pub(crate) const RECENT_DEPTH: u64 = 33;
 /// Upper bound on `sov_getBlockByHeight` calls per template refresh.
 pub(crate) const MAX_FETCH_PER_REFRESH: usize = 4;
@@ -40,6 +45,15 @@ pub(crate) const MAX_PROJECTED_BLOCKS: usize = 6;
 pub(crate) const MAX_GAP_BLOCKS: u64 = 4;
 /// Reported height→hash entries remembered for idempotence and reorg
 /// detection (bounded; oldest heights are pruned as the tip advances).
+///
+/// ACCEPTED LIMIT: a reorg deeper than this bound outruns the memory — the
+/// pruned heights, if the chain then re-advances across them, are announced
+/// again as new blocks rather than deduplicated or flagged as a reorg. That
+/// trade is deliberate: the map stays bounded no matter what the node
+/// serves, and a 64-deep reorg on a 2.5-minute-cadence chain (~2.7 hours of
+/// history rewritten) is a chain catastrophe in which duplicate feed lines
+/// are the least significant symptom. Nothing is misattributed by it:
+/// YOURS/reorg decisions still rest only on node-disclosed data.
 const MAX_REPORTED_TRACKED: usize = 64;
 
 /// The object that actually carries block fields: some RPC shapes nest the
@@ -275,10 +289,86 @@ impl SealedBlocks {
     /// hash is authoritative: it alone decides, so a same-height reorg cannot
     /// mislabel someone else's block as ours. Only when the node did not
     /// disclose the block hash does the accepted height serve as the match.
+    ///
+    /// PRECONDITION: this is only an honest verdict when the block's detail
+    /// WAS retrieved — `hash: None` here means "the node disclosed no hash",
+    /// never "the detail fetch failed". A caller whose fetch failed does not
+    /// know whether the node discloses hashes and must use [`Self::mine_mark`]
+    /// with `detail_fetched = false`, which downgrades the height fallback to
+    /// an explicitly unverified match instead of a claimed win.
     pub(crate) fn sealed(&self, height: u64, hash: Option<&str>) -> bool {
         match hash {
             Some(hash) => self.entries.iter().any(|(_, sealed)| sealed == hash),
             None => self.entries.iter().any(|(sealed, _)| *sealed == height),
+        }
+    }
+
+    /// Classify a block against the accepted-submission proof standard,
+    /// keeping "detail fetch failed this cycle" distinct from "node
+    /// disclosed no hash". `detail_fetched` is whether `sov_getBlockByHeight`
+    /// actually returned this block's detail; when it did not, `hash` is
+    /// unknown — NOT undisclosed — so a height match can only ever be
+    /// reported as unverified, never as a proven YOURS.
+    pub(crate) fn mine_mark(
+        &self,
+        height: u64,
+        detail_fetched: bool,
+        hash: Option<&str>,
+    ) -> MineMark {
+        if detail_fetched {
+            if self.sealed(height, hash) {
+                if hash.is_some() {
+                    MineMark::Hash
+                } else {
+                    MineMark::Height
+                }
+            } else {
+                MineMark::No
+            }
+        } else if self.sealed(height, None) {
+            MineMark::UnverifiedHeight
+        } else {
+            MineMark::No
+        }
+    }
+}
+
+/// How (and whether) a block is attributed to this miner — the exact proof
+/// that fired, so every surface (log line, JSON event, GUI tooltip) can say
+/// what was actually checked instead of overclaiming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MineMark {
+    /// The node-disclosed block hash equals an accepted sealed-header hash —
+    /// the strongest proof.
+    Hash,
+    /// The block detail WAS fetched and the node disclosed no block hash;
+    /// the accepted-submission height matched (the documented fallback for
+    /// pre-upgrade nodes).
+    Height,
+    /// No block detail was available (the fetch failed or was never
+    /// attempted this cycle); the accepted height matched but nothing could
+    /// corroborate it — possibly ours, explicitly NOT a claimed win.
+    UnverifiedHeight,
+    /// Not attributed to this miner.
+    No,
+}
+
+impl MineMark {
+    /// A proven YOURS under the accepted-submission standard (hash match, or
+    /// height match where the node disclosed no hash). An unverified height
+    /// match is NOT proven.
+    pub(crate) fn proven(self) -> bool {
+        matches!(self, Self::Hash | Self::Height)
+    }
+
+    /// Stable wire tag for the additive `mine_basis` JSON field; `None`
+    /// (serialized as null) for a block that is not attributed at all.
+    pub(crate) fn basis(self) -> Option<&'static str> {
+        match self {
+            Self::Hash => Some("hash"),
+            Self::Height => Some("height"),
+            Self::UnverifiedHeight => Some("unverified"),
+            Self::No => None,
         }
     }
 }
@@ -447,7 +537,10 @@ pub(crate) struct Tile {
     pub(crate) height: u64,
     pub(crate) tx_count: Option<u64>,
     pub(crate) timestamp_ms: Option<u64>,
-    pub(crate) mine: bool,
+    /// Attribution with its exact proof basis: a cached fetched block is
+    /// judged on the hash the node disclosed (or honestly did not); a height
+    /// with NO fetched detail can at most be an unverified height match.
+    pub(crate) mine: MineMark,
 }
 
 /// Bounded cache of the most recent confirmed blocks. Confirmed blocks are
@@ -514,7 +607,11 @@ impl RecentBlocks {
                 height,
                 tx_count: info.and_then(|info| info.tx_count),
                 timestamp_ms: info.and_then(|info| info.timestamp_ms),
-                mine: sealed.sealed(height, info.and_then(|info| info.hash.as_deref())),
+                mine: sealed.mine_mark(
+                    height,
+                    info.is_some(),
+                    info.and_then(|info| info.hash.as_deref()),
+                ),
             });
             if height == Self::window_start(tip) {
                 break;
@@ -886,7 +983,7 @@ mod tests {
                 height: 50,
                 tx_count: Some(5),
                 timestamp_ms: None,
-                mine: false
+                mine: MineMark::No
             }
         );
         assert_eq!(
@@ -895,7 +992,7 @@ mod tests {
                 height: 49,
                 tx_count: Some(2),
                 timestamp_ms: None,
-                mine: true
+                mine: MineMark::Hash
             }
         );
         // Unfetched heights render as real heights with unknown tx counts.
@@ -905,9 +1002,84 @@ mod tests {
                 height: 48,
                 tx_count: None,
                 timestamp_ms: None,
-                mine: false
+                mine: MineMark::No
             }
         );
+    }
+
+    /// F2 regression: the proof basis is classified honestly on every tile.
+    /// A fetched block is judged on what the node disclosed; a height with
+    /// no fetched detail at all can never be a proven YOURS — only an
+    /// explicitly unverified height match.
+    #[test]
+    fn mine_mark_downgrades_an_unfetched_height_match_to_unverified() {
+        let mut sealed = SealedBlocks::default();
+        sealed.record(100, "aa".repeat(32));
+
+        // Detail fetched, node-disclosed hash matches: the strongest proof.
+        assert_eq!(
+            sealed.mine_mark(100, true, Some(&"aa".repeat(32))),
+            MineMark::Hash
+        );
+        // Detail fetched, hash disclosed, no match: a same-height reorg
+        // replacement is NOT ours.
+        assert_eq!(
+            sealed.mine_mark(100, true, Some(&"bb".repeat(32))),
+            MineMark::No
+        );
+        // Detail fetched, node disclosed no hash: the documented
+        // accepted-height fallback still counts as proven.
+        assert_eq!(sealed.mine_mark(100, true, None), MineMark::Height);
+        assert_eq!(sealed.mine_mark(99, true, None), MineMark::No);
+        // Detail fetch FAILED: the hash is unknown, not undisclosed — the
+        // height match is only unverified, never a claimed win.
+        assert_eq!(
+            sealed.mine_mark(100, false, None),
+            MineMark::UnverifiedHeight
+        );
+        assert_eq!(sealed.mine_mark(99, false, None), MineMark::No);
+
+        // Wire mapping: only proven marks are `mine: true`; the basis tags
+        // are stable.
+        assert!(MineMark::Hash.proven());
+        assert!(MineMark::Height.proven());
+        assert!(!MineMark::UnverifiedHeight.proven());
+        assert!(!MineMark::No.proven());
+        assert_eq!(MineMark::Hash.basis(), Some("hash"));
+        assert_eq!(MineMark::Height.basis(), Some("height"));
+        assert_eq!(MineMark::UnverifiedHeight.basis(), Some("unverified"));
+        assert_eq!(MineMark::No.basis(), None);
+    }
+
+    /// F2 regression on the strip/graph substrate: an accepted height whose
+    /// detail was never fetched renders as an UNVERIFIED tile, while a
+    /// fetched block whose node disclosed no hash keeps the proven
+    /// height-fallback attribution.
+    #[test]
+    fn tiles_distinguish_unfetched_height_matches_from_undisclosed_hashes() {
+        let mut recent = RecentBlocks::default();
+        let mut sealed = SealedBlocks::default();
+        sealed.record(50, "aa".repeat(32));
+        sealed.record(49, "cc".repeat(32));
+
+        // Height 49 was fetched and the node disclosed NO hash (pre-upgrade
+        // node): the documented height fallback stays a proven YOURS.
+        recent.insert(
+            50,
+            49,
+            BlockInfo {
+                hash: None,
+                tx_count: Some(1),
+                timestamp_ms: None,
+            },
+        );
+        // Height 50 (also ours by height) was NEVER fetched: nothing
+        // corroborates the match, so it must be exactly Unverified.
+        let tiles = recent.tiles(50, &sealed);
+        assert_eq!(tiles[0].height, 50);
+        assert_eq!(tiles[0].mine, MineMark::UnverifiedHeight);
+        assert_eq!(tiles[1].height, 49);
+        assert_eq!(tiles[1].mine, MineMark::Height);
     }
 
     #[test]

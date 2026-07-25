@@ -908,7 +908,55 @@ struct BlockFlowTile {
     /// `None` renders as an explicit gap in the block-time graph — never an
     /// interpolated or carried-forward value.
     timestamp_ms: Option<u64>,
+    /// PROVEN yours per the engine (node-disclosed hash match, or accepted
+    /// height where the fetched detail disclosed no hash).
     mine: bool,
+    /// The engine's additive proof-basis tag: which attribution check
+    /// actually fired for this tile, so the GUI states exactly that instead
+    /// of claiming hash verification unconditionally.
+    mine_basis: Option<MineBasis>,
+}
+
+/// Parsed `mine_basis` tag of a `block_flow` tile / `chain_block` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MineBasis {
+    /// The node-disclosed block hash matched an accepted sealed hash.
+    Hash,
+    /// Detail fetched, node disclosed no hash; the accepted height matched.
+    Height,
+    /// No detail was available; a height match exists but is uncorroborated.
+    Unverified,
+}
+
+impl MineBasis {
+    fn parse(value: Option<&Value>) -> Option<Self> {
+        match value.and_then(Value::as_str) {
+            Some("hash") => Some(Self::Hash),
+            Some("height") => Some(Self::Height),
+            Some("unverified") => Some(Self::Unverified),
+            _ => None,
+        }
+    }
+}
+
+/// The attribution line of a block's tooltip/label: states exactly which
+/// proof fired — never an unconditional "hash-verified" claim.
+fn mine_attribution_line(mine: bool, basis: Option<MineBasis>) -> &'static str {
+    match (mine, basis) {
+        (true, Some(MineBasis::Hash)) => {
+            "★ YOURS — accepted submission; the node-disclosed block hash matches your sealed hash"
+        }
+        (true, Some(MineBasis::Height)) => {
+            "★ YOURS — accepted submission at this height; the node disclosed no block hash to compare"
+        }
+        (true, _) => {
+            "★ YOURS — accepted submission (node-disclosed hash match, or accepted height where the node discloses no hash)"
+        }
+        (false, Some(MineBasis::Unverified)) => {
+            "★? possibly yours — height matches your accepted submission, but no block detail was available to hash-check it"
+        }
+        _ => "Network block",
+    }
 }
 
 /// One projected pending block beyond the forming template: real
@@ -993,6 +1041,7 @@ impl BlockFlowView {
                                 tx_count: tile.get("tx_count").and_then(Value::as_u64),
                                 timestamp_ms: tile.get("timestamp_ms").and_then(Value::as_u64),
                                 mine: tile.get("mine").and_then(Value::as_bool).unwrap_or(false),
+                                mine_basis: MineBasis::parse(tile.get("mine_basis")),
                             })
                         })
                         .take(MAX_RECENT_TILES)
@@ -1027,8 +1076,11 @@ struct IntervalBar {
     /// The block's own miner-declared timestamp (ms), when disclosed.
     timestamp_ms: Option<u64>,
     tx_count: Option<u64>,
-    /// Marked on the existing accepted-submission proof standard only.
+    /// PROVEN yours per the accepted-submission standard only.
     mine: bool,
+    /// The proof basis that fired (see [`MineBasis`]); `Unverified` marks a
+    /// height match no fetched detail could corroborate.
+    mine_basis: Option<MineBasis>,
 }
 
 /// Derive block-time interval bars from one `block_flow` snapshot (`recent`
@@ -1064,6 +1116,7 @@ fn block_interval_bars(recent: &[BlockFlowTile]) -> Vec<IntervalBar> {
                 timestamp_ms: block.timestamp_ms,
                 tx_count: block.tx_count,
                 mine: block.mine,
+                mine_basis: block.mine_basis,
             })
         })
         .collect();
@@ -2514,21 +2567,45 @@ impl MinerApp {
             Some("chain_block") => {
                 if let Some(height) = value.get("height").and_then(Value::as_u64) {
                     let mine = value.get("mine").and_then(Value::as_bool).unwrap_or(false);
+                    // Additive engine fields: a failed detail fetch (hash
+                    // UNKNOWN, not undisclosed) and a height match the
+                    // failure left uncorroborated. Absent on older events —
+                    // then nothing extra is claimed either way.
+                    let fetch_failed = value
+                        .get("detail_fetch_failed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let unverified = value
+                        .get("mine_unverified")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     let hash = value
                         .get("hash")
                         .and_then(Value::as_str)
                         .map_or_else(String::new, |hash| {
                             format!(" | hash {}", bounded_text(hash, 24, "…", false))
                         });
+                    let detail = if fetch_failed {
+                        if unverified {
+                            " | detail fetch failed; hash unknown — height matches your \
+                             accepted submission but could not be hash-checked"
+                        } else {
+                            " | detail fetch failed; hash unknown"
+                        }
+                    } else {
+                        ""
+                    };
                     let tx_count = value
                         .get("tx_count")
                         .and_then(Value::as_u64)
                         .map_or_else(String::new, |count| format!(" | {count} tx"));
                     self.push_log(
                         format!(
-                            "{} height {height}{hash}{tx_count}",
+                            "{} height {height}{hash}{detail}{tx_count}",
                             if mine {
                                 "★ BLOCK FOUND (YOURS)"
+                            } else if unverified {
+                                "BLOCK FOUND (possibly YOURS — unverified)"
                             } else {
                                 "BLOCK FOUND (network)"
                             },
@@ -3571,13 +3648,27 @@ impl MinerApp {
                                     {
                                         let fade =
                                             (1.0 - index as f32 * 0.07).clamp(0.45, 1.0);
+                                        // "★ YOURS" only on the engine's
+                                        // PROVEN mark; a height match with
+                                        // no fetched detail to corroborate
+                                        // it is labeled unverified instead.
+                                        let unverified = !tile.mine
+                                            && tile.mine_basis == Some(MineBasis::Unverified);
                                         flow_block_tile(
                                             ui,
                                             &format!("#{}", tile.height),
                                             tile.tx_count,
-                                            if tile.mine { "★ YOURS" } else { "SEALED" },
+                                            if tile.mine {
+                                                "★ YOURS"
+                                            } else if unverified {
+                                                "★? UNVERIFIED"
+                                            } else {
+                                                "SEALED"
+                                            },
                                             if tile.mine {
                                                 GREEN
+                                            } else if unverified {
+                                                AMBER
                                             } else {
                                                 PURPLE.gamma_multiply(fade)
                                             },
@@ -3720,7 +3811,7 @@ impl MinerApp {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(
-                        "Bar height = interval between consecutive miner-declared header timestamps (sov_getBlockByHeight); reference lines are 1× and 2× the node's own targetBlockMs. '≤0' marks a real non-monotonic timestamp pair (miner-declared clocks, not wall time); '?' marks an interval the node did not disclose — gaps are never interpolated. ★ marks your accepted blocks (hash-proof standard).",
+                        "Bar height = interval between consecutive miner-declared header timestamps (sov_getBlockByHeight); reference lines are 1× and 2× the node's own targetBlockMs. '≤0' marks a real non-monotonic timestamp pair (miner-declared clocks, not wall time); '?' marks an interval the node did not disclose — gaps are never interpolated. ★ marks your accepted blocks: node-disclosed hash match, or accepted height when the node discloses no hash; ★? marks a height match the miner could not hash-check because no block detail was available.",
                     )
                     .size(9.0)
                     .color(MUTED),
@@ -4545,6 +4636,16 @@ fn block_time_chart(ui: &mut egui::Ui, bars: &[IntervalBar], target_block_ms: Op
                 FontId::proportional(9.0),
                 GREEN,
             );
+        } else if bar.mine_basis == Some(MineBasis::Unverified) {
+            // A height match no fetched detail could corroborate: a
+            // distinct, explicitly tentative marker — never the plain ★.
+            painter.text(
+                egui::pos2(center_x, marker_top - 1.0),
+                egui::Align2::CENTER_BOTTOM,
+                "★?",
+                FontId::proportional(9.0),
+                AMBER,
+            );
         }
 
         let mut tooltip = format!("Block #{}", bar.height);
@@ -4573,11 +4674,8 @@ fn block_time_chart(ui: &mut egui::Ui, bars: &[IntervalBar], target_block_ms: Op
         if let Some(tx_count) = bar.tx_count {
             tooltip.push_str(&format!("\n{tx_count} transaction(s)"));
         }
-        tooltip.push_str(if bar.mine {
-            "\n★ YOURS — accepted submission, hash-verified"
-        } else {
-            "\nNetwork block"
-        });
+        tooltip.push('\n');
+        tooltip.push_str(mine_attribution_line(bar.mine, bar.mine_basis));
         ui.interact(
             egui::Rect::from_min_max(egui::pos2(left, plot_top), egui::pos2(right, plot_bottom)),
             ui.id().with(("block-time-bar", bar.height)),
@@ -5327,6 +5425,7 @@ mod tests {
             tx_count,
             timestamp_ms,
             mine,
+            mine_basis: if mine { Some(MineBasis::Hash) } else { None },
         }
     }
 
@@ -5424,6 +5523,7 @@ mod tests {
                 timestamp_ms: None,
                 tx_count: None,
                 mine: false,
+                mine_basis: None,
             },
             IntervalBar {
                 height: 2,
@@ -5431,6 +5531,7 @@ mod tests {
                 timestamp_ms: None,
                 tx_count: None,
                 mine: false,
+                mine_basis: None,
             },
             IntervalBar {
                 height: 3,
@@ -5438,6 +5539,7 @@ mod tests {
                 timestamp_ms: None,
                 tx_count: None,
                 mine: false,
+                mine_basis: None,
             },
             IntervalBar {
                 height: 4,
@@ -5445,6 +5547,7 @@ mod tests {
                 timestamp_ms: None,
                 tx_count: None,
                 mine: false,
+                mine_basis: None,
             },
         ];
         let stats = interval_window_stats(&bars).expect("known intervals exist");
@@ -5460,6 +5563,7 @@ mod tests {
                 timestamp_ms: None,
                 tx_count: None,
                 mine: false,
+                mine_basis: None,
             }]),
             None,
             "an all-unknown window has no statistic, not a fabricated one"
@@ -5537,6 +5641,59 @@ mod tests {
         }));
         assert_eq!(view.recent[0].timestamp_ms, None);
         assert!(view.recent[0].mine);
+        // Older engines carry no basis tag: parsed as None, no extra claim.
+        assert_eq!(view.recent[0].mine_basis, None);
+    }
+
+    /// F1/F2 regression: the tile proof-basis tag parses strictly and each
+    /// attribution line states exactly the proof that fired — never an
+    /// unconditional "hash-verified" claim, and never an unqualified YOURS
+    /// for an uncorroborated height match.
+    #[test]
+    fn mine_basis_parses_strictly_and_attribution_lines_state_the_real_proof() {
+        let view = BlockFlowView::from_telemetry(&json!({
+            "recent": [
+                {"height": 12, "mine": true, "mine_basis": "hash"},
+                {"height": 11, "mine": true, "mine_basis": "height"},
+                {"height": 10, "mine": false, "mine_basis": "unverified"},
+                {"height": 9, "mine": false, "mine_basis": null},
+                {"height": 8, "mine": false, "mine_basis": "bogus"},
+            ],
+        }));
+        assert_eq!(view.recent[0].mine_basis, Some(MineBasis::Hash));
+        assert_eq!(view.recent[1].mine_basis, Some(MineBasis::Height));
+        assert_eq!(view.recent[2].mine_basis, Some(MineBasis::Unverified));
+        assert_eq!(view.recent[3].mine_basis, None);
+        assert_eq!(view.recent[4].mine_basis, None, "unknown tags are dropped");
+
+        assert_eq!(
+            mine_attribution_line(true, Some(MineBasis::Hash)),
+            "★ YOURS — accepted submission; the node-disclosed block hash matches your sealed hash"
+        );
+        assert_eq!(
+            mine_attribution_line(true, Some(MineBasis::Height)),
+            "★ YOURS — accepted submission at this height; the node disclosed no block hash to compare"
+        );
+        // Basis missing (older engine event): state the standard, never a
+        // stronger per-block claim than the data carries.
+        assert_eq!(
+            mine_attribution_line(true, None),
+            "★ YOURS — accepted submission (node-disclosed hash match, or accepted height where the node discloses no hash)"
+        );
+        let unverified = mine_attribution_line(false, Some(MineBasis::Unverified));
+        assert!(unverified.starts_with("★? possibly yours"));
+        assert!(!unverified.contains("hash-verified"));
+        assert_eq!(mine_attribution_line(false, None), "Network block");
+        // No attribution line anywhere claims unconditional verification.
+        for (mine, basis) in [
+            (true, Some(MineBasis::Hash)),
+            (true, Some(MineBasis::Height)),
+            (true, None),
+            (false, Some(MineBasis::Unverified)),
+            (false, None),
+        ] {
+            assert!(!mine_attribution_line(mine, basis).contains("hash-verified"));
+        }
     }
 
     #[test]
@@ -5596,6 +5753,43 @@ mod tests {
         let yours_line = &app.logs.back().expect("yours block line").text;
         assert!(yours_line.starts_with("★ BLOCK FOUND (YOURS) height 11521"));
         assert!(!yours_line.contains("hash"), "undisclosed fields omitted");
+
+        // F2 regression: a failed detail fetch that left a height match
+        // uncorroborated is qualified — never an unqualified ★ YOURS, and
+        // never blamed on the node withholding the hash.
+        app.apply_telemetry(&json!({
+            "event": "chain_block",
+            "height": 11_522,
+            "hash": null,
+            "tx_count": null,
+            "mine": false,
+            "detail_fetch_failed": true,
+            "mine_unverified": true,
+        }));
+        let unverified_line = &app.logs.back().expect("unverified block line").text;
+        assert!(
+            unverified_line.starts_with("BLOCK FOUND (possibly YOURS — unverified) height 11522")
+        );
+        assert!(unverified_line.contains("detail fetch failed"));
+        assert!(unverified_line.contains("could not be hash-checked"));
+        assert!(!unverified_line.contains("★ BLOCK FOUND (YOURS)"));
+        assert!(!unverified_line.contains("not disclosed"));
+
+        // A failed fetch on a network block states the failure plainly.
+        app.apply_telemetry(&json!({
+            "event": "chain_block",
+            "height": 11_523,
+            "hash": null,
+            "tx_count": null,
+            "mine": false,
+            "detail_fetch_failed": true,
+            "mine_unverified": false,
+        }));
+        let failed_line = &app.logs.back().expect("failed fetch line").text;
+        assert_eq!(
+            failed_line,
+            "BLOCK FOUND (network) height 11523 | detail fetch failed; hash unknown"
+        );
 
         app.apply_telemetry(&json!({
             "event": "chain_gap",
@@ -6831,20 +7025,23 @@ mod tests {
                     height: 42,
                     tx_count: Some(3),
                     timestamp_ms: None,
-                    mine: true
+                    mine: true,
+                    mine_basis: None
                 },
                 // Unknown counts remain None (rendered "—"), never invented.
                 BlockFlowTile {
                     height: 41,
                     tx_count: None,
                     timestamp_ms: None,
-                    mine: false
+                    mine: false,
+                    mine_basis: None
                 },
                 BlockFlowTile {
                     height: 40,
                     tx_count: None,
                     timestamp_ms: None,
-                    mine: false
+                    mine: false,
+                    mine_basis: None
                 },
                 // A tile without a real height is dropped, not fabricated.
             ]

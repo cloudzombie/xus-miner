@@ -2,6 +2,41 @@
 
 ## 0.1.6
 
+- **Feed/graph honesty fixes from an independent adversarial audit** (found
+  against this release's own feature set, fixed before release):
+  - A FAILED per-block detail fetch (timeout or budget exhaustion) is now
+    kept distinct from a node that discloses no block hash. Previously the
+    feed line claimed "hash not disclosed by node" for a mere fetch failure,
+    and the accepted-height fallback could print an unqualified
+    "★ BLOCK FOUND (YOURS)" for a same-height block the miner could not
+    hash-check — most likely exactly when the node is busy. Now the line
+    reads "detail fetch failed this cycle; hash unknown", and an
+    uncorroborated height match is worded
+    "BLOCK FOUND (possibly YOURS — unverified) … height matches your
+    accepted submission but could not be hash-checked" on stderr, in the GUI
+    log, and in the GUI strip/graph (an amber "★?"/UNVERIFIED marker instead
+    of the green ★). The `chain_block` JSON event gains ADDITIVE fields
+    `detail_fetch_failed`, `mine_unverified`, and `mine_basis`
+    ("hash"/"height"/"unverified"/null); `block_flow` tiles gain
+    `mine_basis`. No existing event field changed name, type, presence, or
+    meaning; `mine` remains "proven yours per the accepted-submission
+    standard".
+  - Two GUI strings claimed a stronger proof than the code performs (the
+    bar tooltip said "hash-verified" and the graph footer said "hash-proof
+    standard" unconditionally, although against pre-upgrade nodes the
+    documented accepted-height fallback is the path that fires). Both now
+    state the real standard, and the tooltip states per bar which proof
+    actually applied.
+  - Documented the accepted `MAX_REPORTED_TRACKED = 64` limit (a >64-deep
+    reorg can re-announce pruned heights on re-advance; bounded memory is
+    preferred and nothing is misattributed) and corrected two loose
+    documentation claims: the tip detector runs in the template-refresh
+    branch (which every tip change forces), and the real per-refresh
+    detail-RPC worst case is 4 backfill + 4 feed = 8 bounded calls.
+  - New deterministic integration coverage: a real end-to-end reorg through
+    the mock node (tip regression + hash swap ⇒ exactly one `chain_reorg`,
+    never a duplicate `chain_block`) and a forced detail-fetch failure
+    (never an unqualified YOURS, never a false "hash not disclosed" claim).
 - **Block-time graph** (the release centerpiece): a new GUI card plots the
   interval between each confirmed block's miner-declared header timestamp
   and its parent's (`sov_getBlockByHeight` `header.timestamp_ms`,
@@ -15,8 +50,10 @@
     the node did not disclose renders as a hollow "?" gap (never
     interpolated or carried forward). Both cases are unit-tested.
   - Your accepted blocks are marked by the ★ shape (not hue alone) on the
-    existing sealed-hash proof standard; bar-height-vs-reference-line is the
-    primary encoding, colour is secondary.
+    accepted-submission proof standard (node-disclosed hash match, else
+    accepted height where the node discloses no hash);
+    bar-height-vs-reference-line is the primary encoding, colour is
+    secondary.
   - Stable axis (next 1/2/5×10ⁿ ceiling), monospace numerics, per-bar
     tooltips limited to node-supplied fields (height, interval, declared
     timestamp, tx count, yours/network), a rolling window median/mean over

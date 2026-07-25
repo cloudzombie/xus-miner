@@ -1175,29 +1175,44 @@ fn short_hash(hash: &str) -> String {
 /// The human-readable network-block-feed line (without its timestamp
 /// prefix). Every field is a real node value: the height from `sov_health`,
 /// the hash and transaction count from `sov_getBlockByHeight` when the node
-/// disclosed them, and the YOURS marker only on the existing accepted-
-/// submission proof standard (hash match, or accepted height where the node
-/// discloses no hash).
+/// disclosed them, and an unqualified ★ YOURS only on a PROVEN
+/// accepted-submission mark (hash match, or accepted height where the
+/// fetched detail disclosed no hash). `detail_fetched` keeps two states the
+/// old line conflated apart: a failed detail fetch says so — it never
+/// claims "hash not disclosed by node", and any height match it leaves
+/// uncorroborated is worded as possibly-yours-unverified, never as a win.
 fn chain_block_log_line(
     height: u64,
+    detail_fetched: bool,
     hash: Option<&str>,
     tx_count: Option<u64>,
-    mine: bool,
+    mark: blockflow::MineMark,
 ) -> String {
     let mut line = format!(
         "{} height {height}",
-        if mine {
+        if mark.proven() {
             "★ BLOCK FOUND (YOURS)"
+        } else if mark == blockflow::MineMark::UnverifiedHeight {
+            "BLOCK FOUND (possibly YOURS — unverified)"
         } else {
             "BLOCK FOUND (network)"
         }
     );
-    match hash {
-        Some(hash) => {
-            line.push_str(" | hash ");
-            line.push_str(&short_hash(hash));
+    if detail_fetched {
+        match hash {
+            Some(hash) => {
+                line.push_str(" | hash ");
+                line.push_str(&short_hash(hash));
+            }
+            None => line.push_str(" | hash not disclosed by node"),
         }
-        None => line.push_str(" | hash not disclosed by node"),
+    } else {
+        line.push_str(" | detail fetch failed this cycle; hash unknown");
+        if mark == blockflow::MineMark::UnverifiedHeight {
+            line.push_str(
+                " — height matches your accepted submission but could not be hash-checked",
+            );
+        }
     }
     if let Some(tx_count) = tx_count {
         line.push_str(&format!(" | {tx_count} tx"));
@@ -1496,8 +1511,10 @@ fn run_rpc_session(
                         // Bounded by construction: at most MAX_GAP_BLOCKS
                         // detail fetches, one second each, under one shared
                         // wall-clock budget. A failed fetch still reports the
-                        // block (its height is real sov_health data) with the
-                        // undisclosed fields omitted — never invented.
+                        // block (its height is real sov_health data) with
+                        // every surface saying the fetch FAILED — which is
+                        // not the same thing as the node disclosing no hash,
+                        // and never silently upgrades a height match.
                         let feed_deadline = Instant::now() + Duration::from_secs(2);
                         for height in report {
                             let block = (Instant::now() < feed_deadline)
@@ -1511,6 +1528,12 @@ fn run_rpc_session(
                                     .ok()
                                 })
                                 .flatten();
+                            // Whether this block's detail was actually
+                            // retrieved this cycle. When false, `hash` is
+                            // UNKNOWN (fetch failed or budget exhausted) —
+                            // distinct from a fetched block whose node
+                            // disclosed no hash.
+                            let detail_fetched = block.is_some();
                             let hash = block.as_ref().and_then(blockflow::block_hash);
                             let tx_count = block.as_ref().and_then(blockflow::tx_count);
                             let timestamp_ms =
@@ -1533,20 +1556,24 @@ fn run_rpc_session(
                                 .record_reported(height, hash.as_deref());
                             match record {
                                 blockflow::BlockRecord::New => {
-                                    // YOURS only on the existing proof
+                                    // Unqualified YOURS only on the PROVEN
                                     // standard: accepted-submission hash
                                     // match, or accepted height where the
-                                    // node discloses no block hash.
-                                    let mine = state
+                                    // fetched detail disclosed no hash. A
+                                    // failed detail fetch leaves the hash
+                                    // unknown, so a height match is at most
+                                    // possibly-yours-unverified.
+                                    let mark = state
                                         .sealed_blocks
                                         .lock()
                                         .expect("sealed blocks lock")
-                                        .sealed(height, hash.as_deref());
+                                        .mine_mark(height, detail_fetched, hash.as_deref());
                                     let line = chain_block_log_line(
                                         height,
+                                        detail_fetched,
                                         hash.as_deref(),
                                         tx_count,
-                                        mine,
+                                        mark,
                                     );
                                     eprintln!("[{}] {line}", diag::timestamp_utc());
                                     diag::info(&line);
@@ -1556,7 +1583,17 @@ fn run_rpc_session(
                                         "hash": hash,
                                         "tx_count": tx_count,
                                         "timestamp_ms": timestamp_ms,
-                                        "mine": mine,
+                                        "mine": mark.proven(),
+                                        // Additive fields (existing fields
+                                        // above keep their exact meaning):
+                                        // the failed-fetch/undisclosed-hash
+                                        // distinction, an explicit
+                                        // unverified height match, and the
+                                        // proof basis that actually fired.
+                                        "detail_fetch_failed": !detail_fetched,
+                                        "mine_unverified": mark
+                                            == blockflow::MineMark::UnverifiedHeight,
+                                        "mine_basis": mark.basis(),
                                     }));
                                 }
                                 blockflow::BlockRecord::Reorg { previous_hash } => {
@@ -1653,7 +1690,15 @@ fn run_rpc_session(
                                 // the node disclosed it; the GUI's block-time
                                 // graph renders `null` as an explicit gap.
                                 "timestamp_ms": tile.timestamp_ms,
-                                "mine": tile.mine,
+                                // `mine` keeps its meaning: PROVEN yours
+                                // (hash match, or accepted height where the
+                                // fetched detail disclosed no hash). The
+                                // additive `mine_basis` says which proof
+                                // fired — "hash", "height", or
+                                // "unverified" for a height match with no
+                                // fetched detail to corroborate it.
+                                "mine": tile.mine.proven(),
+                                "mine_basis": tile.mine.basis(),
                             }))
                             .collect::<Vec<_>>(),
                     })
@@ -2752,20 +2797,72 @@ System-wide memory free percentage: 62%
 
     #[test]
     fn chain_block_feed_lines_are_exact_and_never_upgrade_to_yours() {
+        use crate::blockflow::MineMark;
         assert_eq!(
-            chain_block_log_line(11_520, Some(&"00891519a548c92a".repeat(4)), Some(3), false),
+            chain_block_log_line(
+                11_520,
+                true,
+                Some(&"00891519a548c92a".repeat(4)),
+                Some(3),
+                MineMark::No
+            ),
             "BLOCK FOUND (network) height 11520 | hash 00891519a548c92a… | 3 tx"
         );
         assert_eq!(
-            chain_block_log_line(11_520, Some("00891519a548c92a"), Some(3), true),
+            chain_block_log_line(
+                11_520,
+                true,
+                Some("00891519a548c92a"),
+                Some(3),
+                MineMark::Hash
+            ),
             "★ BLOCK FOUND (YOURS) height 11520 | hash 00891519a548c92a | 3 tx"
         );
         // Fields the node did not disclose are omitted or stated as
-        // undisclosed — never guessed.
+        // undisclosed — never guessed. This wording is reserved for a
+        // FETCHED block: only then is "not disclosed" a fact about the node.
         assert_eq!(
-            chain_block_log_line(9, None, None, false),
+            chain_block_log_line(9, true, None, None, MineMark::No),
             "BLOCK FOUND (network) height 9 | hash not disclosed by node"
         );
+        // The documented pre-upgrade fallback: detail fetched, no hash
+        // disclosed, accepted height matched — a proven YOURS.
+        assert_eq!(
+            chain_block_log_line(9, true, None, None, MineMark::Height),
+            "★ BLOCK FOUND (YOURS) height 9 | hash not disclosed by node"
+        );
+    }
+
+    /// F2 regression (audit v0.1.6): a FAILED detail fetch is not "the node
+    /// disclosed no hash". The line must state the failure, and a height
+    /// match it could not corroborate must never print an unqualified
+    /// ★ YOURS.
+    #[test]
+    fn chain_block_feed_lines_state_a_failed_fetch_and_qualify_the_height_match() {
+        use crate::blockflow::MineMark;
+        let unverified =
+            chain_block_log_line(11_520, false, None, None, MineMark::UnverifiedHeight);
+        assert_eq!(
+            unverified,
+            "BLOCK FOUND (possibly YOURS — unverified) height 11520 | detail fetch failed \
+             this cycle; hash unknown — height matches your accepted submission but could \
+             not be hash-checked"
+        );
+        assert!(
+            !unverified.contains("not disclosed"),
+            "a failed fetch must never be blamed on the node withholding the hash"
+        );
+        assert!(
+            !unverified.contains("★ BLOCK FOUND (YOURS)"),
+            "an uncorroborated height match must never print an unqualified YOURS"
+        );
+
+        let network = chain_block_log_line(11_521, false, None, None, MineMark::No);
+        assert_eq!(
+            network,
+            "BLOCK FOUND (network) height 11521 | detail fetch failed this cycle; hash unknown"
+        );
+        assert!(!network.contains("not disclosed"));
     }
 
     #[test]
