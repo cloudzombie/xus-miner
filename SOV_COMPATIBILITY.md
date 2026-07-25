@@ -44,6 +44,46 @@ The connected SOV node normally listens on TCP port `8645`. The miner uses:
 - `sov_getPeerInfo` — optional dashboard enrichment. Only the authenticated
   integer `peers` count is displayed; addresses and versions are not retained.
   Failure clears the chip to unavailable and never blocks job installation.
+- `sov_getBlockByHeight` — optional, read-only, named params
+  (`{"height": N}`); supplies confirmed-block detail for the block-flow
+  strip, the network block feed, and the block-time graph: the
+  `transactions`/`txIds` count, the miner-declared `header.timestamp_ms`
+  (integer milliseconds; live-verified — the camelCase `timestampMs` is
+  accepted equivalently), and, on upgraded nodes, `header.hash`. Absent
+  fields render as explicit placeholders/gaps; nothing is interpolated.
+- `sov_getMempoolSize`, `sov_estimateFee`, `sov_getMempoolHistogram` —
+  optional dashboard/strip enrichment (live-verified shapes; the histogram is
+  an upgraded-node addition). All fail soft to honest placeholders.
+
+### Network block feed and block-time graph
+
+Every required `sov_health` poll (one per ~2-second cycle) reads the tip
+height; the tip-advance detector itself runs inside the template-refresh
+branch — entered on session start, whenever the tip height changed since the
+last refresh, and at latest every 30 seconds. Because any tip change forces
+that branch, every tip movement is observed; an unchanged tip is simply a
+no-op for the feed either way. Each block that appears on the network
+produces one timestamped stderr line, one stable `chain_block` JSON event,
+and one GUI log entry, marked YOURS strictly on the accepted-submission
+proof standard (exact sealed-hash match, or the accepted height where the
+FETCHED block detail discloses no hash). A per-block detail fetch that fails
+or misses its budget is a distinct third state: the hash is then unknown —
+not "undisclosed by the node" — so every surface says the fetch failed, and
+a height match the failure left uncorroborated is reported as
+possibly-yours-unverified, never as an unqualified YOURS. The `chain_block`
+event carries that distinction in additive fields (`detail_fetch_failed`,
+`mine_unverified`, `mine_basis`) without changing any pre-existing field;
+`block_flow` tiles likewise add `mine_basis`. Detail comes only from bounded
+`sov_getBlockByHeight` calls: at most `MAX_GAP_BLOCKS` (4) per tip advance
+under a wall-clock budget for the feed, plus at most 4 strip-backfill calls
+per refresh — a bounded worst case of 8 detail calls per template refresh. A
+larger jump is summarized explicitly ("… and N more") instead of flooding
+lines or RPCs.
+Session start or reconnect announces a single baseline and never replays
+chain history. The block-time graph derives every bar from consecutive
+miner-declared `header.timestamp_ms` values and reference-marks plain
+multiples of the node-supplied `targetBlockMs`; no cadence is hardcoded and
+no SOV consensus rule is encoded in this client.
 
 The miner decodes the canonical Borsh header and refuses to hash when the RPC
 height, timestamp, proposer, template ID, nonce position, algorithm, or target
@@ -71,3 +111,8 @@ A variable-difficulty share target is not a consensus block target. Block ETA
 and round probability remain unavailable unless the bridge separately supplies
 `network_target_full` or `network_target`. A pool-accepted share must never be
 presented as proof that this miner found a network block.
+
+Pool mode has no direct node RPC, so the network block feed and block-time
+graph are unavailable there: the client says so explicitly (one
+`chain_feed_unavailable` event and log line per session) rather than
+presenting pool shares as network blocks.

@@ -98,14 +98,14 @@ jobs:
         if: matrix.os == 'windows-2025' || matrix.os == 'macos-15'
         timeout-minutes: 15
         run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_stability_window -- --ignored --test-threads=1
-      - name: Soak one-worker optimized RandomX recovery for 90 seconds (Windows)
-        if: matrix.os == 'windows-2025'
+      - name: Soak one-worker optimized RandomX recovery for 90 seconds (Windows and Apple Silicon)
+        if: matrix.os == 'windows-2025' || matrix.os == 'macos-15'
         timeout-minutes: 15
         env:
           XUS_TEST_RANDOMX_ONE_WORKER: "1"
         run: cargo test --locked --release --test rpc_0199_protocol headless_randomx_direct_rpc_engine_stays_alive_for_stability_window -- --ignored --test-threads=1
-      - name: Soak one-worker light-memory RandomX recovery for 90 seconds (Windows)
-        if: matrix.os == 'windows-2025'
+      - name: Soak one-worker light-memory RandomX recovery for 90 seconds (Windows and Apple Silicon)
+        if: matrix.os == 'windows-2025' || matrix.os == 'macos-15'
         timeout-minutes: 15
         env:
           XUS_TEST_RANDOMX_LIGHT: "1"

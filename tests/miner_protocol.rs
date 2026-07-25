@@ -224,22 +224,36 @@ fn external_process_logs_in_hashes_and_submits_a_valid_share() {
     let submit = read_submit_for(&mut reader, "integration-job");
     assert_valid_submit(&submit, "integration-job", &blob);
 
-    let mut event_names = Vec::new();
-    for _ in 0..4 {
-        let event = telemetry_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("GUI telemetry event");
-        event_names.push(
-            event["event"]
-                .as_str()
-                .expect("telemetry event name")
-                .to_owned(),
+    let mut events = Vec::new();
+    for _ in 0..5 {
+        events.push(
+            telemetry_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("GUI telemetry event"),
         );
     }
+    let event_names: Vec<&str> = events
+        .iter()
+        .map(|event| event["event"].as_str().expect("telemetry event name"))
+        .collect();
+    // Pool mode degrades the network block feed EXPLICITLY: a pool discloses
+    // shares, not network blocks, and no share is ever presented as one.
     assert_eq!(
         event_names,
-        ["startup", "connecting", "pool_connected", "job"]
+        [
+            "startup",
+            "connecting",
+            "pool_connected",
+            "chain_feed_unavailable",
+            "job"
+        ]
     );
+    let feed_unavailable = &events[3];
+    assert_eq!(feed_unavailable["reason"], json!("stratum"));
+    assert!(feed_unavailable["message"]
+        .as_str()
+        .expect("degradation message")
+        .contains("pool discloses shares, not network blocks"));
     let worker_ready = loop {
         let event = telemetry_rx
             .recv_timeout(Duration::from_secs(2))

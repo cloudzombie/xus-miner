@@ -167,6 +167,19 @@ fn format_utc(unix_millis: u128) -> String {
     )
 }
 
+/// Current UTC timestamp in the same format the diagnostic log uses, for
+/// caller-visible timestamped lines (e.g. the network block feed on stderr).
+pub(crate) fn timestamp_utc() -> String {
+    now_utc()
+}
+
+/// Render a node-supplied unix-milliseconds timestamp as UTC text, for
+/// read-only displays (e.g. block-time graph tooltips). Display only; never
+/// fed back into any protocol path.
+pub(crate) fn format_utc_millis(unix_millis: u64) -> String {
+    format_utc(u128::from(unix_millis))
+}
+
 fn now_utc() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
