@@ -904,6 +904,10 @@ struct MeterSample {
 struct BlockFlowTile {
     height: u64,
     tx_count: Option<u64>,
+    /// Miner-declared header timestamp (ms) when the node disclosed it;
+    /// `None` renders as an explicit gap in the block-time graph — never an
+    /// interpolated or carried-forward value.
+    timestamp_ms: Option<u64>,
     mine: bool,
 }
 
@@ -939,6 +943,15 @@ const MAX_FLOW_TILES: usize = 12;
 /// Bound on rendered projected pending tiles (the engine already merges the
 /// packing tail into its last projected block).
 const MAX_PROJECTED_FLOW_TILES: usize = 6;
+/// Bound on retained recent-block entries from one `block_flow` event: the
+/// engine's window (33) plus slack, so a malformed or hostile event can never
+/// grow GUI memory. The strip still renders at most `MAX_FLOW_TILES` tiles;
+/// the block-time graph consumes up to `BLOCK_TIME_GRAPH_BARS` intervals.
+const MAX_RECENT_TILES: usize = 40;
+/// Bars in the block-time graph: one fewer than the engine's 33-block window
+/// (each bar needs its parent's timestamp), a bounded newest-right view of
+/// roughly the last 80 minutes at the mainnet's 2.5-minute cadence.
+const BLOCK_TIME_GRAPH_BARS: usize = 32;
 
 impl BlockFlowView {
     fn from_telemetry(value: &Value) -> Self {
@@ -978,14 +991,156 @@ impl BlockFlowView {
                             Some(BlockFlowTile {
                                 height: tile.get("height").and_then(Value::as_u64)?,
                                 tx_count: tile.get("tx_count").and_then(Value::as_u64),
+                                timestamp_ms: tile.get("timestamp_ms").and_then(Value::as_u64),
                                 mine: tile.get("mine").and_then(Value::as_bool).unwrap_or(false),
                             })
                         })
-                        .take(MAX_FLOW_TILES)
+                        .take(MAX_RECENT_TILES)
                         .collect()
                 })
                 .unwrap_or_default(),
         }
+    }
+}
+
+/// Truthful state of the big HASHRATE card (see `headline_hashrate`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HashrateReadout {
+    Live(f64),
+    /// The engine is running but its telemetry went silent; the last value
+    /// is shown explicitly marked stale, muted, never as a live number.
+    Stale(f64),
+    Offline,
+}
+
+/// One bar of the block-time graph: the interval between a block's
+/// miner-declared header timestamp and its parent's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IntervalBar {
+    height: u64,
+    /// `timestamp_ms[height] − timestamp_ms[height−1]`. Zero or negative is
+    /// a REAL pair of non-monotonic miner-declared timestamps and is shown
+    /// as a distinct marker, never clamped or dropped. `None` means the node
+    /// did not disclose one of the two timestamps: an explicit gap, never an
+    /// interpolated, estimated, or carried-forward value.
+    interval_ms: Option<i64>,
+    /// The block's own miner-declared timestamp (ms), when disclosed.
+    timestamp_ms: Option<u64>,
+    tx_count: Option<u64>,
+    /// Marked on the existing accepted-submission proof standard only.
+    mine: bool,
+}
+
+/// Derive block-time interval bars from one `block_flow` snapshot (`recent`
+/// is newest-first with contiguous heights). Output is oldest-left,
+/// newest-right, bounded to `BLOCK_TIME_GRAPH_BARS`. Deriving from the latest
+/// snapshot alone means a reorg that rewrites a height simply re-derives that
+/// bar — corrected, never duplicated — and the paint path shares no mutable
+/// state with the telemetry thread.
+fn block_interval_bars(recent: &[BlockFlowTile]) -> Vec<IntervalBar> {
+    let mut bars: Vec<IntervalBar> = recent
+        .windows(2)
+        .filter_map(|pair| {
+            let (block, parent) = (&pair[0], &pair[1]);
+            // Defensive: only a true parent (height − 1) forms an interval.
+            if parent.height.checked_add(1) != Some(block.height) {
+                return None;
+            }
+            let interval_ms = match (block.timestamp_ms, parent.timestamp_ms) {
+                (Some(this), Some(previous)) => {
+                    let difference = i128::from(this) - i128::from(previous);
+                    // Saturate an absurd (hostile) span instead of wrapping.
+                    Some(i64::try_from(difference).unwrap_or(if difference > 0 {
+                        i64::MAX
+                    } else {
+                        i64::MIN
+                    }))
+                }
+                _ => None,
+            };
+            Some(IntervalBar {
+                height: block.height,
+                interval_ms,
+                timestamp_ms: block.timestamp_ms,
+                tx_count: block.tx_count,
+                mine: block.mine,
+            })
+        })
+        .collect();
+    bars.reverse(); // oldest → newest, newest-right
+    if bars.len() > BLOCK_TIME_GRAPH_BARS {
+        let excess = bars.len() - BLOCK_TIME_GRAPH_BARS;
+        bars.drain(..excess); // keep the newest window
+    }
+    bars
+}
+
+/// Snap a milliseconds ceiling to the next 1/2/5×10ⁿ stop at or above
+/// `max_ms` (minimum one second), so the y-axis moves between stable stops
+/// instead of rescaling continuously as bars enter and leave the window.
+fn nice_ceiling_ms(max_ms: i64) -> i64 {
+    let target = max_ms.max(1_000);
+    let mut magnitude: i64 = 1_000;
+    loop {
+        for multiplier in [1_i64, 2, 5] {
+            let candidate = magnitude.saturating_mul(multiplier);
+            if candidate >= target {
+                return candidate;
+            }
+        }
+        magnitude = magnitude.saturating_mul(10);
+        if magnitude >= i64::MAX / 10 {
+            return i64::MAX;
+        }
+    }
+}
+
+/// Median and mean of the KNOWN intervals in the visible window. Unknown
+/// intervals are excluded rather than substituted (which would fabricate
+/// data); the rendered label states the known/total counts so the exclusion
+/// is visible. Zero and negative intervals are real declared values and are
+/// included. `None` when no interval in the window is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntervalWindowStats {
+    median_ms: i64,
+    mean_ms: i64,
+    known: usize,
+    total: usize,
+}
+
+fn interval_window_stats(bars: &[IntervalBar]) -> Option<IntervalWindowStats> {
+    let mut known: Vec<i64> = bars.iter().filter_map(|bar| bar.interval_ms).collect();
+    if known.is_empty() {
+        return None;
+    }
+    known.sort_unstable();
+    let middle = known.len() / 2;
+    let median_ms = if known.len() % 2 == 1 {
+        known[middle]
+    } else {
+        ((i128::from(known[middle - 1]) + i128::from(known[middle])) / 2) as i64
+    };
+    let mean_ms =
+        (known.iter().map(|value| i128::from(*value)).sum::<i128>() / known.len() as i128) as i64;
+    Some(IntervalWindowStats {
+        median_ms,
+        mean_ms,
+        known: known.len(),
+        total: bars.len(),
+    })
+}
+
+/// Human-readable signed millisecond interval ("2m 24s", "45s", "0s",
+/// "−12s") for the block-time graph's monospace readouts.
+fn format_signed_ms(ms: i64) -> String {
+    let sign = if ms < 0 { "−" } else { "" };
+    let seconds = ms.unsigned_abs() / 1_000;
+    if seconds < 60 {
+        format!("{sign}{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{sign}{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{sign}{}h {:02}m", seconds / 3_600, seconds / 60 % 60)
     }
 }
 
@@ -1041,6 +1196,12 @@ struct MinerApp {
     mempool_size: Option<u64>,
     peer_count: Option<u64>,
     block_flow: Option<BlockFlowView>,
+    /// Highest tip height seen in `block_flow` telemetry this session.
+    observed_tip_height: Option<u64>,
+    /// LOCAL observation clock: when this miner observed the tip advance —
+    /// deliberately not the miner-declared block timestamp, and labeled as
+    /// such wherever it is rendered.
+    tip_observed_at: Option<Instant>,
     meter_history: VecDeque<MeterSample>,
     last_metrics_at: Option<Instant>,
     ready_workers: u64,
@@ -1112,6 +1273,8 @@ impl Default for MinerApp {
             mempool_size: None,
             peer_count: None,
             block_flow: None,
+            observed_tip_height: None,
+            tip_observed_at: None,
             meter_history: VecDeque::new(),
             last_metrics_at: None,
             ready_workers: 0,
@@ -1307,6 +1470,8 @@ impl MinerApp {
         self.mempool_size = None;
         self.peer_count = None;
         self.block_flow = None;
+        self.observed_tip_height = None;
+        self.tip_observed_at = None;
         self.meter_history.clear();
         self.last_metrics_at = None;
         self.ready_workers = 0;
@@ -2324,7 +2489,92 @@ impl MinerApp {
                 self.peer_count = next;
             }
             Some("block_flow") => {
-                self.block_flow = Some(BlockFlowView::from_telemetry(value));
+                let flow = BlockFlowView::from_telemetry(value);
+                // Local observation clock for "since last block": advance it
+                // only when this miner OBSERVES a higher tip. It is never
+                // derived from miner-declared block timestamps.
+                if let Some(tip) = flow.tip_height {
+                    if self.observed_tip_height.is_none_or(|seen| tip > seen) {
+                        self.observed_tip_height = Some(tip);
+                        self.tip_observed_at = Some(Instant::now());
+                    }
+                }
+                self.block_flow = Some(flow);
+            }
+            Some("chain_baseline") => {
+                if let Some(height) = value.get("height").and_then(Value::as_u64) {
+                    self.push_log(
+                        format!(
+                            "Block feed live at chain height #{height}; every new network block will be logged here."
+                        ),
+                        false,
+                    );
+                }
+            }
+            Some("chain_block") => {
+                if let Some(height) = value.get("height").and_then(Value::as_u64) {
+                    let mine = value.get("mine").and_then(Value::as_bool).unwrap_or(false);
+                    let hash = value
+                        .get("hash")
+                        .and_then(Value::as_str)
+                        .map_or_else(String::new, |hash| {
+                            format!(" | hash {}", bounded_text(hash, 24, "…", false))
+                        });
+                    let tx_count = value
+                        .get("tx_count")
+                        .and_then(Value::as_u64)
+                        .map_or_else(String::new, |count| format!(" | {count} tx"));
+                    self.push_log(
+                        format!(
+                            "{} height {height}{hash}{tx_count}",
+                            if mine {
+                                "★ BLOCK FOUND (YOURS)"
+                            } else {
+                                "BLOCK FOUND (network)"
+                            },
+                        ),
+                        false,
+                    );
+                }
+            }
+            Some("chain_gap") => {
+                if let (Some(omitted), Some(from), Some(to)) = (
+                    value.get("omitted").and_then(Value::as_u64),
+                    value.get("from").and_then(Value::as_u64),
+                    value.get("to").and_then(Value::as_u64),
+                ) {
+                    self.push_log(
+                        format!(
+                            "Tip caught up past {omitted} more block(s) (heights #{from}-#{to}) not listed individually."
+                        ),
+                        false,
+                    );
+                }
+            }
+            Some("chain_reorg") => {
+                if let Some(height) = value.get("height").and_then(Value::as_u64) {
+                    let old_hash = value.get("old_hash").and_then(Value::as_str).map_or_else(
+                        || "(unknown)".to_owned(),
+                        |hash| bounded_text(hash, 24, "…", false),
+                    );
+                    let new_hash = value.get("new_hash").and_then(Value::as_str).map_or_else(
+                        || "(hash not disclosed)".to_owned(),
+                        |hash| bounded_text(hash, 24, "…", false),
+                    );
+                    self.push_log(
+                        format!(
+                            "Chain REORG at height #{height}: block {new_hash} replaced {old_hash}."
+                        ),
+                        false,
+                    );
+                }
+            }
+            Some("chain_feed_unavailable") => {
+                let message = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Network block feed unavailable: no direct node RPC in this mode.");
+                self.push_log(self.redact_sensitive_text(message), false);
             }
             Some("metrics") => {
                 let now = Instant::now();
@@ -2448,6 +2698,10 @@ impl MinerApp {
                 self.mempool_size = None;
                 self.peer_count = None;
                 self.block_flow = None;
+                // The observation clock is meaningless across a session gap:
+                // blocks may appear while disconnected without being observed.
+                self.observed_tip_height = None;
+                self.tip_observed_at = None;
                 let session_error = value.get("message").and_then(Value::as_str).map_or_else(
                     || "Pool session ended.".to_owned(),
                     |message| self.redact_sensitive_text(message),
@@ -2493,6 +2747,20 @@ impl MinerApp {
             && self.ready_workers > 0)
             .then(|| self.height_started_at.map(|started| started.elapsed()))
             .flatten()
+    }
+
+    /// The headline hashrate readout, gated on the same freshness proof as
+    /// the ETA and heartbeat: `Offline` when no engine is running, `Stale`
+    /// when the engine stopped reporting metrics (a wedged engine must not
+    /// keep its last number painted as live), `Live` otherwise.
+    fn headline_hashrate(&self) -> HashrateReadout {
+        if !self.is_running() || self.engine_fatal_seen {
+            HashrateReadout::Offline
+        } else if self.telemetry_is_fresh() {
+            HashrateReadout::Live(self.hashrate)
+        } else {
+            HashrateReadout::Stale(self.hashrate)
+        }
     }
 
     fn telemetry_is_fresh(&self) -> bool {
@@ -2752,8 +3020,12 @@ impl MinerApp {
                             font_id: FontId::monospace(11.0),
                             color: if line.error {
                                 RED
-                            } else if line.text.contains("COINBASE CONFIRMED") {
+                            } else if line.text.contains("COINBASE CONFIRMED")
+                                || line.text.starts_with('★')
+                            {
                                 GREEN
+                            } else if line.text.starts_with("BLOCK FOUND (network)") {
+                                PURPLE
                             } else {
                                 MUTED
                             },
@@ -3187,15 +3459,15 @@ impl MinerApp {
                 has_job || recently_found.is_some(),
                 pulse_time + 0.34,
             );
-            let pending = self.mempool_size.unwrap_or(0);
+            // Three-way honesty: "CLEAR" is an affirmative claim and is made
+            // only on a real node-reported zero, never on absent data.
+            let (queue_headline, queue_detail, queue_color) = tx_queue_status(self.mempool_size);
             heartbeat_card(
                 &mut columns[3],
                 "TX QUEUE",
-                if pending > 0 { "TRANSACTIONS" } else { "CLEAR" },
-                self.mempool_size
-                    .map(|size| format!("{size} pending for mining"))
-                    .unwrap_or_else(|| "Awaiting node data".into()),
-                if pending > 0 { GREEN } else { MUTED },
+                queue_headline,
+                queue_detail,
+                queue_color,
                 connected && self.mempool_size.is_some(),
                 pulse_time + 0.51,
             );
@@ -3340,21 +3612,143 @@ impl MinerApp {
             });
     }
 
+    /// Block-time graph: one bar per confirmed block in the bounded window,
+    /// bar height = the interval between that block's miner-declared header
+    /// timestamp and its parent's (`sov_getBlockByHeight`), against reference
+    /// lines at 1× and 2× the node's own `sov_getDifficulty` `targetBlockMs`.
+    /// No cadence is hardcoded and no SOV consensus rule is encoded here —
+    /// reference marks are plain multiples of the node-supplied target.
+    fn block_time_graph(&self, ui: &mut egui::Ui) {
+        if !is_direct_node_endpoint(&self.settings.pool) && self.block_flow.is_none() {
+            // Pool (Stratum) mode has no direct node RPC to observe blocks
+            // through — hidden exactly like the block-flow strip, and the
+            // engine's chain_feed_unavailable log line says why.
+            return;
+        }
+        ui.add_space(12.0);
+        Frame::new()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::same(16))
+            .show(ui, |ui| {
+                let bars = self
+                    .block_flow
+                    .as_ref()
+                    .map(|flow| block_interval_bars(&flow.recent))
+                    .unwrap_or_default();
+                let stats = interval_window_stats(&bars);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("BLOCK TIME")
+                            .size(11.0)
+                            .strong()
+                            .color(MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // LOCAL observation clock: since this miner observed
+                        // the tip advance — deliberately NOT the
+                        // miner-declared block timestamp.
+                        let since = self
+                            .tip_observed_at
+                            .filter(|_| self.is_running() && self.node_link_live)
+                            .map(|at| at.elapsed());
+                        let target_ms = self.target_block_ms;
+                        let since_text = since.map_or_else(
+                            || "—".into(),
+                            |elapsed| {
+                                format!(
+                                    "{} (target {})",
+                                    format_elapsed(elapsed),
+                                    target_ms.map_or_else(
+                                        || "—".into(),
+                                        |ms| format_signed_ms(ms as i64)
+                                    ),
+                                )
+                            },
+                        );
+                        let since_color = match (since, target_ms) {
+                            (Some(elapsed), Some(target)) => {
+                                let target = Duration::from_millis(target);
+                                if elapsed <= target {
+                                    GREEN
+                                } else if elapsed <= target * 2 {
+                                    AMBER
+                                } else {
+                                    RED
+                                }
+                            }
+                            _ => MUTED,
+                        };
+                        telemetry_chip(
+                            ui,
+                            "SINCE LAST BLOCK (OBSERVED)",
+                            &since_text,
+                            since_color,
+                            "Local clock since this miner OBSERVED the chain tip advance — not the miner-declared block timestamp. Compared against the node's own targetBlockMs.",
+                        );
+                        if let Some(stats) = stats {
+                            telemetry_chip(
+                                ui,
+                                "WINDOW MEDIAN",
+                                &format_signed_ms(stats.median_ms),
+                                CYAN,
+                                &format!(
+                                    "Median of the {} known interval(s) of the {} visible; mean {}. Intervals the node did not disclose are excluded, never substituted.",
+                                    stats.known,
+                                    stats.total,
+                                    format_signed_ms(stats.mean_ms),
+                                ),
+                            );
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                if bars.is_empty() {
+                    ui.label(
+                        RichText::new(if self.block_flow.is_none() {
+                            "Awaiting real block data from the connected SOV node…"
+                        } else {
+                            "Awaiting a second confirmed block to compute a block-time interval…"
+                        })
+                        .size(10.0)
+                        .color(MUTED),
+                    );
+                } else {
+                    block_time_chart(ui, &bars, self.target_block_ms);
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Bar height = interval between consecutive miner-declared header timestamps (sov_getBlockByHeight); reference lines are 1× and 2× the node's own targetBlockMs. '≤0' marks a real non-monotonic timestamp pair (miner-declared clocks, not wall time); '?' marks an interval the node did not disclose — gaps are never interpolated. ★ marks your accepted blocks (hash-proof standard).",
+                    )
+                    .size(9.0)
+                    .color(MUTED),
+                );
+            });
+    }
+
     fn dashboard(&mut self, ui: &mut egui::Ui) {
         self.header(ui);
         ui.add_space(14.0);
         self.status_rail(ui);
         ui.add_space(12.0);
         ui.columns(4, |columns| {
-            metric_card(
-                &mut columns[0],
-                "HASHRATE",
-                &format_hashrate(self.hashrate),
-                CYAN,
-            );
+            // The most prominent number on screen must never present a stale
+            // value as live: gate it on the same freshness proof the ETA and
+            // heartbeat already use.
+            let (hashrate_text, hashrate_color) = match self.headline_hashrate() {
+                HashrateReadout::Live(rate) => (format_hashrate(rate), CYAN),
+                HashrateReadout::Stale(rate) => (format!("{} STALE", format_hashrate(rate)), MUTED),
+                HashrateReadout::Offline => ("—".into(), MUTED),
+            };
+            metric_card(&mut columns[0], "HASHRATE", &hashrate_text, hashrate_color);
+            // `self.height` is the TEMPLATE height this miner is sealing —
+            // tip + 1 — so it is labeled as the block being mined, never as
+            // the chain height an explorer would show.
             metric_card(
                 &mut columns[1],
-                "CHAIN HEIGHT",
+                "MINING BLOCK",
                 &self
                     .height
                     .map(|height| format!("#{height}"))
@@ -3380,6 +3774,7 @@ impl MinerApp {
         });
 
         self.block_flow_strip(ui);
+        self.block_time_graph(ui);
 
         ui.add_space(12.0);
         Frame::new()
@@ -3568,7 +3963,9 @@ impl MinerApp {
                                 );
                                 work_chip(
                                     &mut chips[1],
-                                    "HEIGHT",
+                                    // The template height being sealed (tip
+                                    // + 1), not the confirmed chain height.
+                                    "MINING BLOCK",
                                     &self
                                         .height
                                         .map(|height| format!("#{height}"))
@@ -3781,6 +4178,22 @@ fn install_theme(ctx: &egui::Context) {
     });
 }
 
+/// TX QUEUE headline/detail/color. Strictly three-way: a node-reported zero
+/// is "CLEAR", a node-reported count is "TRANSACTIONS", and NO data is
+/// "UNAVAILABLE" — an absent mempool size must never be presented as an
+/// affirmatively clear queue.
+fn tx_queue_status(mempool_size: Option<u64>) -> (&'static str, String, Color32) {
+    match mempool_size {
+        Some(0) => ("CLEAR", "0 pending for mining".into(), MUTED),
+        Some(size) => ("TRANSACTIONS", format!("{size} pending for mining"), GREEN),
+        None => (
+            "UNAVAILABLE",
+            "Node has not reported a mempool size".into(),
+            MUTED,
+        ),
+    }
+}
+
 fn metric_card(ui: &mut egui::Ui, label: &str, value: &str, accent: Color32) {
     Frame::new()
         .fill(CARD)
@@ -3953,6 +4366,227 @@ fn flow_tip_divider(ui: &mut egui::Ui) {
             Stroke::new(1.4, BORDER),
         );
         y += 11.0;
+    }
+}
+
+/// Paint the block-time bars. Position (bar height vs the reference lines)
+/// is the primary encoding; colour is secondary and always paired with the
+/// axis labels, the '≤0'/'?' glyphs, and the ★ shape marker for own blocks.
+/// Reads only the immutable snapshot passed in — no shared mutable state
+/// with the telemetry thread.
+fn block_time_chart(ui: &mut egui::Ui, bars: &[IntervalBar], target_block_ms: Option<u64>) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 150.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(8), BG);
+    let outer = rect.shrink2(Vec2::new(8.0, 7.0));
+    let plot_top = outer.top() + 13.0;
+    let plot_bottom = outer.bottom() - 13.0;
+
+    let known_max = bars.iter().filter_map(|bar| bar.interval_ms).max();
+    let target_ms = target_block_ms.and_then(|ms| i64::try_from(ms).ok());
+    // Stable axis: snap to the next 1/2/5×10ⁿ stop above the window max (and
+    // above 2× target so both reference lines stay on screen).
+    let ceiling = nice_ceiling_ms(
+        known_max
+            .unwrap_or(0)
+            .max(target_ms.map_or(0, |target| target.saturating_mul(2))),
+    );
+    let y_for = |ms: i64| {
+        let fraction = ((ms.max(0) as f64) / (ceiling as f64)).clamp(0.0, 1.0) as f32;
+        egui::lerp(plot_bottom..=plot_top, fraction)
+    };
+
+    painter.line_segment(
+        [
+            egui::pos2(outer.left(), plot_bottom),
+            egui::pos2(outer.right(), plot_bottom),
+        ],
+        Stroke::new(1.0, BORDER),
+    );
+    painter.text(
+        egui::pos2(outer.left(), plot_top - 1.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!("0 – {}", format_signed_ms(ceiling)),
+        FontId::monospace(8.5),
+        MUTED,
+    );
+
+    // Reference lines: plain multiples of the node's own targetBlockMs. No
+    // hardcoded cadence, no consensus rule — labeled as exactly what they
+    // are.
+    match target_ms {
+        Some(target) => {
+            for (multiple, label) in [(1_i64, "1× TARGET"), (2, "2× TARGET")] {
+                let value = target.saturating_mul(multiple);
+                if value > ceiling {
+                    continue;
+                }
+                let y = y_for(value);
+                let mut x = outer.left();
+                while x + 5.0 < outer.right() {
+                    painter.line_segment(
+                        [egui::pos2(x, y), egui::pos2(x + 5.0, y)],
+                        Stroke::new(1.0, AMBER.gamma_multiply(0.55)),
+                    );
+                    x += 9.0;
+                }
+                painter.text(
+                    egui::pos2(outer.right(), y - 2.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    format!("{label} {}", format_signed_ms(value)),
+                    FontId::monospace(8.0),
+                    AMBER,
+                );
+            }
+        }
+        None => {
+            painter.text(
+                egui::pos2(outer.right(), plot_top - 1.0),
+                egui::Align2::RIGHT_BOTTOM,
+                "NODE TARGET CADENCE UNAVAILABLE",
+                FontId::monospace(8.0),
+                MUTED,
+            );
+        }
+    }
+
+    // Fixed slot layout (newest at the right edge): bar widths stay stable
+    // as history fills instead of stretching to the window.
+    let slot = outer.width() / BLOCK_TIME_GRAPH_BARS as f32;
+    let first_slot = BLOCK_TIME_GRAPH_BARS.saturating_sub(bars.len());
+    for (index, bar) in bars.iter().enumerate() {
+        let left = outer.left() + (first_slot + index) as f32 * slot + 1.0;
+        let right = left + (slot - 2.0).max(1.0);
+        let center_x = (left + right) / 2.0;
+        let marker_top;
+        match bar.interval_ms {
+            Some(interval) if interval > 0 => {
+                let top = y_for(interval);
+                marker_top = top;
+                let fill = if bar.mine { GREEN } else { CYAN };
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, plot_bottom)),
+                    CornerRadius::same(2),
+                    fill.gamma_multiply(if bar.mine { 0.9 } else { 0.72 }),
+                );
+            }
+            Some(_) => {
+                // A REAL zero-or-negative interval (non-monotonic
+                // miner-declared timestamps): a distinct baseline marker
+                // with its own glyph — never clamped into a normal bar,
+                // never dropped.
+                marker_top = plot_bottom - 12.0;
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(left, plot_bottom - 3.0),
+                        egui::pos2(right, plot_bottom),
+                    ),
+                    CornerRadius::same(1),
+                    AMBER,
+                );
+                painter.text(
+                    egui::pos2(center_x, plot_bottom - 4.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    "≤0",
+                    FontId::monospace(7.5),
+                    AMBER,
+                );
+            }
+            None => {
+                // Unknown interval: an explicit hollow gap marker. No height
+                // is invented for it.
+                marker_top = plot_bottom - 12.0;
+                let gap = egui::Rect::from_min_max(
+                    egui::pos2(left, plot_bottom - 11.0),
+                    egui::pos2(right, plot_bottom),
+                );
+                let stroke = Stroke::new(1.0, MUTED.gamma_multiply(0.7));
+                painter.line_segment([gap.left_top(), gap.right_top()], stroke);
+                painter.line_segment([gap.left_top(), gap.left_bottom()], stroke);
+                painter.line_segment([gap.right_top(), gap.right_bottom()], stroke);
+                painter.text(
+                    egui::pos2(center_x, plot_bottom - 12.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    "?",
+                    FontId::monospace(8.0),
+                    MUTED,
+                );
+            }
+        }
+        if bar.mine {
+            // Own blocks are marked by SHAPE, not hue alone.
+            painter.text(
+                egui::pos2(center_x, marker_top - 1.0),
+                egui::Align2::CENTER_BOTTOM,
+                "★",
+                FontId::proportional(9.0),
+                GREEN,
+            );
+        }
+
+        let mut tooltip = format!("Block #{}", bar.height);
+        match bar.interval_ms {
+            Some(interval) => {
+                tooltip.push_str(&format!(
+                    "\nInterval {} from the previous block's miner-declared timestamp",
+                    format_signed_ms(interval)
+                ));
+                if interval <= 0 {
+                    tooltip.push_str(
+                        "\nNon-monotonic timestamp: block timestamps are miner-declared, not wall-clock truth",
+                    );
+                }
+            }
+            None => tooltip.push_str(
+                "\nInterval unknown: the node did not disclose a timestamp for this block or its parent",
+            ),
+        }
+        if let Some(timestamp_ms) = bar.timestamp_ms {
+            tooltip.push_str(&format!(
+                "\nDeclared timestamp {} ({timestamp_ms} ms)",
+                diag::format_utc_millis(timestamp_ms)
+            ));
+        }
+        if let Some(tx_count) = bar.tx_count {
+            tooltip.push_str(&format!("\n{tx_count} transaction(s)"));
+        }
+        tooltip.push_str(if bar.mine {
+            "\n★ YOURS — accepted submission, hash-verified"
+        } else {
+            "\nNetwork block"
+        });
+        ui.interact(
+            egui::Rect::from_min_max(egui::pos2(left, plot_top), egui::pos2(right, plot_bottom)),
+            ui.id().with(("block-time-bar", bar.height)),
+            Sense::hover(),
+        )
+        .on_hover_text(tooltip);
+    }
+
+    if let (Some(oldest), Some(newest)) = (bars.first(), bars.last()) {
+        painter.text(
+            egui::pos2(outer.left(), outer.bottom() + 1.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("#{} OLDEST", oldest.height),
+            FontId::monospace(8.5),
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(outer.right(), outer.bottom() + 1.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("#{} NEWEST", newest.height),
+            FontId::monospace(8.5),
+            PURPLE,
+        );
+    }
+    if known_max.is_none() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "The connected node has not disclosed block timestamps yet",
+            FontId::proportional(11.0),
+            MUTED,
+        );
     }
 }
 
@@ -4657,6 +5291,342 @@ mod tests {
             .unwrap()
             .text
             .ends_with(TRUNCATED_LINE_SUFFIX));
+    }
+
+    fn flow_tile(
+        height: u64,
+        timestamp_ms: Option<u64>,
+        tx_count: Option<u64>,
+        mine: bool,
+    ) -> BlockFlowTile {
+        BlockFlowTile {
+            height,
+            tx_count,
+            timestamp_ms,
+            mine,
+        }
+    }
+
+    #[test]
+    fn block_intervals_render_zero_negative_and_unknown_honestly() {
+        // Newest-first, contiguous heights (the engine's `recent` order).
+        let recent = vec![
+            flow_tile(104, Some(2_000_000), Some(1), false), // +150s vs 103
+            flow_tile(103, Some(1_850_000), Some(2), true),  // −50s vs 102 (negative)
+            flow_tile(102, Some(1_900_000), Some(0), false), // 0s vs 101 (zero)
+            flow_tile(101, Some(1_900_000), None, false),    // parent ts missing → unknown
+            flow_tile(100, None, Some(4), false),            // own ts missing → no bar for 100
+        ];
+        let bars = block_interval_bars(&recent);
+        // Oldest-left, newest-right; height 100 has no parent in the window.
+        assert_eq!(
+            bars.iter().map(|bar| bar.height).collect::<Vec<_>>(),
+            vec![101, 102, 103, 104]
+        );
+        // Unknown endpoint → explicit gap, never interpolated.
+        assert_eq!(bars[0].interval_ms, None);
+        // A REAL zero interval survives as zero.
+        assert_eq!(bars[1].interval_ms, Some(0));
+        // A REAL negative (non-monotonic miner-declared) interval survives
+        // as negative — never clamped, never dropped.
+        assert_eq!(bars[2].interval_ms, Some(-50_000));
+        assert!(bars[2].mine, "yours marker rides the proof-standard flag");
+        assert_eq!(bars[3].interval_ms, Some(150_000));
+
+        // Heights are unique and ascending: a reorg re-derivation replaces a
+        // bar, it can never duplicate one.
+        let mut heights: Vec<u64> = bars.iter().map(|bar| bar.height).collect();
+        heights.dedup();
+        assert_eq!(heights.len(), bars.len());
+    }
+
+    #[test]
+    fn block_intervals_are_bounded_and_require_true_parents() {
+        // More history than the window: only the newest
+        // BLOCK_TIME_GRAPH_BARS bars remain, newest at the right edge.
+        let recent: Vec<BlockFlowTile> = (0..(BLOCK_TIME_GRAPH_BARS as u64 + 20))
+            .map(|offset| {
+                let height = 1_000 - offset;
+                flow_tile(height, Some(height * 1_000), None, false)
+            })
+            .collect();
+        let bars = block_interval_bars(&recent);
+        assert_eq!(bars.len(), BLOCK_TIME_GRAPH_BARS);
+        assert_eq!(bars.last().map(|bar| bar.height), Some(1_000));
+
+        // A non-contiguous pair (defensive) forms no interval bar at all.
+        let gapped = vec![
+            flow_tile(50, Some(9_000), None, false),
+            flow_tile(48, Some(1_000), None, false),
+        ];
+        assert!(block_interval_bars(&gapped).is_empty());
+
+        // A reorg re-derivation from the corrected snapshot replaces the
+        // bar's data instead of duplicating the height.
+        let before = vec![
+            flow_tile(50, Some(300_000), Some(1), true),
+            flow_tile(49, Some(150_000), Some(1), false),
+        ];
+        let after = vec![
+            flow_tile(50, Some(400_000), Some(7), false), // reorg replaced 50
+            flow_tile(49, Some(150_000), Some(1), false),
+        ];
+        let corrected = block_interval_bars(&after);
+        assert_eq!(corrected.len(), 1);
+        assert_eq!(corrected[0].interval_ms, Some(250_000));
+        assert!(!corrected[0].mine);
+        assert_ne!(block_interval_bars(&before), corrected);
+    }
+
+    #[test]
+    fn block_time_axis_snaps_to_one_two_five_stops() {
+        assert_eq!(nice_ceiling_ms(0), 1_000);
+        assert_eq!(nice_ceiling_ms(-5_000), 1_000, "axis floor is one second");
+        assert_eq!(nice_ceiling_ms(1_000), 1_000);
+        assert_eq!(nice_ceiling_ms(1_001), 2_000);
+        assert_eq!(nice_ceiling_ms(4_000), 5_000);
+        assert_eq!(nice_ceiling_ms(5_001), 10_000);
+        assert_eq!(nice_ceiling_ms(150_000), 200_000);
+        assert_eq!(nice_ceiling_ms(300_000), 500_000);
+        assert_eq!(nice_ceiling_ms(500_001), 1_000_000);
+        assert_eq!(nice_ceiling_ms(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn window_stats_exclude_unknown_intervals_without_substituting() {
+        let bars = vec![
+            IntervalBar {
+                height: 1,
+                interval_ms: Some(100_000),
+                timestamp_ms: None,
+                tx_count: None,
+                mine: false,
+            },
+            IntervalBar {
+                height: 2,
+                interval_ms: None, // unknown: excluded, never substituted
+                timestamp_ms: None,
+                tx_count: None,
+                mine: false,
+            },
+            IntervalBar {
+                height: 3,
+                interval_ms: Some(-20_000), // real negative: included
+                timestamp_ms: None,
+                tx_count: None,
+                mine: false,
+            },
+            IntervalBar {
+                height: 4,
+                interval_ms: Some(300_000),
+                timestamp_ms: None,
+                tx_count: None,
+                mine: false,
+            },
+        ];
+        let stats = interval_window_stats(&bars).expect("known intervals exist");
+        assert_eq!(stats.known, 3);
+        assert_eq!(stats.total, 4);
+        assert_eq!(stats.median_ms, 100_000);
+        assert_eq!(stats.mean_ms, (100_000 - 20_000 + 300_000) / 3);
+
+        assert_eq!(
+            interval_window_stats(&[IntervalBar {
+                height: 9,
+                interval_ms: None,
+                timestamp_ms: None,
+                tx_count: None,
+                mine: false,
+            }]),
+            None,
+            "an all-unknown window has no statistic, not a fabricated one"
+        );
+    }
+
+    #[test]
+    fn signed_interval_formatting_keeps_zero_and_negative_visible() {
+        assert_eq!(format_signed_ms(0), "0s");
+        assert_eq!(format_signed_ms(-12_000), "−12s");
+        assert_eq!(format_signed_ms(45_000), "45s");
+        assert_eq!(format_signed_ms(144_000), "2m 24s");
+        assert_eq!(format_signed_ms(-3_660_000), "−1h 01m");
+    }
+
+    #[test]
+    fn tx_queue_headline_is_three_way_and_never_claims_clear_without_data() {
+        assert_eq!(tx_queue_status(Some(0)).0, "CLEAR");
+        let (headline, detail, _) = tx_queue_status(Some(7));
+        assert_eq!(headline, "TRANSACTIONS");
+        assert!(detail.contains('7'));
+        // Absent data is UNAVAILABLE — not an affirmative "CLEAR".
+        let (headline, detail, _) = tx_queue_status(None);
+        assert_eq!(headline, "UNAVAILABLE");
+        assert!(detail.contains("not reported"));
+    }
+
+    #[test]
+    fn headline_hashrate_is_gated_by_freshness_like_the_eta() {
+        let mut app = MinerApp::default();
+        assert_eq!(app.headline_hashrate(), HashrateReadout::Offline);
+
+        // Running with fresh metrics: live.
+        app.automatic_restart_at = Some(Instant::now());
+        app.hashrate = 123.0;
+        app.last_metrics_at = Some(Instant::now());
+        assert_eq!(app.headline_hashrate(), HashrateReadout::Live(123.0));
+
+        // Running but telemetry went silent: explicitly stale, never
+        // presented as a live number.
+        app.last_metrics_at =
+            Some(Instant::now() - Duration::from_secs(app.settings.report_secs * 3 + 9));
+        assert_eq!(app.headline_hashrate(), HashrateReadout::Stale(123.0));
+
+        // A fatal engine is offline regardless of the last sample.
+        app.engine_fatal_seen = true;
+        assert_eq!(app.headline_hashrate(), HashrateReadout::Offline);
+    }
+
+    #[test]
+    fn block_flow_view_parses_timestamps_and_bounds_retained_tiles() {
+        let recent: Vec<Value> = (0..(MAX_RECENT_TILES as u64 + 25))
+            .map(|offset| {
+                json!({
+                    "height": 500 - offset,
+                    "tx_count": 1,
+                    "timestamp_ms": 1_784_936_544_968_u64 - offset * 150_000,
+                    "mine": false,
+                })
+            })
+            .collect();
+        let view = BlockFlowView::from_telemetry(&json!({
+            "event": "block_flow",
+            "tip_height": 500,
+            "template": {"height": 501, "tx_count": null},
+            "fee_grains": null,
+            "projected": [],
+            "recent": recent,
+        }));
+        assert_eq!(view.recent.len(), MAX_RECENT_TILES, "hostile-size bound");
+        assert_eq!(view.recent[0].timestamp_ms, Some(1_784_936_544_968));
+        // An undisclosed timestamp stays None.
+        let view = BlockFlowView::from_telemetry(&json!({
+            "recent": [{"height": 9, "tx_count": null, "mine": true}],
+        }));
+        assert_eq!(view.recent[0].timestamp_ms, None);
+        assert!(view.recent[0].mine);
+    }
+
+    #[test]
+    fn since_last_block_uses_the_local_observation_clock_only() {
+        let mut app = MinerApp::default();
+        assert!(app.tip_observed_at.is_none());
+
+        app.apply_telemetry(&json!({"event": "block_flow", "tip_height": 10, "recent": []}));
+        let first = app.tip_observed_at.expect("tip observation recorded");
+        assert_eq!(app.observed_tip_height, Some(10));
+
+        // The same tip re-reported does NOT reset the clock.
+        app.apply_telemetry(&json!({"event": "block_flow", "tip_height": 10, "recent": []}));
+        assert_eq!(app.tip_observed_at, Some(first));
+
+        // A higher observed tip advances the clock.
+        app.apply_telemetry(&json!({"event": "block_flow", "tip_height": 11, "recent": []}));
+        assert_eq!(app.observed_tip_height, Some(11));
+        assert!(app.tip_observed_at.expect("advanced observation") >= first);
+
+        // A session gap invalidates the observation clock entirely: blocks
+        // can appear unobserved while disconnected.
+        app.apply_telemetry(&json!({"event": "session_error", "message": "gone"}));
+        assert!(app.tip_observed_at.is_none());
+        assert!(app.observed_tip_height.is_none());
+    }
+
+    #[test]
+    fn chain_feed_events_land_in_the_engine_log_and_stay_bounded() {
+        let mut app = MinerApp::default();
+        app.apply_telemetry(&json!({"event": "chain_baseline", "height": 11_519}));
+        assert!(app
+            .logs
+            .back()
+            .expect("baseline line")
+            .text
+            .contains("Block feed live at chain height #11519"));
+
+        app.apply_telemetry(&json!({
+            "event": "chain_block",
+            "height": 11_520,
+            "hash": "00891519a548c92ad3cd3334becc3fab",
+            "tx_count": 3,
+            "mine": false,
+        }));
+        let network_line = &app.logs.back().expect("network block line").text;
+        assert!(network_line.starts_with("BLOCK FOUND (network) height 11520"));
+        assert!(network_line.contains("3 tx"));
+
+        app.apply_telemetry(&json!({
+            "event": "chain_block",
+            "height": 11_521,
+            "hash": null,
+            "tx_count": null,
+            "mine": true,
+        }));
+        let yours_line = &app.logs.back().expect("yours block line").text;
+        assert!(yours_line.starts_with("★ BLOCK FOUND (YOURS) height 11521"));
+        assert!(!yours_line.contains("hash"), "undisclosed fields omitted");
+
+        app.apply_telemetry(&json!({
+            "event": "chain_gap",
+            "omitted": 8,
+            "from": 11_500,
+            "to": 11_507,
+        }));
+        assert!(app
+            .logs
+            .back()
+            .expect("gap line")
+            .text
+            .contains("8 more block(s) (heights #11500-#11507)"));
+
+        app.apply_telemetry(&json!({
+            "event": "chain_reorg",
+            "height": 11_520,
+            "old_hash": "aa11",
+            "new_hash": "bb22",
+        }));
+        assert!(app
+            .logs
+            .back()
+            .expect("reorg line")
+            .text
+            .contains("Chain REORG at height #11520"));
+
+        app.apply_telemetry(&json!({
+            "event": "chain_feed_unavailable",
+            "reason": "stratum",
+            "message": "network block feed unavailable in pool (Stratum) mode",
+        }));
+        assert!(app
+            .logs
+            .back()
+            .expect("degradation line")
+            .text
+            .contains("unavailable in pool (Stratum) mode"));
+
+        // The feed shares the engine log's exact memory bound.
+        for height in 0..(MAX_LOG_LINES as u64 + 12) {
+            app.apply_telemetry(&json!({
+                "event": "chain_block",
+                "height": height,
+                "hash": format!("{height:064x}"),
+                "tx_count": 1,
+                "mine": false,
+            }));
+        }
+        assert_eq!(app.logs.len(), MAX_LOG_LINES);
+        assert!(app
+            .logs
+            .iter()
+            .all(|line| line.text.len() <= MAX_STORED_LOG_BYTES));
     }
 
     #[test]
@@ -5837,17 +6807,20 @@ mod tests {
                 BlockFlowTile {
                     height: 42,
                     tx_count: Some(3),
+                    timestamp_ms: None,
                     mine: true
                 },
                 // Unknown counts remain None (rendered "—"), never invented.
                 BlockFlowTile {
                     height: 41,
                     tx_count: None,
+                    timestamp_ms: None,
                     mine: false
                 },
                 BlockFlowTile {
                     height: 40,
                     tx_count: None,
+                    timestamp_ms: None,
                     mine: false
                 },
                 // A tile without a real height is dropped, not fabricated.
@@ -5865,8 +6838,9 @@ mod tests {
         assert_eq!(flow, BlockFlowView::default());
         assert!(flow.projected.is_empty());
 
-        // The rendered strip is bounded even against a hostile event.
-        let oversized: Vec<Value> = (0..64)
+        // Retained tiles are bounded even against a hostile event (the strip
+        // itself renders at most MAX_FLOW_TILES of them).
+        let oversized: Vec<Value> = (0..(MAX_RECENT_TILES as u64 + 24))
             .map(|height| json!({"height": height, "tx_count": 1}))
             .collect();
         let oversized_projected: Vec<Value> = (0..64)
@@ -5879,7 +6853,7 @@ mod tests {
         }));
         assert_eq!(
             app.block_flow.as_ref().map(|flow| flow.recent.len()),
-            Some(MAX_FLOW_TILES)
+            Some(MAX_RECENT_TILES)
         );
         assert_eq!(
             app.block_flow.as_ref().map(|flow| flow.projected.len()),

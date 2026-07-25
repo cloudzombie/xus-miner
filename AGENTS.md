@@ -25,8 +25,11 @@ This repository owns only the standalone XUS Miner client.
   operator Stop latch, failed-cleanup child quarantine, and the Windows
   one-worker optimized then portable light-memory RandomX recovery path.
   Preserve the GUI-parent pipe watchdog so a GUI crash cannot orphan its
-  engine. Normal mining must remain optimized, and CI must execute two-worker
-  optimized, one-worker optimized, and light-memory Windows soaks.
+  engine. Normal mining must remain optimized, and CI must execute the
+  two-worker optimized, one-worker optimized-recovery, and one-worker
+  portable light-memory RandomX soaks on BOTH the Windows and the Apple
+  Silicon (macos-15) legs — Apple Silicon runs real Apple-Silicon-specific
+  tests, never build-only.
 - If a miner change appears to require chaincode changes, stop and ask the user
   to authorize a separate task in the SOV repository. Do not cross the boundary
   from this repository.

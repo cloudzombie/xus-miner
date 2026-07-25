@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.1.6
+
+- **Block-time graph** (the release centerpiece): a new GUI card plots the
+  interval between each confirmed block's miner-declared header timestamp
+  and its parent's (`sov_getBlockByHeight` `header.timestamp_ms`,
+  live-verified in milliseconds), one bar per block in a bounded
+  newest-right window of up to 32 intervals, with dashed reference lines at
+  1× and 2× the node's own `sov_getDifficulty` `targetBlockMs` — no cadence
+  is hardcoded and no SOV consensus rule is encoded in the miner.
+  - Honest about miner-declared clocks: a zero or NEGATIVE interval is a
+    real non-monotonic timestamp pair and renders as a distinct baseline
+    "≤0" marker (never clamped, never dropped); an interval whose endpoint
+    the node did not disclose renders as a hollow "?" gap (never
+    interpolated or carried forward). Both cases are unit-tested.
+  - Your accepted blocks are marked by the ★ shape (not hue alone) on the
+    existing sealed-hash proof standard; bar-height-vs-reference-line is the
+    primary encoding, colour is secondary.
+  - Stable axis (next 1/2/5×10ⁿ ceiling), monospace numerics, per-bar
+    tooltips limited to node-supplied fields (height, interval, declared
+    timestamp, tx count, yours/network), a rolling window median/mean over
+    KNOWN intervals only (exclusions stated, never substituted), and a live
+    "SINCE LAST BLOCK (OBSERVED)" readout derived from the local observation
+    clock — explicitly not from miner-declared timestamps.
+  - Data flows through the existing block-flow cache, widened to a 33-block
+    window; backfill remains capped at 4 `sov_getBlockByHeight` calls per
+    refresh under a 2-second budget, so a cold start fills gradually and the
+    graph can never issue unbounded RPCs. Pool/Stratum mode hides the graph
+    exactly like the strip (no direct node RPC); a reorg refetch corrects
+    the affected bars instead of duplicating them.
+- **Network block feed**: every block that appears on the network — not just
+  this miner's accepted submissions — now produces a timestamped, clearly
+  marked line on all three surfaces: the headless stderr log, the
+  `--json-events` stream (new stable `chain_baseline` / `chain_block` /
+  `chain_gap` / `chain_reorg` / `chain_feed_unavailable` events; the
+  existing `share`/`job`/`block_flow` events are untouched), and the GUI
+  engine log (same 500-line/8-KiB bounds as before).
+  - Session start or reconnect logs a single "BLOCK FEED live at height N"
+    baseline — chain history is never replayed as a flood of block-found
+    lines, and a height+hash already reported is never reported twice,
+    including across reconnects.
+  - A tip jump reports at most 4 blocks individually plus an explicit
+    "… and N more" summary, bounding both log lines and follow-up RPCs.
+  - The same height reappearing with a different node-disclosed hash logs a
+    distinctly worded REORG line, never a duplicate block-found line.
+  - YOURS is claimed strictly on the existing accepted-submission proof
+    standard (exact sealed-hash match; accepted-height fallback only where
+    the node discloses no hash). Pool/Stratum mode states explicitly that
+    the feed is unavailable — a pool share is never presented as a network
+    block.
+- GUI honesty fixes from an independent visual audit:
+  - TX QUEUE is now three-way: "CLEAR" only on a node-reported zero,
+    "UNAVAILABLE" when the node never supplied a mempool size (previously
+    absent data read as an affirmative "CLEAR").
+  - The headline HASHRATE card is gated by the same telemetry-freshness
+    proof as the ETA and heartbeat: "—" when no engine runs, and an
+    explicit muted "STALE" marker when a running engine stops reporting —
+    a wedged engine can no longer keep its last number painted as live.
+  - The prominent height readouts are relabeled "MINING BLOCK": the value is
+    the template height being sealed (tip + 1), not the confirmed chain
+    height an explorer shows.
+- CI/Release: the one-worker optimized-recovery and one-worker portable
+  light-memory RandomX soaks now run on the Apple Silicon (macos-15) leg as
+  well as Windows, closing the standing directive that every build runs
+  Apple-Silicon-specific tests rather than build-only.
+
 ## 0.1.5
 
 - Complete the mempool.space-style block-flow strip by consuming the SOV

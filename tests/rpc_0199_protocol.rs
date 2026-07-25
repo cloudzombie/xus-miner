@@ -5,7 +5,7 @@ use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -47,6 +47,20 @@ struct TemplateFixture {
     /// sov_getMempoolHistogram method at all. The miner must degrade to
     /// honest placeholders against this node, never crash or invent values.
     legacy: bool,
+    /// The mock chain tip served by `sov_health`. Tests advance it to drive
+    /// the network block feed; blocks exist for every height at or below it.
+    tip: Arc<AtomicU64>,
+    /// The sealed-block hash of the last accepted `sov_submitBlock`; the
+    /// upgraded mock discloses it as block HEIGHT's `header.hash` so the
+    /// feed's exact-hash YOURS matching is exercised end to end.
+    accepted_hash: Arc<Mutex<Option<String>>>,
+}
+
+/// Miner-declared header timestamp the mock serves for `height`: the fixed
+/// template timestamp offset by 150 s per block around HEIGHT.
+fn mock_timestamp_ms(height: u64) -> u64 {
+    let offset = (i128::from(height) - i128::from(HEIGHT)) * 150_000;
+    u64::try_from(i128::from(TIMESTAMP_MS) + offset).expect("mock timestamp fits u64")
 }
 
 impl TemplateFixture {
@@ -101,6 +115,8 @@ impl TemplateFixture {
             target,
             response,
             legacy: false,
+            tip: Arc::new(AtomicU64::new(HEIGHT - 1)),
+            accepted_hash: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -416,7 +432,7 @@ fn handle_rpc_connection(
             "result": {
                 "ok": true,
                 "chainId": "sov-mainnet",
-                "height": HEIGHT - 1,
+                "height": fixture.tip.load(Ordering::Acquire),
                 "mempool": 2,
             }
         }),
@@ -514,19 +530,34 @@ fn handle_rpc_connection(
             },
         }),
         // Live-verified shape: {"header": {...}, "transactions": [...]} with
-        // no txIds/txCount fields. The upgraded node additionally discloses
-        // the block's own hash inside `header`.
+        // no txIds/txCount fields, and the miner-declared header timestamp
+        // as `timestamp_ms` in milliseconds (verified against the live
+        // mainnet node; disclosed by pre-upgrade nodes too). The upgraded
+        // node additionally discloses the block's own hash inside `header`.
         "sov_getBlockByHeight" => match params.get("height").and_then(Value::as_u64) {
-            Some(height) if height < HEIGHT => {
+            Some(height) if height <= fixture.tip.load(Ordering::Acquire) => {
                 let mut header = json!({
                     "height": height,
                     "prevHash": "11".repeat(32),
                     "txRoot": "22".repeat(32),
-                    "timestampMs": TIMESTAMP_MS - 1,
+                    "timestamp_ms": mock_timestamp_ms(height),
                     "proposer": COINBASE,
                 });
                 if !fixture.legacy {
-                    header["hash"] = json!(format!("{height:064x}"));
+                    // Block HEIGHT is the one this miner seals in the feed
+                    // test: once a submission was accepted, the chain block
+                    // at that height IS the accepted block, so its disclosed
+                    // hash is the accepted sealed-header hash.
+                    let accepted = (height == HEIGHT)
+                        .then(|| {
+                            fixture
+                                .accepted_hash
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone()
+                        })
+                        .flatten();
+                    header["hash"] = json!(accepted.unwrap_or_else(|| format!("{height:064x}")));
                 }
                 json!({
                     "jsonrpc": "2.0",
@@ -567,6 +598,10 @@ fn handle_rpc_connection(
                 )
             });
             if is_sha_fixture && template_matches && timestamp_matches && seal_matches {
+                *fixture
+                    .accepted_hash
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hash.clone());
                 json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -659,8 +694,9 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
     let mut saw_peers = false;
     let mut saw_accepted_share = false;
     let mut saw_block_flow = false;
+    let mut saw_chain_baseline = false;
     while Instant::now() < deadline
-        && !(saw_job && saw_peers && saw_accepted_share && saw_block_flow)
+        && !(saw_job && saw_peers && saw_accepted_share && saw_block_flow && saw_chain_baseline)
     {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let event = match telemetry_rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
@@ -706,17 +742,32 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
                 assert!(!recent.is_empty());
                 assert_eq!(recent[0]["height"], json!(HEIGHT - 1));
                 assert_eq!(recent[0]["tx_count"], json!(2));
+                // The block-time graph's substrate: the exact miner-declared
+                // header timestamp the node disclosed, in milliseconds.
+                assert_eq!(
+                    recent[0]["timestamp_ms"],
+                    json!(mock_timestamp_ms(HEIGHT - 1))
+                );
                 // header.hash is disclosed and none of these are ours, so
                 // the exact hash comparison keeps the highlight off.
                 assert_eq!(recent[0]["mine"], json!(false));
                 saw_block_flow = true;
             }
+            Some("chain_baseline") => {
+                // First successful poll: a single baseline at the tip.
+                assert_eq!(event["height"], json!(HEIGHT - 1));
+                saw_chain_baseline = true;
+            }
+            Some("chain_block") => panic!(
+                "a static tip must never produce a block-found event (history \
+                 replay): {event}"
+            ),
             _ => {}
         }
     }
     assert!(
-        saw_job && saw_peers && saw_accepted_share && saw_block_flow,
-        "missing required telemetry (job={saw_job}, peers={saw_peers}, share={saw_accepted_share}, block_flow={saw_block_flow}); miner stderr:\n{}",
+        saw_job && saw_peers && saw_accepted_share && saw_block_flow && saw_chain_baseline,
+        "missing required telemetry (job={saw_job}, peers={saw_peers}, share={saw_accepted_share}, block_flow={saw_block_flow}, chain_baseline={saw_chain_baseline}); miner stderr:\n{}",
         stderr_log.lock().expect("stderr log lock")
     );
 
@@ -881,6 +932,13 @@ fn headless_miner_degrades_cleanly_on_a_pre_upgrade_node() {
                 assert!(!recent.is_empty());
                 assert_eq!(recent[0]["height"], json!(HEIGHT - 1));
                 assert_eq!(recent[0]["tx_count"], json!(2));
+                // The live pre-upgrade node DOES disclose header
+                // timestamp_ms (verified on mainnet), so the block-time
+                // graph substrate is present even against a legacy node.
+                assert_eq!(
+                    recent[0]["timestamp_ms"],
+                    json!(mock_timestamp_ms(HEIGHT - 1))
+                );
                 saw_degraded_block_flow = true;
             }
             Some("share") if event["accepted"].as_u64().unwrap_or_default() >= 1 => {
@@ -904,6 +962,204 @@ fn headless_miner_degrades_cleanly_on_a_pre_upgrade_node() {
     assert!(
         child.0.try_wait().expect("poll miner child").is_none(),
         "miner must stay alive against a pre-upgrade node"
+    );
+}
+
+/// End-to-end network block feed: baseline once, YOUR accepted block
+/// announced with mine=true on exact hash proof, a large tip jump reported
+/// bounded with an explicit omitted count, and no height ever reported
+/// twice.
+#[test]
+fn network_block_feed_reports_yours_gap_and_idempotent_network_blocks() {
+    let fixture = TemplateFixture::sov_0_1_99();
+    let tip = Arc::clone(&fixture.tip);
+    let accepted_hash = Arc::clone(&fixture.accepted_hash);
+    let (mock_node, _request_rx) = MockNode::start(fixture.clone());
+    let endpoint = format!("rpc://{}", mock_node.address);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xus-miner"))
+        .args([
+            "--headless",
+            "--json-events",
+            "--pool",
+            &endpoint,
+            "--user",
+            COINBASE,
+            "--workers",
+            "1",
+            "--reconnect-secs",
+            "1",
+            "--report-secs",
+            "1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn headless xus-miner");
+
+    let stdout = child.stdout.take().expect("miner telemetry stdout");
+    let (telemetry_tx, telemetry_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if telemetry_tx.send(value).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let stderr = child.stderr.take().expect("miner diagnostic stderr");
+    let stderr_log = Arc::new(Mutex::new(String::new()));
+    let stderr_sink = Arc::clone(&stderr_log);
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let mut log = stderr_sink.lock().expect("stderr log lock");
+            if log.len() < 64 * 1024 {
+                log.push_str(&line);
+                log.push('\n');
+            }
+        }
+    });
+    let _child = ChildGuard(child);
+
+    let fail = |message: &str, stderr_log: &Arc<Mutex<String>>| -> ! {
+        panic!(
+            "{message}; miner stderr:\n{}",
+            stderr_log.lock().expect("stderr log lock")
+        )
+    };
+
+    // Phase 1 — static tip: exactly one baseline, an accepted submission,
+    // and NO block-found events (no history replay).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_baseline = false;
+    let mut saw_accepted_share = false;
+    let mut chain_blocks: Vec<Value> = Vec::new();
+    while Instant::now() < deadline && !(saw_baseline && saw_accepted_share) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = telemetry_rx.recv_timeout(remaining.min(Duration::from_millis(500))) else {
+            continue;
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("chain_baseline") => {
+                assert_eq!(event["height"], json!(HEIGHT - 1));
+                assert!(!saw_baseline, "baseline must be announced exactly once");
+                saw_baseline = true;
+            }
+            Some("chain_block") => chain_blocks.push(event),
+            Some("share") if event["accepted"].as_u64().unwrap_or_default() >= 1 => {
+                saw_accepted_share = true;
+            }
+            _ => {}
+        }
+    }
+    if !(saw_baseline && saw_accepted_share) {
+        fail(
+            "no baseline + accepted submission on the static tip",
+            &stderr_log,
+        );
+    }
+    assert!(
+        chain_blocks.is_empty(),
+        "a static tip produced block-found events (history replay): {chain_blocks:?}"
+    );
+    let sealed_hash = accepted_hash
+        .lock()
+        .expect("accepted hash lock")
+        .clone()
+        .expect("mock recorded the accepted sealed hash");
+
+    // Phase 2 — the accepted block confirms as the new tip: exactly one
+    // block-found event, marked YOURS on the exact disclosed-hash proof.
+    tip.store(HEIGHT, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut yours: Option<Value> = None;
+    while Instant::now() < deadline && yours.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = telemetry_rx.recv_timeout(remaining.min(Duration::from_millis(500))) else {
+            continue;
+        };
+        if event.get("event").and_then(Value::as_str) == Some("chain_block") {
+            chain_blocks.push(event.clone());
+            yours = Some(event);
+        }
+    }
+    let Some(yours) = yours else {
+        fail("the confirmed own block was never announced", &stderr_log);
+    };
+    assert_eq!(yours["height"], json!(HEIGHT));
+    assert_eq!(yours["hash"], json!(sealed_hash));
+    assert_eq!(yours["mine"], json!(true), "exact hash proof marks YOURS");
+    assert_eq!(yours["tx_count"], json!(2));
+    assert_eq!(yours["timestamp_ms"], json!(mock_timestamp_ms(HEIGHT)));
+
+    // Phase 3 — a tip jump of 8: the newest 4 blocks are reported
+    // individually (network, exact mock hashes) plus one explicit
+    // "... and 4 more" gap event; nothing is reported twice.
+    let jump_tip = HEIGHT + 8;
+    tip.store(jump_tip, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_gap = false;
+    let mut reported_heights: Vec<u64> = Vec::new();
+    while Instant::now() < deadline && !(saw_gap && reported_heights.len() >= 4) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = telemetry_rx.recv_timeout(remaining.min(Duration::from_millis(500))) else {
+            continue;
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("chain_gap") => {
+                assert_eq!(event["omitted"], json!(4));
+                assert_eq!(event["from"], json!(HEIGHT + 1));
+                assert_eq!(event["to"], json!(HEIGHT + 4));
+                assert!(!saw_gap, "the gap summary must be announced once");
+                saw_gap = true;
+            }
+            Some("chain_block") => {
+                let height = event["height"].as_u64().expect("chain_block height");
+                assert!(
+                    height > HEIGHT + 4 && height <= jump_tip,
+                    "omitted gap heights must not be individually reported: {event}"
+                );
+                assert_eq!(event["mine"], json!(false));
+                assert_eq!(event["hash"], json!(format!("{height:064x}")));
+                reported_heights.push(height);
+                chain_blocks.push(event);
+            }
+            _ => {}
+        }
+    }
+    if !(saw_gap && reported_heights.len() >= 4) {
+        fail("bounded gap reporting incomplete", &stderr_log);
+    }
+    reported_heights.sort_unstable();
+    assert_eq!(
+        reported_heights,
+        vec![HEIGHT + 5, HEIGHT + 6, HEIGHT + 7, HEIGHT + 8],
+        "exactly the newest MAX_GAP_BLOCKS heights are reported"
+    );
+
+    // Idempotence: drain a further grace window; no height may repeat.
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < drain_deadline {
+        let Ok(event) = telemetry_rx.recv_timeout(Duration::from_millis(250)) else {
+            continue;
+        };
+        if event.get("event").and_then(Value::as_str) == Some("chain_block") {
+            chain_blocks.push(event);
+        }
+    }
+    let mut all_heights: Vec<u64> = chain_blocks
+        .iter()
+        .filter_map(|event| event["height"].as_u64())
+        .collect();
+    all_heights.sort_unstable();
+    let deduplicated = all_heights.len();
+    all_heights.dedup();
+    assert_eq!(
+        all_heights.len(),
+        deduplicated,
+        "a height+hash was reported twice: {chain_blocks:?}"
     );
 }
 

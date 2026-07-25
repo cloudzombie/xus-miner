@@ -16,8 +16,13 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
-/// Confirmed-block tiles kept in the strip (newest first).
-pub(crate) const RECENT_DEPTH: u64 = 8;
+/// Confirmed blocks kept in the recent-window cache (newest first). 33
+/// consecutive block timestamps yield the 32 block-time intervals of the
+/// GUI's block-time graph (a bounded, newest-right window); the flow strip
+/// renders only its own smaller tile cap from the same cache. Backfill stays
+/// rate-limited by `MAX_FETCH_PER_REFRESH`, so widening the window can never
+/// widen the per-refresh RPC load — a cold start simply fills across cycles.
+pub(crate) const RECENT_DEPTH: u64 = 33;
 /// Upper bound on `sov_getBlockByHeight` calls per template refresh.
 pub(crate) const MAX_FETCH_PER_REFRESH: usize = 4;
 /// Accepted block submissions remembered for the "yours" highlight.
@@ -28,6 +33,14 @@ const MAX_HASH_CHARS: usize = 128;
 /// tail beyond this cap merges into the last projected block (as
 /// mempool.space does) so nothing pending is silently dropped.
 pub(crate) const MAX_PROJECTED_BLOCKS: usize = 6;
+/// Most individually reported blocks per tip advance. A larger jump (slow
+/// poll, node catch-up) reports only the newest `MAX_GAP_BLOCKS` heights plus
+/// one explicit "… and N more" summary, so a big gap can never spam unbounded
+/// log lines or issue unbounded `sov_getBlockByHeight` calls.
+pub(crate) const MAX_GAP_BLOCKS: u64 = 4;
+/// Reported height→hash entries remembered for idempotence and reorg
+/// detection (bounded; oldest heights are pruned as the tip advances).
+const MAX_REPORTED_TRACKED: usize = 64;
 
 /// The object that actually carries block fields: some RPC shapes nest the
 /// block under a `block` key; use it when present, else the value itself.
@@ -75,6 +88,24 @@ pub(crate) fn block_hash(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|hash| !hash.is_empty() && hash.len() <= MAX_HASH_CHARS)
         .map(str::to_owned)
+}
+
+/// The block's own miner-declared header timestamp in milliseconds, when the
+/// node discloses one. Live-verified `sov_getBlockByHeight` shape: the field
+/// is `header.timestamp_ms` (integer milliseconds); the node's camelCase
+/// convention `timestampMs` (used by `sov_getBlockTemplate`) is accepted
+/// equivalently. Absent both, the timestamp is unknown and every consumer
+/// must render a gap — never interpolate, estimate, or carry a neighbour
+/// forward.
+pub(crate) fn block_timestamp_ms(value: &Value) -> Option<u64> {
+    let facet = block_facet(value);
+    let read = |object: &Value| {
+        object
+            .get("timestamp_ms")
+            .or_else(|| object.get("timestampMs"))
+            .and_then(Value::as_u64)
+    };
+    facet.get("header").and_then(read).or_else(|| read(facet))
 }
 
 /// The fee-to-get-in from `sov_estimateFee`, in grains. The live node returns
@@ -252,11 +283,162 @@ impl SealedBlocks {
     }
 }
 
+/// How one tip poll advanced the network block feed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TipAdvance {
+    /// First successful poll of a session (start or reconnect): a single
+    /// baseline is announced and chain history is never replayed as a flood
+    /// of block-found lines.
+    Baseline { height: u64 },
+    /// The tip advanced. `report` holds the heights to announce individually
+    /// (ascending, at most `MAX_GAP_BLOCKS`); `omitted` counts the older
+    /// intervening heights (`omitted_from..=omitted_to`) summarized instead
+    /// of reported one by one.
+    Blocks {
+        report: Vec<u64>,
+        omitted: u64,
+        omitted_from: u64,
+        omitted_to: u64,
+    },
+    /// No new height (unchanged, or the tip moved backward — a reorg line is
+    /// produced later by the hash change at refetch, never a duplicate
+    /// block-found line here).
+    Unchanged,
+}
+
+/// The outcome of registering one observed block with the feed's memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BlockRecord {
+    /// First time this height is reported: announce it.
+    New,
+    /// This height (and hash, when both are known) was already reported —
+    /// including across reconnects. Never announce it again.
+    AlreadyReported,
+    /// The same height reappeared with a DIFFERENT node-disclosed hash: a
+    /// reorg, announced distinctly, never as a duplicate block-found line.
+    Reorg { previous_hash: String },
+}
+
+/// Tip-advance detector behind the network block feed. Pure state, fed only
+/// real `sov_health` heights and real `sov_getBlockByHeight` hashes; it never
+/// fabricates, estimates, or interpolates a block. It outlives RPC sessions so
+/// a reconnect re-baselines without ever re-reporting a known height+hash.
+#[derive(Debug, Default)]
+pub(crate) struct TipWatch {
+    /// Last tip height already accounted for; `None` until the first poll.
+    last_tip: Option<u64>,
+    /// Set by `begin_session`; forces a single baseline announcement on the
+    /// next poll instead of replaying whatever happened while disconnected.
+    needs_baseline: bool,
+    /// Height → node-disclosed hash (when any) of every reported block,
+    /// bounded to `MAX_REPORTED_TRACKED` newest heights.
+    reported: BTreeMap<u64, Option<String>>,
+}
+
+impl TipWatch {
+    /// Call at the start of every direct-RPC session (connect or reconnect):
+    /// the next successful poll announces one baseline line only.
+    pub(crate) fn begin_session(&mut self) {
+        self.needs_baseline = true;
+    }
+
+    /// Feed one successful `sov_health` tip height; returns what to announce.
+    pub(crate) fn observe_tip(&mut self, tip: u64) -> TipAdvance {
+        if self.needs_baseline || self.last_tip.is_none() {
+            self.needs_baseline = false;
+            self.last_tip = Some(tip);
+            // Remember the baseline height itself (hash still unknown) so a
+            // later reorg replacing the baseline block is detected.
+            self.reported.entry(tip).or_insert(None);
+            self.prune();
+            return TipAdvance::Baseline { height: tip };
+        }
+        let last = self.last_tip.expect("tip watch baselined");
+        if tip <= last {
+            // Unchanged tip, or a shorter chain after a reorg: track the
+            // lower tip so a subsequent re-advance is observed, but announce
+            // nothing here (idempotence; the reorg line comes from the hash
+            // change at refetch).
+            self.last_tip = Some(tip.min(last));
+            return TipAdvance::Unchanged;
+        }
+        self.last_tip = Some(tip);
+        let gap = tip - last;
+        let reported = gap.min(MAX_GAP_BLOCKS);
+        let omitted = gap - reported;
+        let first_reported = tip - reported + 1;
+        TipAdvance::Blocks {
+            report: (first_reported..=tip).collect(),
+            omitted,
+            omitted_from: last + 1,
+            omitted_to: first_reported.saturating_sub(1),
+        }
+    }
+
+    /// Register a height about to be announced (from `TipAdvance::Blocks`).
+    /// Deduplicates across tip regressions and reconnects and converts a
+    /// changed node-disclosed hash into a reorg.
+    pub(crate) fn record_reported(&mut self, height: u64, hash: Option<&str>) -> BlockRecord {
+        self.record(height, hash, true)
+    }
+
+    /// Register a block fetched for any other reason (strip backfill). Never
+    /// produces a `New` announcement — history stays history — but a changed
+    /// hash at an already-known height still surfaces as a reorg.
+    pub(crate) fn observe_fetched(&mut self, height: u64, hash: Option<&str>) -> BlockRecord {
+        self.record(height, hash, false)
+    }
+
+    fn record(&mut self, height: u64, hash: Option<&str>, announce_new: bool) -> BlockRecord {
+        let hash = hash
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty() && hash.len() <= MAX_HASH_CHARS)
+            .map(str::to_owned);
+        let record = match self.reported.get_mut(&height) {
+            Some(existing) => match (existing.as_deref(), hash.as_deref()) {
+                (Some(previous), Some(new)) if previous != new => {
+                    let previous = previous.to_owned();
+                    *existing = hash;
+                    BlockRecord::Reorg {
+                        previous_hash: previous,
+                    }
+                }
+                (None, Some(_)) => {
+                    // First time the node disclosed this block's hash: learn
+                    // it silently for future reorg detection.
+                    *existing = hash;
+                    BlockRecord::AlreadyReported
+                }
+                _ => BlockRecord::AlreadyReported,
+            },
+            None => {
+                self.reported.insert(height, hash);
+                if announce_new {
+                    BlockRecord::New
+                } else {
+                    BlockRecord::AlreadyReported
+                }
+            }
+        };
+        self.prune();
+        record
+    }
+
+    fn prune(&mut self) {
+        while self.reported.len() > MAX_REPORTED_TRACKED {
+            let oldest = *self.reported.keys().next().expect("non-empty reported map");
+            self.reported.remove(&oldest);
+        }
+    }
+}
+
 /// What is known about one confirmed block, fetched via `sov_getBlockByHeight`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BlockInfo {
     pub(crate) hash: Option<String>,
     pub(crate) tx_count: Option<u64>,
+    /// Miner-declared header timestamp in ms; feeds the block-time graph.
+    pub(crate) timestamp_ms: Option<u64>,
 }
 
 /// One rendered tile of the confirmed strip.
@@ -264,6 +446,7 @@ pub(crate) struct BlockInfo {
 pub(crate) struct Tile {
     pub(crate) height: u64,
     pub(crate) tx_count: Option<u64>,
+    pub(crate) timestamp_ms: Option<u64>,
     pub(crate) mine: bool,
 }
 
@@ -330,6 +513,7 @@ impl RecentBlocks {
             tiles.push(Tile {
                 height,
                 tx_count: info.and_then(|info| info.tx_count),
+                timestamp_ms: info.and_then(|info| info.timestamp_ms),
                 mine: sealed.sealed(height, info.and_then(|info| info.hash.as_deref())),
             });
             if height == Self::window_start(tip) {
@@ -620,7 +804,55 @@ mod tests {
         BlockInfo {
             hash: Some(hash.to_owned()),
             tx_count: Some(txs),
+            timestamp_ms: None,
         }
+    }
+
+    #[test]
+    fn block_timestamp_reads_only_node_disclosed_millisecond_fields() {
+        // Live-verified mainnet shape: header.timestamp_ms in milliseconds.
+        assert_eq!(
+            block_timestamp_ms(&json!({
+                "header": {"height": 7, "timestamp_ms": 1_784_936_544_968_u64},
+                "transactions": [],
+            })),
+            Some(1_784_936_544_968)
+        );
+        // The node's other (template) spelling is accepted equivalently.
+        assert_eq!(
+            block_timestamp_ms(&json!({"header": {"timestampMs": 5}})),
+            Some(5)
+        );
+        assert_eq!(block_timestamp_ms(&json!({"timestamp_ms": 9})), Some(9));
+        assert_eq!(
+            block_timestamp_ms(&json!({"block": {"header": {"timestamp_ms": 3}}})),
+            Some(3)
+        );
+        // Undisclosed or malformed stays unknown — never a guess.
+        assert_eq!(block_timestamp_ms(&json!({"header": {"height": 7}})), None);
+        assert_eq!(
+            block_timestamp_ms(&json!({"header": {"timestamp_ms": "soon"}})),
+            None
+        );
+        assert_eq!(block_timestamp_ms(&json!(null)), None);
+    }
+
+    #[test]
+    fn tiles_carry_node_disclosed_timestamps_for_the_block_time_graph() {
+        let mut recent = RecentBlocks::default();
+        recent.insert(
+            50,
+            50,
+            BlockInfo {
+                hash: Some("aa".into()),
+                tx_count: Some(1),
+                timestamp_ms: Some(1_000),
+            },
+        );
+        recent.insert(50, 49, info("bb", 2)); // no timestamp disclosed
+        let tiles = recent.tiles(50, &SealedBlocks::default());
+        assert_eq!(tiles[0].timestamp_ms, Some(1_000));
+        assert_eq!(tiles[1].timestamp_ms, None, "unknown stays unknown");
     }
 
     #[test]
@@ -653,6 +885,7 @@ mod tests {
             Tile {
                 height: 50,
                 tx_count: Some(5),
+                timestamp_ms: None,
                 mine: false
             }
         );
@@ -661,6 +894,7 @@ mod tests {
             Tile {
                 height: 49,
                 tx_count: Some(2),
+                timestamp_ms: None,
                 mine: true
             }
         );
@@ -670,6 +904,7 @@ mod tests {
             Tile {
                 height: 48,
                 tx_count: None,
+                timestamp_ms: None,
                 mine: false
             }
         );
@@ -693,18 +928,226 @@ mod tests {
     }
 
     #[test]
+    fn tip_watch_baselines_once_and_never_replays_history() {
+        let mut watch = TipWatch::default();
+        watch.begin_session();
+        // First successful poll: one baseline line, no block-found flood even
+        // though the chain has 11_519 blocks of history.
+        assert_eq!(
+            watch.observe_tip(11_519),
+            TipAdvance::Baseline { height: 11_519 }
+        );
+        // The same tip on the next poll announces nothing.
+        assert_eq!(watch.observe_tip(11_519), TipAdvance::Unchanged);
+        // A single new block is reported exactly once.
+        assert_eq!(
+            watch.observe_tip(11_520),
+            TipAdvance::Blocks {
+                report: vec![11_520],
+                omitted: 0,
+                omitted_from: 11_520,
+                omitted_to: 11_519,
+            }
+        );
+        assert_eq!(watch.observe_tip(11_520), TipAdvance::Unchanged);
+    }
+
+    #[test]
+    fn tip_watch_rebaselines_on_reconnect_without_rereporting() {
+        let mut watch = TipWatch::default();
+        watch.begin_session();
+        assert_eq!(watch.observe_tip(100), TipAdvance::Baseline { height: 100 });
+        // The baseline height itself is covered by the baseline line and can
+        // never be re-announced as a found block.
+        assert_eq!(
+            watch.record_reported(100, Some("99")),
+            BlockRecord::AlreadyReported
+        );
+        assert_eq!(
+            watch.observe_tip(101),
+            TipAdvance::Blocks {
+                report: vec![101],
+                omitted: 0,
+                omitted_from: 101,
+                omitted_to: 100,
+            }
+        );
+        assert_eq!(watch.record_reported(101, Some("aa")), BlockRecord::New);
+
+        // The session drops; blocks 102..=105 appear while disconnected.
+        // Reconnect: a single new baseline, never a four-line replay.
+        watch.begin_session();
+        assert_eq!(watch.observe_tip(105), TipAdvance::Baseline { height: 105 });
+        // And a height+hash reported before the reconnect stays reported.
+        assert_eq!(
+            watch.record_reported(101, Some("aa")),
+            BlockRecord::AlreadyReported
+        );
+    }
+
+    #[test]
+    fn tip_watch_bounds_gap_reporting_and_counts_the_omitted_tail() {
+        let mut watch = TipWatch::default();
+        watch.begin_session();
+        assert_eq!(watch.observe_tip(50), TipAdvance::Baseline { height: 50 });
+
+        // A jump within the bound reports every intervening height.
+        assert_eq!(
+            watch.observe_tip(53),
+            TipAdvance::Blocks {
+                report: vec![51, 52, 53],
+                omitted: 0,
+                omitted_from: 51,
+                omitted_to: 50,
+            }
+        );
+
+        // A jump beyond the bound reports only the newest MAX_GAP_BLOCKS
+        // heights and says explicitly how many older ones were skipped —
+        // bounded lines AND bounded follow-up RPCs, never silent truncation.
+        assert_eq!(
+            watch.observe_tip(53 + MAX_GAP_BLOCKS + 7),
+            TipAdvance::Blocks {
+                report: (61..=64).collect(),
+                omitted: 7,
+                omitted_from: 54,
+                omitted_to: 60,
+            }
+        );
+    }
+
+    #[test]
+    fn tip_watch_reports_a_reorg_distinctly_and_never_a_duplicate_block() {
+        let mut watch = TipWatch::default();
+        watch.begin_session();
+        assert_eq!(watch.observe_tip(10), TipAdvance::Baseline { height: 10 });
+        assert_eq!(
+            watch.observe_tip(11),
+            TipAdvance::Blocks {
+                report: vec![11],
+                omitted: 0,
+                omitted_from: 11,
+                omitted_to: 10,
+            }
+        );
+        assert_eq!(watch.record_reported(11, Some("aa")), BlockRecord::New);
+
+        // Idempotence: the same height+hash is never reported twice.
+        assert_eq!(
+            watch.record_reported(11, Some("aa")),
+            BlockRecord::AlreadyReported
+        );
+
+        // The tip walking back to 10 announces nothing by itself…
+        assert_eq!(watch.observe_tip(10), TipAdvance::Unchanged);
+        // …and height 11 reappearing with a DIFFERENT hash is a reorg line,
+        // not a second block-found line.
+        assert_eq!(
+            watch.observe_tip(11),
+            TipAdvance::Blocks {
+                report: vec![11],
+                omitted: 0,
+                omitted_from: 11,
+                omitted_to: 10,
+            }
+        );
+        assert_eq!(
+            watch.record_reported(11, Some("bb")),
+            BlockRecord::Reorg {
+                previous_hash: "aa".into(),
+            }
+        );
+        // The replacement is now the known block at 11.
+        assert_eq!(
+            watch.record_reported(11, Some("bb")),
+            BlockRecord::AlreadyReported
+        );
+    }
+
+    #[test]
+    fn tip_watch_backfill_learns_hashes_silently_and_flags_reorgs() {
+        let mut watch = TipWatch::default();
+        watch.begin_session();
+        assert_eq!(watch.observe_tip(20), TipAdvance::Baseline { height: 20 });
+
+        // Strip backfill of history (heights below the baseline) must never
+        // produce a block-found announcement…
+        assert_eq!(
+            watch.observe_fetched(15, Some("cc")),
+            BlockRecord::AlreadyReported
+        );
+        // …but it registers the hash, so a later replacement IS a reorg.
+        assert_eq!(
+            watch.observe_fetched(15, Some("dd")),
+            BlockRecord::Reorg {
+                previous_hash: "cc".into(),
+            }
+        );
+
+        // The baseline block itself: hash learned silently on first fetch,
+        // reorg on replacement.
+        assert_eq!(
+            watch.observe_fetched(20, Some("ee")),
+            BlockRecord::AlreadyReported
+        );
+        assert_eq!(
+            watch.observe_fetched(20, Some("ff")),
+            BlockRecord::Reorg {
+                previous_hash: "ee".into(),
+            }
+        );
+
+        // A node that discloses no hash (the live pre-upgrade shape) can
+        // never produce a false reorg.
+        assert_eq!(
+            watch.observe_fetched(20, None),
+            BlockRecord::AlreadyReported
+        );
+    }
+
+    #[test]
+    fn tip_watch_memory_is_bounded_and_rejects_oversized_hashes() {
+        let mut watch = TipWatch::default();
+        watch.begin_session();
+        assert_eq!(watch.observe_tip(0), TipAdvance::Baseline { height: 0 });
+        for height in 1..=(MAX_REPORTED_TRACKED as u64 + 16) {
+            watch.observe_tip(height);
+            watch.record_reported(height, Some(&format!("{height:064x}")));
+        }
+        assert!(watch.reported.len() <= MAX_REPORTED_TRACKED);
+        // Pruned heights fell off the oldest end; the newest stay known.
+        assert_eq!(
+            watch.record_reported(
+                MAX_REPORTED_TRACKED as u64 + 16,
+                Some(&format!("{:064x}", MAX_REPORTED_TRACKED as u64 + 16)),
+            ),
+            BlockRecord::AlreadyReported
+        );
+
+        // A node-supplied hash beyond the sanity bound is ignored, exactly
+        // like `block_hash`, so it cannot grow memory or fake a reorg.
+        let oversized = "ff".repeat(MAX_HASH_CHARS);
+        assert_eq!(
+            watch.record_reported(MAX_REPORTED_TRACKED as u64 + 16, Some(&oversized)),
+            BlockRecord::AlreadyReported
+        );
+    }
+
+    #[test]
     fn cache_prunes_to_the_visible_window() {
         let mut recent = RecentBlocks::default();
-        recent.insert(50, 50, info("aa", 1));
-        recent.insert(50, 43, info("bb", 2));
-        // The tip advancing pushes 43 out of the window.
-        recent.insert(58, 58, info("cc", 3));
+        recent.insert(100, 100, info("aa", 1));
+        recent.insert(100, 100 - (RECENT_DEPTH - 1), info("bb", 2));
+        // The tip advancing pushes both old entries out of the window.
+        let far_tip = 100 + RECENT_DEPTH;
+        recent.insert(far_tip, far_tip, info("cc", 3));
+        let window_start = far_tip - (RECENT_DEPTH - 1);
         assert!(recent
-            .refresh_targets(58)
+            .refresh_targets(far_tip)
             .iter()
-            .all(|height| *height >= 51));
+            .all(|height| *height >= window_start));
         assert_eq!(
-            recent.tiles(58, &SealedBlocks::default())[0].tx_count,
+            recent.tiles(far_tip, &SealedBlocks::default())[0].tx_count,
             Some(3)
         );
     }
