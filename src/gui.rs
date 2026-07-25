@@ -971,6 +971,121 @@ struct ProjectedFlowTile {
     fee_max_grains: u64,
 }
 
+/// The engine's additive `backlog` telemetry: the validated
+/// `sov_getMempoolHistogram` summary. `None` means the node DID NOT serve a
+/// histogram (older node, error, malformed reply) — rendered as an explicit
+/// UNAVAILABLE state, never as a plausible-looking empty backlog. Every
+/// figure is the node's own (`tx_count`, `max_block_txs`) or exact engine
+/// arithmetic over it (`depth_blocks`, the packed `blocks`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BacklogView {
+    tx_count: u64,
+    max_block_txs: u64,
+    /// Exact full-capacity blocks the overflow beyond the forming block
+    /// occupies — independent of the render cap on `blocks`.
+    depth_blocks: u64,
+    /// Packed pending blocks beyond the forming one (tail merged into the
+    /// last entry by the engine), bounded to `MAX_BACKLOG_VIEW_BLOCKS`.
+    blocks: Vec<ProjectedFlowTile>,
+}
+
+impl BacklogView {
+    /// Strict parse of the additive `backlog` member. `None` for JSON null,
+    /// absence, or ANY malformed field — a partially parsed backlog could
+    /// misstate depth, so it degrades whole to the unavailable state.
+    fn parse(value: Option<&Value>) -> Option<Self> {
+        let value = value?;
+        let blocks_raw = value.get("blocks")?.as_array()?;
+        if blocks_raw.len() > MAX_BACKLOG_VIEW_BLOCKS {
+            return None;
+        }
+        let blocks = blocks_raw
+            .iter()
+            .map(|block| {
+                Some(ProjectedFlowTile {
+                    tx_count: block.get("tx_count").and_then(Value::as_u64)?,
+                    fee_min_grains: block.get("fee_min_grains").and_then(Value::as_u64)?,
+                    fee_max_grains: block.get("fee_max_grains").and_then(Value::as_u64)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            tx_count: value.get("tx_count").and_then(Value::as_u64)?,
+            max_block_txs: value.get("max_block_txs").and_then(Value::as_u64)?,
+            depth_blocks: value.get("depth_blocks").and_then(Value::as_u64)?,
+            blocks,
+        })
+    }
+}
+
+/// The mutually exclusive on-screen states of the backlog panel body. The
+/// distinction between `Unavailable` ("the node did not tell us") and
+/// `Empty`/`Clear` (the node affirmatively reported the mempool state) is
+/// the panel's core honesty rule and is pinned by tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BacklogState {
+    /// No `block_flow` telemetry at all yet (connecting / warming up).
+    AwaitingData,
+    /// Telemetry is live but the node did not serve a histogram.
+    Unavailable,
+    /// Histogram served: zero pending transactions.
+    Empty,
+    /// Histogram served: everything pending fits in the forming block.
+    Clear { pending: u64 },
+    /// Histogram served: `depth_blocks` full blocks of overflow to chart.
+    Deep,
+}
+
+fn backlog_state(flow: Option<&BlockFlowView>) -> BacklogState {
+    match flow {
+        None => BacklogState::AwaitingData,
+        Some(flow) => match flow.backlog.as_ref() {
+            None => BacklogState::Unavailable,
+            Some(backlog) if backlog.tx_count == 0 => BacklogState::Empty,
+            Some(backlog) if backlog.depth_blocks == 0 => BacklogState::Clear {
+                pending: backlog.tx_count,
+            },
+            Some(_) => BacklogState::Deep,
+        },
+    }
+}
+
+/// The observed backlog trend over the retained sample window: the delta
+/// between the newest and the oldest in-window pending count, both REAL
+/// node-served histogram figures with their real observation span. `None`
+/// until two samples at least `BACKLOG_TREND_MIN_SPAN` apart exist — no
+/// trend is ever claimed from a single sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BacklogTrend {
+    delta: i64,
+    span: Duration,
+}
+
+/// Retained (observed-at, pending-tx) samples: one per received backlog
+/// snapshot, bounded, cleared with the session (a trend must never bridge a
+/// connection gap the miner did not observe).
+const MAX_BACKLOG_TREND_SAMPLES: usize = 240;
+/// Oldest sample age considered when computing the trend.
+const BACKLOG_TREND_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// Minimum observed span before any trend is claimed.
+const BACKLOG_TREND_MIN_SPAN: Duration = Duration::from_secs(30);
+
+fn backlog_trend(history: &VecDeque<(Instant, u64)>, now: Instant) -> Option<BacklogTrend> {
+    let (newest_at, newest) = *history.back()?;
+    let (oldest_at, oldest) = *history
+        .iter()
+        .find(|(at, _)| now.saturating_duration_since(*at) <= BACKLOG_TREND_WINDOW)?;
+    let span = newest_at.saturating_duration_since(oldest_at);
+    if span < BACKLOG_TREND_MIN_SPAN {
+        return None;
+    }
+    let delta = i128::from(newest) - i128::from(oldest);
+    Some(BacklogTrend {
+        delta: i64::try_from(delta).unwrap_or(if delta > 0 { i64::MAX } else { i64::MIN }),
+        span,
+    })
+}
+
 /// The mempool.space-style strip: recent confirmed blocks (newest first), the
 /// forming template block, projected pending blocks behind it, and the
 /// node's fee-to-get-in.
@@ -983,6 +1098,8 @@ struct BlockFlowView {
     /// (1 XUS = 10^8 grains), relayed by the engine — the live auction
     /// `floorGrains` when the node serves it, else the flat `feeGrains`.
     fee_grains: Option<u64>,
+    /// Additive multi-block backlog; `None` = histogram not served.
+    backlog: Option<BacklogView>,
     projected: Vec<ProjectedFlowTile>,
     recent: Vec<BlockFlowTile>,
 }
@@ -991,6 +1108,11 @@ const MAX_FLOW_TILES: usize = 12;
 /// Bound on rendered projected pending tiles (the engine already merges the
 /// packing tail into its last projected block).
 const MAX_PROJECTED_FLOW_TILES: usize = 6;
+/// Bound on retained backlog blocks from one `block_flow` event: the
+/// engine's own packing cap. A longer array is a malformed event and drops
+/// the whole backlog to the unavailable state — bounded memory, no partial
+/// misrepresentation.
+const MAX_BACKLOG_VIEW_BLOCKS: usize = 24;
 /// Bound on retained recent-block entries from one `block_flow` event: the
 /// engine's window (33) plus slack, so a malformed or hostile event can never
 /// grow GUI memory. The strip still renders at most `MAX_FLOW_TILES` tiles;
@@ -1008,6 +1130,7 @@ impl BlockFlowView {
             template_height: value.pointer("/template/height").and_then(Value::as_u64),
             template_tx_count: value.pointer("/template/tx_count").and_then(Value::as_u64),
             fee_grains: value.get("fee_grains").and_then(Value::as_u64),
+            backlog: BacklogView::parse(value.get("backlog")),
             projected: value
                 .get("projected")
                 .and_then(Value::as_array)
@@ -1255,6 +1378,9 @@ struct MinerApp {
     /// deliberately not the miner-declared block timestamp, and labeled as
     /// such wherever it is rendered.
     tip_observed_at: Option<Instant>,
+    /// (observed-at, pending-tx) samples from node-served backlog snapshots
+    /// only — bounded, session-scoped, and the sole input of the TREND chip.
+    backlog_history: VecDeque<(Instant, u64)>,
     meter_history: VecDeque<MeterSample>,
     last_metrics_at: Option<Instant>,
     ready_workers: u64,
@@ -1328,6 +1454,7 @@ impl Default for MinerApp {
             block_flow: None,
             observed_tip_height: None,
             tip_observed_at: None,
+            backlog_history: VecDeque::new(),
             meter_history: VecDeque::new(),
             last_metrics_at: None,
             ready_workers: 0,
@@ -1525,6 +1652,7 @@ impl MinerApp {
         self.block_flow = None;
         self.observed_tip_height = None;
         self.tip_observed_at = None;
+        self.backlog_history.clear();
         self.meter_history.clear();
         self.last_metrics_at = None;
         self.ready_workers = 0;
@@ -2552,6 +2680,15 @@ impl MinerApp {
                         self.tip_observed_at = Some(Instant::now());
                     }
                 }
+                // Trend samples come ONLY from node-served backlog
+                // snapshots; an unavailable histogram records nothing.
+                if let Some(backlog) = flow.backlog.as_ref() {
+                    self.backlog_history
+                        .push_back((Instant::now(), backlog.tx_count));
+                    while self.backlog_history.len() > MAX_BACKLOG_TREND_SAMPLES {
+                        self.backlog_history.pop_front();
+                    }
+                }
                 self.block_flow = Some(flow);
             }
             Some("chain_baseline") => {
@@ -2779,6 +2916,8 @@ impl MinerApp {
                 // blocks may appear while disconnected without being observed.
                 self.observed_tip_height = None;
                 self.tip_observed_at = None;
+                // A trend must never bridge a gap the miner did not observe.
+                self.backlog_history.clear();
                 let session_error = value.get("message").and_then(Value::as_str).map_or_else(
                     || "Pool session ended.".to_owned(),
                     |message| self.redact_sensitive_text(message),
@@ -3703,6 +3842,209 @@ impl MinerApp {
             });
     }
 
+    /// Multi-block mempool backlog: how many blocks deep the pending queue
+    /// stretches beyond the forming block, the effective tip that gets into
+    /// each projected block, total pending size, and the observed trend —
+    /// all from the node's own `sov_getMempoolHistogram` relayed by the
+    /// engine (no extra RPC; the call already rides the template-refresh
+    /// budget). The degraded states are deliberately distinct on screen:
+    /// awaiting telemetry, histogram UNAVAILABLE (the node did not tell us —
+    /// the backlog is UNKNOWN, not empty), and an affirmatively empty or
+    /// clear backlog the node actually reported.
+    fn mempool_backlog_panel(&self, ui: &mut egui::Ui) {
+        if !is_direct_node_endpoint(&self.settings.pool) && self.block_flow.is_none() {
+            // Pool (Stratum) mode has no direct node RPC to observe the
+            // mempool through — hidden exactly like the strip and the
+            // block-time graph; the engine's chain_feed_unavailable log
+            // line says why.
+            return;
+        }
+        ui.add_space(12.0);
+        Frame::new()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::same(16))
+            .show(ui, |ui| {
+                let flow = self.block_flow.as_ref();
+                let state = backlog_state(flow);
+                let backlog = flow.and_then(|flow| flow.backlog.as_ref());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("MEMPOOL BACKLOG")
+                            .size(11.0)
+                            .strong()
+                            .color(MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Right-to-left: first chip lands rightmost.
+                        match backlog_trend(&self.backlog_history, Instant::now())
+                            .filter(|_| backlog.is_some())
+                        {
+                            Some(trend) => {
+                                let (glyph, word, color) = if trend.delta > 0 {
+                                    ("▲", "GROWING", AMBER)
+                                } else if trend.delta < 0 {
+                                    ("▼", "DRAINING", GREEN)
+                                } else {
+                                    ("→", "STEADY", MUTED)
+                                };
+                                telemetry_chip(
+                                    ui,
+                                    "TREND",
+                                    &format!(
+                                        "{glyph} {word} {}{} TX / {}",
+                                        if trend.delta > 0 { "+" } else { "" },
+                                        trend.delta,
+                                        format_elapsed(trend.span),
+                                    ),
+                                    color,
+                                    "Observed change in the node-reported pending count between the oldest and newest histogram samples this miner retained (bounded 10-minute window). Both endpoints are real node figures; nothing between them is interpolated. Cleared on reconnect — a trend never bridges an unobserved gap.",
+                                );
+                            }
+                            None => telemetry_chip(
+                                ui,
+                                "TREND",
+                                "—",
+                                MUTED,
+                                "Trend locks after two node-served histogram samples at least 30 seconds apart within this session. No trend is ever claimed from a single sample or across a connection gap.",
+                            ),
+                        }
+                        telemetry_chip(
+                            ui,
+                            "CAPACITY",
+                            &backlog.map_or_else(
+                                || "—".into(),
+                                |backlog| format!("{} TX/BLK", format_count(backlog.max_block_txs)),
+                            ),
+                            PURPLE,
+                            "maxBlockTxs: the node's own per-block transaction capacity — the packing unit of the blockspace auction and of every projected block shown here.",
+                        );
+                        telemetry_chip(
+                            ui,
+                            "PENDING",
+                            &backlog.map_or_else(
+                                || "—".into(),
+                                |backlog| format!("{} TX", format_count(backlog.tx_count)),
+                            ),
+                            CYAN,
+                            "txCount: total pending transactions in the node's mempool histogram. '—' when the node did not serve the histogram.",
+                        );
+                        telemetry_chip(
+                            ui,
+                            "DEPTH",
+                            &backlog.map_or_else(
+                                || "—".into(),
+                                |backlog| {
+                                    format!(
+                                        "{} BLOCK{}",
+                                        format_count(backlog.depth_blocks),
+                                        if backlog.depth_blocks == 1 { "" } else { "S" },
+                                    )
+                                },
+                            ),
+                            AMBER,
+                            "Exact number of full blocks the pending overflow beyond the forming block occupies — computed from the node's own txCount and maxBlockTxs, independent of how many bars fit on screen. 0 = everything pending fits in the forming block.",
+                        );
+                    });
+                });
+                ui.add_space(10.0);
+                match state {
+                    BacklogState::AwaitingData => {
+                        ui.label(
+                            RichText::new("Awaiting real mempool data from the connected SOV node…")
+                                .size(10.0)
+                                .color(MUTED),
+                        );
+                    }
+                    BacklogState::Unavailable => {
+                        // The node did not tell us. This must be unmistakably
+                        // different from an empty backlog: its own framed
+                        // callout, its own wording, no zeroed figures.
+                        Frame::new()
+                            .fill(AMBER.gamma_multiply(0.07))
+                            .stroke(Stroke::new(1.0, AMBER.gamma_multiply(0.45)))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("HISTOGRAM UNAVAILABLE — BACKLOG UNKNOWN")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(AMBER),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "The connected node did not serve sov_getMempoolHistogram (older node, error, or malformed reply). The queue beyond the forming block is UNKNOWN — not empty — and nothing here is estimated in its place.",
+                                    )
+                                    .size(10.0)
+                                    .color(TEXT),
+                                );
+                            });
+                    }
+                    BacklogState::Empty => {
+                        // Affirmative emptiness: the node REPORTED zero.
+                        Frame::new()
+                            .fill(GREEN.gamma_multiply(0.06))
+                            .stroke(Stroke::new(1.0, GREEN.gamma_multiply(0.35)))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("MEMPOOL EMPTY")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(GREEN),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "The node's histogram reports 0 pending transactions — an affirmative report, not missing data.",
+                                    )
+                                    .size(10.0)
+                                    .color(TEXT),
+                                );
+                            });
+                    }
+                    BacklogState::Clear { pending } => {
+                        Frame::new()
+                            .fill(GREEN.gamma_multiply(0.06))
+                            .stroke(Stroke::new(1.0, GREEN.gamma_multiply(0.35)))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("BACKLOG CLEAR")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(GREEN),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "All {pending} pending transaction{} fit in the forming block — nothing overflows into a later block.",
+                                        if pending == 1 { "" } else { "s" },
+                                    ))
+                                    .size(10.0)
+                                    .color(TEXT),
+                                );
+                            });
+                    }
+                    BacklogState::Deep => {
+                        if let Some(backlog) = backlog {
+                            backlog_chart(ui, backlog, self.target_block_ms);
+                        }
+                    }
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Real node data only — the node's own sov_getMempoolHistogram (effective-tip buckets, highest first) packed by its own maxBlockTxs capacity, exactly as the blockspace auction admits transactions. Bar height = how full each projected block is; the label under a bar is the lowest effective tip that gets into it (grains). An amber +N bar is the merged tail: the remaining transactions beyond the render cap, never dropped. DEPTH stays exact regardless. No histogram ⇒ the explicit UNAVAILABLE state above, never an invented backlog.",
+                    )
+                    .size(9.0)
+                    .color(MUTED),
+                );
+            });
+    }
+
     /// Block-time graph: one bar per confirmed block in the bounded window,
     /// bar height = the interval between that block's miner-declared header
     /// timestamp and its parent's (`sov_getBlockByHeight`), against reference
@@ -3865,6 +4207,7 @@ impl MinerApp {
         });
 
         self.block_flow_strip(ui);
+        self.mempool_backlog_panel(ui);
         self.block_time_graph(ui);
 
         ui.add_space(12.0);
@@ -4708,6 +5051,147 @@ fn block_time_chart(ui: &mut egui::Ui, bars: &[IntervalBar], target_block_ms: Op
             FontId::proportional(11.0),
             MUTED,
         );
+    }
+}
+
+/// Paint the backlog chart: one column per projected pending block beyond
+/// the forming one, in queue order (nearest block leftmost). Column height —
+/// the primary encoding — is the block's fill against the node's own
+/// per-block capacity line; colour is secondary and always paired with a
+/// label ("+N BLK" on the merged amber tail). Fee-entry labels are 9 px
+/// monospace and thin out instead of shrinking when slots get narrow; every
+/// figure lives in the per-column tooltip regardless of width. Reads only
+/// the immutable snapshot passed in.
+fn backlog_chart(ui: &mut egui::Ui, backlog: &BacklogView, target_block_ms: Option<u64>) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 132.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(8), BG);
+    let outer = rect.shrink2(Vec2::new(8.0, 7.0));
+    let plot_top = outer.top() + 15.0;
+    let plot_bottom = outer.bottom() - 14.0;
+
+    // The node's own capacity is the 100% line — dashed, labeled.
+    let mut x = outer.left();
+    while x + 5.0 < outer.right() {
+        painter.line_segment(
+            [egui::pos2(x, plot_top), egui::pos2(x + 5.0, plot_top)],
+            Stroke::new(1.0, PURPLE.gamma_multiply(0.5)),
+        );
+        x += 9.0;
+    }
+    painter.text(
+        egui::pos2(outer.right(), plot_top - 2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("CAP {} TX/BLOCK", format_count(backlog.max_block_txs)),
+        FontId::monospace(9.0),
+        PURPLE,
+    );
+    painter.text(
+        egui::pos2(outer.left(), plot_top - 2.0),
+        egui::Align2::LEFT_BOTTOM,
+        "QUEUE → NEAREST BLOCK FIRST",
+        FontId::monospace(9.0),
+        MUTED,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(outer.left(), plot_bottom),
+            egui::pos2(outer.right(), plot_bottom),
+        ],
+        Stroke::new(1.0, BORDER),
+    );
+
+    let count = backlog.blocks.len().max(1);
+    let slot = (outer.width() / count as f32).min(72.0);
+    // Fee labels never shrink below 9 px: when slots are narrow, label only
+    // the first and last columns (the rest stay in tooltips).
+    let label_every_bar = slot >= 40.0;
+    for (index, block) in backlog.blocks.iter().enumerate() {
+        let left = outer.left() + index as f32 * slot + 1.0;
+        let right = left + (slot - 2.0).max(1.0);
+        let center_x = (left + right) / 2.0;
+        let last = index + 1 == backlog.blocks.len();
+        // The engine merges the packing tail into the last block when the
+        // exact depth exceeds the render cap; either signal marks it.
+        let merged_tail = last
+            && (backlog.depth_blocks > backlog.blocks.len() as u64
+                || block.tx_count > backlog.max_block_txs);
+        let fill = if backlog.max_block_txs == 0 {
+            0.0
+        } else {
+            ((block.tx_count as f64) / (backlog.max_block_txs as f64)).clamp(0.0, 1.0) as f32
+        };
+        let top = egui::lerp(plot_bottom..=plot_top, fill);
+        let fade = (1.0 - index as f32 * 0.02).clamp(0.55, 1.0);
+        let color = if merged_tail {
+            AMBER
+        } else {
+            CYAN.gamma_multiply(fade)
+        };
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, plot_bottom)),
+            CornerRadius::same(2),
+            color.gamma_multiply(0.8),
+        );
+        // The merged tail is marked by SHAPE AND LABEL, not hue alone: the
+        // exact number of capacity blocks it stands for.
+        let tail_blocks = backlog
+            .depth_blocks
+            .saturating_sub(backlog.blocks.len() as u64 - 1);
+        if merged_tail {
+            painter.text(
+                egui::pos2(center_x, top - 1.0),
+                egui::Align2::CENTER_BOTTOM,
+                format!("+{} BLK", format_count(tail_blocks)),
+                FontId::monospace(9.0),
+                AMBER,
+            );
+        }
+        if label_every_bar || index == 0 || last {
+            painter.text(
+                egui::pos2(center_x, outer.bottom()),
+                egui::Align2::CENTER_BOTTOM,
+                format!("≥{}", format_count(block.fee_min_grains)),
+                FontId::monospace(9.0),
+                if merged_tail { AMBER } else { MUTED },
+            );
+        }
+
+        let position = index as u64 + 1;
+        let mut tooltip = if merged_tail {
+            format!(
+                "Merged tail: projected blocks +{position} and deeper\n{} pending tx ≈ {} block{} at the node's {}-tx capacity (nothing dropped)",
+                block.tx_count,
+                tail_blocks,
+                if tail_blocks == 1 { "" } else { "s" },
+                backlog.max_block_txs,
+            )
+        } else {
+            format!(
+                "Projected block +{position} behind the forming block\n{} of {} tx ({}% full)",
+                block.tx_count,
+                backlog.max_block_txs,
+                (fill * 100.0).round() as u64,
+            )
+        };
+        tooltip.push_str(&format!(
+            "\nEffective tip to be included: {}",
+            format_fee_rate_range(block.fee_min_grains, block.fee_max_grains),
+        ));
+        if let Some(target_ms) = target_block_ms {
+            tooltip.push_str(&format!(
+                "\n≈ {} away at the node's target cadence (statistical, not a countdown)",
+                format_eta(position as f64 * target_ms as f64 / 1_000.0),
+            ));
+        }
+        tooltip
+            .push_str("\nPacked from the node's own mempool histogram in auction admission order");
+        ui.interact(
+            egui::Rect::from_min_max(egui::pos2(left, plot_top), egui::pos2(right, plot_bottom)),
+            ui.id().with(("backlog-block", index)),
+            Sense::hover(),
+        )
+        .on_hover_text(tooltip);
     }
 }
 
@@ -7079,6 +7563,252 @@ mod tests {
             app.block_flow.as_ref().map(|flow| flow.projected.len()),
             Some(MAX_PROJECTED_FLOW_TILES)
         );
+    }
+
+    #[test]
+    fn backlog_view_parses_strictly_and_bounds_retained_blocks() {
+        // Absent or JSON-null backlog (engine: node did not serve the
+        // histogram) parses to None — the explicit UNAVAILABLE state.
+        assert_eq!(BacklogView::parse(None), None);
+        assert_eq!(BacklogView::parse(Some(&json!(null))), None);
+
+        // The exact engine shape parses.
+        let parsed = BacklogView::parse(Some(&json!({
+            "tx_count": 5,
+            "max_block_txs": 2,
+            "depth_blocks": 2,
+            "blocks": [
+                {"tx_count": 2, "fee_min_grains": 10, "fee_max_grains": 7_000},
+                {"tx_count": 1, "fee_min_grains": 10, "fee_max_grains": 10},
+            ],
+        })))
+        .expect("engine backlog shape parses");
+        assert_eq!(parsed.tx_count, 5);
+        assert_eq!(parsed.max_block_txs, 2);
+        assert_eq!(parsed.depth_blocks, 2);
+        assert_eq!(parsed.blocks.len(), 2);
+
+        // ANY malformed field drops the WHOLE backlog to unavailable — a
+        // partial parse could misstate depth.
+        for malformed in [
+            json!({"max_block_txs": 2, "depth_blocks": 0, "blocks": []}),
+            json!({"tx_count": 5, "depth_blocks": 0, "blocks": []}),
+            json!({"tx_count": 5, "max_block_txs": 2, "blocks": []}),
+            json!({"tx_count": 5, "max_block_txs": 2, "depth_blocks": 0}),
+            json!({
+                "tx_count": 5,
+                "max_block_txs": 2,
+                "depth_blocks": 1,
+                "blocks": [{"tx_count": 1, "fee_min_grains": 10}],
+            }),
+        ] {
+            assert_eq!(BacklogView::parse(Some(&malformed)), None);
+        }
+
+        // A hostile over-long blocks array rejects the event instead of
+        // growing GUI memory (the engine caps its packing at 24).
+        let oversized: Vec<Value> = (0..(MAX_BACKLOG_VIEW_BLOCKS as u64 + 1))
+            .map(|index| json!({"tx_count": 1, "fee_min_grains": index, "fee_max_grains": index}))
+            .collect();
+        assert_eq!(
+            BacklogView::parse(Some(&json!({
+                "tx_count": 25,
+                "max_block_txs": 1,
+                "depth_blocks": 25,
+                "blocks": oversized,
+            }))),
+            None
+        );
+    }
+
+    /// The panel's core honesty rule: "the node did not tell us" is a state
+    /// of its own, never conflated with an affirmatively empty or clear
+    /// backlog the node actually reported.
+    #[test]
+    fn backlog_state_keeps_unavailable_distinct_from_empty_and_clear() {
+        assert_eq!(backlog_state(None), BacklogState::AwaitingData);
+
+        // Telemetry live, histogram not served: UNAVAILABLE, not empty.
+        let unavailable = BlockFlowView::from_telemetry(&json!({
+            "event": "block_flow",
+            "tip_height": 10,
+            "backlog": null,
+            "recent": [],
+        }));
+        assert_eq!(unavailable.backlog, None);
+        assert_eq!(backlog_state(Some(&unavailable)), BacklogState::Unavailable);
+        // An engine event predating the field behaves identically.
+        let absent = BlockFlowView::from_telemetry(&json!({"recent": []}));
+        assert_eq!(backlog_state(Some(&absent)), BacklogState::Unavailable);
+
+        // Served and empty: the affirmative EMPTY state.
+        let empty = BlockFlowView::from_telemetry(&json!({
+            "backlog": {"tx_count": 0, "max_block_txs": 8, "depth_blocks": 0, "blocks": []},
+            "recent": [],
+        }));
+        assert_eq!(backlog_state(Some(&empty)), BacklogState::Empty);
+
+        // Served, pending but no overflow: CLEAR with the real count.
+        let clear = BlockFlowView::from_telemetry(&json!({
+            "backlog": {"tx_count": 3, "max_block_txs": 8, "depth_blocks": 0, "blocks": []},
+            "recent": [],
+        }));
+        assert_eq!(
+            backlog_state(Some(&clear)),
+            BacklogState::Clear { pending: 3 }
+        );
+
+        // Served with overflow: the charted DEEP state.
+        let deep = BlockFlowView::from_telemetry(&json!({
+            "backlog": {
+                "tx_count": 5,
+                "max_block_txs": 2,
+                "depth_blocks": 2,
+                "blocks": [
+                    {"tx_count": 2, "fee_min_grains": 10, "fee_max_grains": 7_000},
+                    {"tx_count": 1, "fee_min_grains": 10, "fee_max_grains": 10},
+                ],
+            },
+            "recent": [],
+        }));
+        assert_eq!(backlog_state(Some(&deep)), BacklogState::Deep);
+    }
+
+    #[test]
+    fn backlog_trend_requires_a_real_observed_span_and_never_bridges_a_gap() {
+        let now = Instant::now();
+        let mut history: VecDeque<(Instant, u64)> = VecDeque::new();
+        assert_eq!(backlog_trend(&history, now), None, "no samples, no trend");
+
+        // A single sample can never claim a trend.
+        history.push_back((now - Duration::from_secs(120), 10));
+        assert_eq!(backlog_trend(&history, now), None);
+
+        // Two samples closer than the minimum span: still no trend.
+        history.push_back((now - Duration::from_secs(100), 40));
+        assert_eq!(backlog_trend(&history, now), None);
+
+        // A real span: delta between the real endpoints, growing.
+        history.push_back((now - Duration::from_secs(5), 25));
+        let trend = backlog_trend(&history, now).expect("spanned samples trend");
+        assert_eq!(trend.delta, 15);
+        assert_eq!(trend.span, Duration::from_secs(115));
+
+        // Draining reads negative.
+        history.push_back((now, 4));
+        let trend = backlog_trend(&history, now).expect("draining trend");
+        assert_eq!(trend.delta, -6);
+
+        // Samples older than the window are excluded as the anchor.
+        let mut stale: VecDeque<(Instant, u64)> = VecDeque::new();
+        stale.push_back((now - BACKLOG_TREND_WINDOW - Duration::from_secs(60), 1_000));
+        stale.push_back((now - Duration::from_secs(90), 20));
+        stale.push_back((now, 30));
+        let trend = backlog_trend(&stale, now).expect("in-window trend");
+        assert_eq!(trend.delta, 10, "the stale 1000-tx sample is not an anchor");
+
+        // Steady is a zero delta, still a real observation.
+        let mut steady: VecDeque<(Instant, u64)> = VecDeque::new();
+        steady.push_back((now - Duration::from_secs(60), 7));
+        steady.push_back((now, 7));
+        assert_eq!(backlog_trend(&steady, now).expect("steady trend").delta, 0);
+    }
+
+    #[test]
+    fn backlog_history_is_bounded_session_scoped_and_fed_only_by_served_histograms() {
+        let mut app = MinerApp::default();
+        // An unavailable histogram records NO trend sample.
+        app.apply_telemetry(&json!({
+            "event": "block_flow",
+            "tip_height": 5,
+            "backlog": null,
+            "recent": [],
+        }));
+        assert!(app.backlog_history.is_empty());
+
+        let served = json!({
+            "event": "block_flow",
+            "tip_height": 5,
+            "backlog": {"tx_count": 9, "max_block_txs": 8, "depth_blocks": 1,
+                        "blocks": [{"tx_count": 1, "fee_min_grains": 0, "fee_max_grains": 0}]},
+            "recent": [],
+        });
+        for _ in 0..(MAX_BACKLOG_TREND_SAMPLES + 16) {
+            app.apply_telemetry(&served);
+        }
+        assert_eq!(app.backlog_history.len(), MAX_BACKLOG_TREND_SAMPLES);
+        assert!(app.backlog_history.iter().all(|(_, pending)| *pending == 9));
+
+        // A lost session clears the history: a trend never bridges an
+        // unobserved gap.
+        app.apply_telemetry(&json!({"event": "session_error", "message": "node gone"}));
+        assert!(app.backlog_history.is_empty());
+
+        app.apply_telemetry(&served);
+        assert_eq!(app.backlog_history.len(), 1);
+        // Engine restart clears it with the rest of the telemetry.
+        app.reset_telemetry();
+        assert!(app.backlog_history.is_empty());
+    }
+
+    #[test]
+    fn backlog_chart_paints_every_state_without_panicking() {
+        // Deep backlog with a merged amber tail (24 bars, tail beyond cap).
+        let blocks: Vec<ProjectedFlowTile> = (0..MAX_BACKLOG_VIEW_BLOCKS as u64)
+            .map(|index| ProjectedFlowTile {
+                tx_count: if index + 1 == MAX_BACKLOG_VIEW_BLOCKS as u64 {
+                    900
+                } else {
+                    64
+                },
+                fee_min_grains: 7_000_u64.saturating_sub(index * 250),
+                fee_max_grains: 7_000,
+            })
+            .collect();
+        let merged = BacklogView {
+            tx_count: 64 * 24 + 900,
+            max_block_txs: 64,
+            depth_blocks: 38,
+            blocks,
+        };
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            backlog_chart(ui, &merged, Some(150_000));
+        });
+        assert!(output.shapes.len() > 20);
+
+        // One shallow block, no target cadence, no merged tail.
+        let shallow = BacklogView {
+            tx_count: 3,
+            max_block_txs: 8,
+            depth_blocks: 1,
+            blocks: vec![ProjectedFlowTile {
+                tx_count: 1,
+                fee_min_grains: 0,
+                fee_max_grains: 0,
+            }],
+        };
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            backlog_chart(ui, &shallow, None);
+        });
+        assert!(output.shapes.len() > 3);
+
+        // Hostile zero capacity (engine validation rejects it upstream, the
+        // painter must still be total): draws flat, never divides by zero.
+        let hostile = BacklogView {
+            tx_count: 5,
+            max_block_txs: 0,
+            depth_blocks: 0,
+            blocks: vec![ProjectedFlowTile {
+                tx_count: 5,
+                fee_min_grains: 1,
+                fee_max_grains: 2,
+            }],
+        };
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            backlog_chart(ui, &hostile, Some(150_000));
+        });
+        assert!(output.shapes.len() > 3);
     }
 
     #[test]

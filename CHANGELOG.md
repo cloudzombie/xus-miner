@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.1.7
+
+- **Multi-block mempool backlog view** (the release centerpiece): a new GUI
+  card charts the pending queue BEYOND the forming block — one column per
+  projected block (nearest first, up to 24 = one hour at the mainnet's
+  2.5-minute target cadence), column height = that block's fill against the
+  node's own `maxBlockTxs` capacity line, with the lowest effective tip that
+  gets into each block labeled under it and the full figures (fill, fee
+  range, queue position, cadence-based distance explicitly marked
+  statistical) in per-column tooltips. Headline chips report the EXACT depth
+  in blocks (pure arithmetic on the node's own `txCount`/`maxBlockTxs`,
+  never clamped by the render cap), total pending transactions, per-block
+  capacity, and the observed trend (▲ growing / ▼ draining / → steady: the
+  delta between the oldest and newest node-served histogram samples in a
+  bounded 10-minute window — both endpoints real observations, no trend
+  claimed from one sample or across a reconnect, history cleared with the
+  session). A tail deeper than 24 blocks merges into a distinct amber
+  "+N BLK" column (shape and label, not hue alone) so nothing pending is
+  dropped and the headline depth stays exact.
+- **"Empty" and "unavailable" are now unmistakably different on screen** —
+  previously the engine relayed only the packed `projected` tiles, so a node
+  without `sov_getMempoolHistogram` (today's live mainnet: method not found)
+  rendered exactly like an empty mempool. The `block_flow` event now carries
+  an ADDITIVE `backlog` member: the validated histogram summary
+  (`tx_count`, `max_block_txs`, exact `depth_blocks`, packed `blocks`), or
+  JSON `null` whenever the node did not serve a valid histogram. The GUI
+  renders null as a framed "HISTOGRAM UNAVAILABLE — BACKLOG UNKNOWN" state,
+  a served-empty histogram as an affirmative "MEMPOOL EMPTY", and
+  no-overflow as "BACKLOG CLEAR". No existing event field changed name,
+  type, presence, or meaning; pool/Stratum mode hides the panel exactly like
+  the strip (no direct node RPC). No new RPC call: the histogram already
+  rode the template-refresh budget, so the deeper view costs zero extra
+  node load.
+- **Projection-logic audit fixes** (this code had never run against real
+  data — the live node does not serve the histogram yet — so every path was
+  re-verified and pinned):
+  - The packing tail-merge used an unchecked `+=` on node-supplied counts: a
+    hostile reply with near-`u64::MAX` bucket counts would panic a debug
+    build and silently WRAP to a small dishonest number in release. It now
+    saturates (a floor of "huge", never a small lie), pinned by test.
+  - `sov_getMempoolHistogram` replies are now strictly validated instead of
+    trusted: the bucket list is bounded (≤ 512; the node contract caps at
+    128), `maxBlockTxs` must be positive (a zero capacity previously packed
+    to "no projected blocks" — indistinguishable from an empty mempool),
+    buckets must arrive highest-effective-tip-first (a shuffled reply would
+    render misleading per-block fee ranges), and bucket counts must sum
+    exactly (checked, not wrapped) to `txCount` so the headline count and
+    the packed blocks can never disagree. Any failure degrades to the
+    explicit UNAVAILABLE state — indistinguishable from an absent RPC,
+    never from an empty backlog.
+  - Boundary coverage pinned by unit tests: empty mempool, one bucket, a
+    bucket spanning multiple blocks, exactly-filling the forming block, more
+    buckets/blocks than the render cap (tail merge conserves every
+    transaction), hostile huge counts, zero capacity, non-monotonic fee
+    rates, oversized bucket lists, and bucket-sum overflow. The 0.1.5
+    packing itself (bucket→block assignment, per-block fee ranges,
+    forming-block exclusion, 6-tile strip cap) verified correct and
+    unchanged.
+- Both integration paths are pinned end to end through the mock node: the
+  upgraded node's `block_flow` now asserts the exact additive `backlog`
+  object (including `depth_blocks`), and the pre-upgrade node asserts
+  `backlog: null` — the degraded state the live network exercises today.
+
 ## 0.1.6
 
 - **Feed/graph honesty fixes from an independent adversarial audit** (found

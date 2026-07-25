@@ -53,7 +53,15 @@ The connected SOV node normally listens on TCP port `8645`. The miner uses:
   fields render as explicit placeholders/gaps; nothing is interpolated.
 - `sov_getMempoolSize`, `sov_estimateFee`, `sov_getMempoolHistogram` —
   optional dashboard/strip enrichment (live-verified shapes; the histogram is
-  an upgraded-node addition). All fail soft to honest placeholders.
+  an upgraded-node addition). All fail soft to honest placeholders. The
+  histogram reply is strictly validated (bounded bucket list, positive
+  `maxBlockTxs`, buckets highest-tip-first, bucket counts summing exactly to
+  `txCount`); a reply failing any check degrades identically to an absent
+  RPC. The `block_flow` telemetry event carries the validated summary in an
+  ADDITIVE `backlog` member (`tx_count`, `max_block_txs`, exact
+  `depth_blocks`, packed `blocks`), which is JSON `null` whenever the node
+  did not serve a valid histogram — consumers can therefore always tell "the
+  node did not say" apart from an affirmatively empty mempool.
 
 ### Network block feed and block-time graph
 

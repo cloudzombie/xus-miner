@@ -1220,6 +1220,32 @@ fn chain_block_log_line(
     line
 }
 
+/// The additive `backlog` member of the `block_flow` event: the validated
+/// `sov_getMempoolHistogram` summary, or JSON `null` when the node did not
+/// serve one (older node, error, malformed/hostile reply). The explicit null
+/// is the point — the GUI renders it as "histogram UNAVAILABLE", which must
+/// be unmistakably different from a served-but-clear backlog. Every number
+/// is the node's own figure or exact arithmetic over it (`depth_blocks` =
+/// full-capacity blocks the overflow beyond the forming block occupies);
+/// nothing is estimated.
+fn mempool_backlog_json(histogram: Option<&blockflow::MempoolHistogram>) -> Value {
+    histogram.map_or(Value::Null, |histogram| {
+        json!({
+            "tx_count": histogram.tx_count,
+            "max_block_txs": histogram.max_block_txs,
+            "depth_blocks": blockflow::backlog_depth(histogram),
+            "blocks": blockflow::backlog_blocks(histogram)
+                .iter()
+                .map(|block| json!({
+                    "tx_count": block.tx_count,
+                    "fee_min_grains": block.fee_min_grains,
+                    "fee_max_grains": block.fee_max_grains,
+                }))
+                .collect::<Vec<_>>(),
+        })
+    })
+}
+
 /// Announce a reorg: the same height reappeared with a different
 /// node-disclosed hash. Distinctly worded — never a duplicate block-found
 /// line — on all surfaces (stderr, diagnostic log, JSON events).
@@ -1653,13 +1679,19 @@ fn run_rpc_session(
                 }
                 // Projected pending blocks: real histogram buckets packed by
                 // the node's own per-block capacity. A pre-upgrade node
-                // (method not found), a malformed reply, or an empty mempool
-                // packs to no tiles — the honest state, never invented ones.
-                let projected = histogram_reply
+                // (method not found) or a malformed/hostile reply parses to
+                // `None`, relayed below as an EXPLICIT `backlog: null` so
+                // "the node did not tell us" can never render like an empty
+                // mempool; a served histogram with no overflow is the
+                // distinct affirmative clear state. Never invented tiles.
+                let histogram = histogram_reply
                     .as_ref()
-                    .and_then(blockflow::mempool_histogram)
-                    .map(|histogram| blockflow::projected_blocks(&histogram))
+                    .and_then(blockflow::mempool_histogram);
+                let projected = histogram
+                    .as_ref()
+                    .map(blockflow::projected_blocks)
                     .unwrap_or_default();
+                let backlog = mempool_backlog_json(histogram.as_ref());
                 let block_flow = {
                     let sealed = state.sealed_blocks.lock().expect("sealed blocks lock");
                     let tiles = recent_blocks.tiles(current_height, &sealed);
@@ -1673,6 +1705,11 @@ fn run_rpc_session(
                         // The auction floor (`floorGrains`) when the node
                         // serves it; the flat `feeGrains` estimate otherwise.
                         "fee_grains": fee_reply.as_ref().and_then(blockflow::fee_floor_grains),
+                        // ADDITIVE multi-block mempool backlog (v0.1.7): the
+                        // full validated histogram summary, or `null` when
+                        // the node did not serve one. Existing fields —
+                        // including `projected` — keep their exact meaning.
+                        "backlog": backlog,
                         "projected": projected
                             .iter()
                             .map(|block| json!({
@@ -2863,6 +2900,55 @@ System-wide memory free percentage: 62%
             "BLOCK FOUND (network) height 11521 | detail fetch failed this cycle; hash unknown"
         );
         assert!(!network.contains("not disclosed"));
+    }
+
+    /// The additive `backlog` telemetry keeps "the node did not tell us"
+    /// (JSON null) unmistakably distinct from a served-but-clear or empty
+    /// backlog (an object whose figures are the node's own).
+    #[test]
+    fn backlog_telemetry_is_null_when_unserved_and_exact_when_served() {
+        assert_eq!(mempool_backlog_json(None), Value::Null);
+
+        // Served, empty mempool: an OBJECT with zero counts — affirmative
+        // emptiness, not absence.
+        let empty = blockflow::mempool_histogram(&json!({
+            "txCount": 0,
+            "maxBlockTxs": 8,
+            "buckets": [],
+        }))
+        .expect("empty histogram parses");
+        assert_eq!(
+            mempool_backlog_json(Some(&empty)),
+            json!({
+                "tx_count": 0,
+                "max_block_txs": 8,
+                "depth_blocks": 0,
+                "blocks": [],
+            })
+        );
+
+        // Served with overflow: exact depth plus the packed blocks.
+        let deep = blockflow::mempool_histogram(&json!({
+            "txCount": 5,
+            "maxBlockTxs": 2,
+            "buckets": [
+                {"feeRateGrains": "7000", "txCount": 3},
+                {"feeRateGrains": "10", "txCount": 2},
+            ],
+        }))
+        .expect("deep histogram parses");
+        assert_eq!(
+            mempool_backlog_json(Some(&deep)),
+            json!({
+                "tx_count": 5,
+                "max_block_txs": 2,
+                "depth_blocks": 2,
+                "blocks": [
+                    {"tx_count": 2, "fee_min_grains": 10, "fee_max_grains": 7_000},
+                    {"tx_count": 1, "fee_min_grains": 10, "fee_max_grains": 10},
+                ],
+            })
+        );
     }
 
     #[test]
