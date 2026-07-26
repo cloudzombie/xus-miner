@@ -782,6 +782,18 @@ fn headless_miner_round_trips_the_sov_0_1_99_direct_rpc_contract() {
                     event["projected"],
                     json!([{"tx_count": 1, "fee_min_grains": 0, "fee_max_grains": 0}])
                 );
+                // The additive v0.1.7 backlog member: the validated
+                // histogram summary with the EXACT depth (2 pending, 1-tx
+                // capacity: 1 in the forming block, 1 block of overflow).
+                assert_eq!(
+                    event["backlog"],
+                    json!({
+                        "tx_count": 2,
+                        "max_block_txs": 1,
+                        "depth_blocks": 1,
+                        "blocks": [{"tx_count": 1, "fee_min_grains": 0, "fee_max_grains": 0}],
+                    })
+                );
                 let recent = event["recent"].as_array().expect("recent tiles");
                 assert!(!recent.is_empty());
                 assert_eq!(recent[0]["height"], json!(HEIGHT - 1));
@@ -972,6 +984,10 @@ fn headless_miner_degrades_cleanly_on_a_pre_upgrade_node() {
                 assert_eq!(event.pointer("/template/tx_count"), Some(&Value::Null));
                 assert_eq!(event["fee_grains"], json!(1_651_760));
                 assert_eq!(event["projected"], json!([]));
+                // No histogram method ⇒ the backlog is explicitly NULL —
+                // "the node did not tell us", which the GUI renders as the
+                // UNAVAILABLE state, never as an empty backlog.
+                assert_eq!(event["backlog"], Value::Null);
                 let recent = event["recent"].as_array().expect("recent tiles");
                 assert!(!recent.is_empty());
                 assert_eq!(recent[0]["height"], json!(HEIGHT - 1));

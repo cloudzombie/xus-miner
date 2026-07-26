@@ -9,8 +9,11 @@
 //! Projected pending blocks (mempool.space's multi-block view) come from the
 //! additive `sov_getMempoolHistogram` RPC: effective-tip fee buckets, highest
 //! first, packed into blocks by the node's own `maxBlockTxs` capacity. An
-//! older node without the RPC — or an empty mempool — yields NO projected
-//! blocks; that honest absence renders as no tiles, never invented ones.
+//! older node without the RPC — or a malformed reply — parses to `None`,
+//! which the telemetry relays as an EXPLICIT "histogram unavailable" state;
+//! a served histogram with nothing overflowing the forming block is the
+//! distinct affirmative "backlog clear" state. The two are never conflated:
+//! "the node did not tell us" must not look like "the mempool is empty".
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -38,6 +41,19 @@ const MAX_HASH_CHARS: usize = 128;
 /// tail beyond this cap merges into the last projected block (as
 /// mempool.space does) so nothing pending is silently dropped.
 pub(crate) const MAX_PROJECTED_BLOCKS: usize = 6;
+/// Packed pending blocks carried by the denser mempool BACKLOG view: one
+/// hour of chain progress at the mainnet's 2.5-minute target cadence. The
+/// packing tail beyond this cap merges into the last block exactly like the
+/// strip's cap, and the exact total depth is reported separately by
+/// [`backlog_depth`], so a deeper backlog is summarized, never dropped or
+/// silently truncated.
+pub(crate) const MAX_BACKLOG_BLOCKS: usize = 24;
+/// Upper bound on accepted histogram buckets. The node contract caps its
+/// reply at 128 buckets with the low-tip tail merged; four times that is
+/// tolerated for forward compatibility, and anything larger is rejected as
+/// malformed (honest degradation) so a hostile reply can never grow client
+/// memory through the bucket list.
+pub(crate) const MAX_HISTOGRAM_BUCKETS: usize = 512;
 /// Most individually reported blocks per tip advance. A larger jump (slow
 /// poll, node catch-up) reports only the newest `MAX_GAP_BLOCKS` heights plus
 /// one explicit "… and N more" summary, so a big gap can never spam unbounded
@@ -165,9 +181,22 @@ pub(crate) struct HistogramBucket {
     pub(crate) tx_count: u64,
 }
 
-/// The parsed `sov_getMempoolHistogram` reply. `None` for any malformed or
-/// missing field: an old node (method not found) or a bad reply degrades to
-/// "no projected blocks", never to invented ones.
+/// The parsed and VALIDATED `sov_getMempoolHistogram` reply. `None` for any
+/// malformed or missing field: an old node (method not found) or a bad reply
+/// degrades to the explicit "histogram unavailable" state, never to invented
+/// blocks and never to a plausible-looking empty backlog.
+///
+/// Validation is strict because everything downstream (projected tiles, the
+/// backlog view, the exact depth figure) is arithmetic over these fields:
+/// - at most [`MAX_HISTOGRAM_BUCKETS`] buckets (bounded memory);
+/// - `maxBlockTxs > 0` (a zero capacity would make "no overflow" look like
+///   an affirmatively clear backlog);
+/// - buckets ordered highest effective tip first (non-increasing), the
+///   node's documented auction admission order — a shuffled reply would
+///   render misleading per-block fee ranges;
+/// - bucket transaction counts sum EXACTLY to `txCount` (checked, no
+///   overflow), so the headline count and the packed blocks can never
+///   disagree on screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MempoolHistogram {
     pub(crate) tx_count: u64,
@@ -178,9 +207,14 @@ pub(crate) struct MempoolHistogram {
 pub(crate) fn mempool_histogram(value: &Value) -> Option<MempoolHistogram> {
     let tx_count = grains(value.get("txCount")?)?;
     let max_block_txs = grains(value.get("maxBlockTxs")?)?;
-    let buckets = value
-        .get("buckets")?
-        .as_array()?
+    if max_block_txs == 0 {
+        return None;
+    }
+    let raw_buckets = value.get("buckets")?.as_array()?;
+    if raw_buckets.len() > MAX_HISTOGRAM_BUCKETS {
+        return None;
+    }
+    let buckets = raw_buckets
         .iter()
         .map(|bucket| {
             Some(HistogramBucket {
@@ -189,6 +223,18 @@ pub(crate) fn mempool_histogram(value: &Value) -> Option<MempoolHistogram> {
             })
         })
         .collect::<Option<Vec<_>>>()?;
+    let ordered = buckets
+        .windows(2)
+        .all(|pair| pair[0].fee_rate_grains >= pair[1].fee_rate_grains);
+    if !ordered {
+        return None;
+    }
+    let bucket_sum = buckets
+        .iter()
+        .try_fold(0_u64, |sum, bucket| sum.checked_add(bucket.tx_count))?;
+    if bucket_sum != tx_count {
+        return None;
+    }
     Some(MempoolHistogram {
         tx_count,
         max_block_txs,
@@ -211,10 +257,12 @@ pub(crate) struct ProjectedBlock {
 /// capacity unit the node itself reports and the blockspace auction uses.
 /// The FIRST packed block is the forming template block, which the strip
 /// already renders from real template data, so only the blocks BEYOND it are
-/// returned as projected tiles. Everything past `MAX_PROJECTED_BLOCKS`
-/// merges into the last tile. An empty mempool, a zero capacity, or no
-/// overflow beyond the forming block yields no projected tiles.
-pub(crate) fn projected_blocks(histogram: &MempoolHistogram) -> Vec<ProjectedBlock> {
+/// returned. Everything past `cap` packed blocks merges into the last one
+/// (counts SATURATE at u64::MAX rather than wrapping on a hostile reply —
+/// the on-screen number can floor at "huge", never at a small wrapped lie).
+/// An empty mempool, a zero capacity, or no overflow beyond the forming
+/// block yields no packed blocks.
+fn packed_pending_blocks(histogram: &MempoolHistogram, cap: usize) -> Vec<ProjectedBlock> {
     if histogram.max_block_txs == 0 || histogram.tx_count == 0 {
         return Vec::new();
     }
@@ -224,11 +272,11 @@ pub(crate) fn projected_blocks(histogram: &MempoolHistogram) -> Vec<ProjectedBlo
         let mut remaining = bucket.tx_count;
         while remaining > 0 {
             if room == 0 {
-                if blocks.len() > MAX_PROJECTED_BLOCKS {
-                    // At the render cap: the whole tail merges into the
-                    // last projected block instead of growing the packing.
+                if blocks.len() > cap {
+                    // At the cap: the whole tail merges into the last packed
+                    // block instead of growing the packing.
                     let last = blocks.last_mut().expect("capped packing has blocks");
-                    last.tx_count += remaining;
+                    last.tx_count = last.tx_count.saturating_add(remaining);
                     last.fee_min_grains = last.fee_min_grains.min(bucket.fee_rate_grains);
                     last.fee_max_grains = last.fee_max_grains.max(bucket.fee_rate_grains);
                     break;
@@ -249,11 +297,38 @@ pub(crate) fn projected_blocks(histogram: &MempoolHistogram) -> Vec<ProjectedBlo
             remaining -= take;
         }
     }
-    // Drop the forming block; keep only the projected overflow behind it.
+    // Drop the forming block; keep only the pending overflow behind it.
     if blocks.len() <= 1 {
         return Vec::new();
     }
     blocks.split_off(1)
+}
+
+/// The strip's projected pending tiles: up to [`MAX_PROJECTED_BLOCKS`]
+/// blocks beyond the forming one, tail merged into the last tile.
+pub(crate) fn projected_blocks(histogram: &MempoolHistogram) -> Vec<ProjectedBlock> {
+    packed_pending_blocks(histogram, MAX_PROJECTED_BLOCKS)
+}
+
+/// The denser backlog view's packing: up to [`MAX_BACKLOG_BLOCKS`] blocks
+/// beyond the forming one, tail merged into the last block.
+pub(crate) fn backlog_blocks(histogram: &MempoolHistogram) -> Vec<ProjectedBlock> {
+    packed_pending_blocks(histogram, MAX_BACKLOG_BLOCKS)
+}
+
+/// The EXACT number of full-capacity blocks the pending overflow beyond the
+/// forming block occupies — pure arithmetic on the node's own `txCount` and
+/// `maxBlockTxs`, independent of any render cap, so the headline depth stays
+/// exact even when the packed tail was merged for display. Zero when
+/// everything pending fits in the forming block.
+pub(crate) fn backlog_depth(histogram: &MempoolHistogram) -> u64 {
+    if histogram.max_block_txs == 0 {
+        return 0;
+    }
+    histogram
+        .tx_count
+        .saturating_sub(histogram.max_block_txs)
+        .div_ceil(histogram.max_block_txs)
 }
 
 /// The pending-transaction count from `sov_getMempoolSize`. The live node
@@ -800,6 +875,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mempool_histogram_rejects_hostile_replies_as_unavailable_not_empty() {
+        // A zero per-block capacity is nonsensical: rejecting it keeps "no
+        // overflow" from masquerading as an affirmatively clear backlog.
+        assert_eq!(
+            mempool_histogram(&json!({
+                "txCount": 5,
+                "maxBlockTxs": 0,
+                "buckets": [{"feeRateGrains": "7000", "txCount": 5}],
+            })),
+            None
+        );
+        // Buckets must arrive highest effective tip first (the documented
+        // auction admission order); a shuffled reply would render misleading
+        // per-block fee ranges and is rejected instead.
+        assert_eq!(
+            mempool_histogram(&json!({
+                "txCount": 2,
+                "maxBlockTxs": 4,
+                "buckets": [
+                    {"feeRateGrains": "10", "txCount": 1},
+                    {"feeRateGrains": "7000", "txCount": 1},
+                ],
+            })),
+            None
+        );
+        // Equal adjacent rates are non-increasing and stay accepted.
+        assert!(mempool_histogram(&json!({
+            "txCount": 2,
+            "maxBlockTxs": 4,
+            "buckets": [
+                {"feeRateGrains": "7000", "txCount": 1},
+                {"feeRateGrains": "7000", "txCount": 1},
+            ],
+        }))
+        .is_some());
+        // The headline txCount and the buckets must agree exactly, or the
+        // depth figure and the packed blocks would contradict each other.
+        assert_eq!(
+            mempool_histogram(&json!({
+                "txCount": 3,
+                "maxBlockTxs": 1,
+                "buckets": [{"feeRateGrains": "7000", "txCount": 1}],
+            })),
+            None
+        );
+        // A bucket sum that overflows u64 is checked, not wrapped.
+        assert_eq!(
+            mempool_histogram(&json!({
+                "txCount": 0,
+                "maxBlockTxs": 1,
+                "buckets": [
+                    {"feeRateGrains": "7000", "txCount": u64::MAX},
+                    {"feeRateGrains": "10", "txCount": u64::MAX},
+                ],
+            })),
+            None
+        );
+        // The bucket list itself is bounded: one entry over the cap rejects
+        // the reply, so a hostile node cannot grow client memory through it.
+        let hostile: Vec<Value> = (0..=MAX_HISTOGRAM_BUCKETS as u64)
+            .map(|index| {
+                json!({
+                    "feeRateGrains": (u64::MAX - index).to_string(),
+                    "txCount": 0,
+                })
+            })
+            .collect();
+        assert_eq!(hostile.len(), MAX_HISTOGRAM_BUCKETS + 1);
+        assert_eq!(
+            mempool_histogram(&json!({
+                "txCount": 0,
+                "maxBlockTxs": 1,
+                "buckets": hostile,
+            })),
+            None
+        );
+        // Exactly at the cap parses (forward-compatible headroom).
+        let bounded: Vec<Value> = (0..MAX_HISTOGRAM_BUCKETS as u64)
+            .map(|index| {
+                json!({
+                    "feeRateGrains": (u64::MAX - index).to_string(),
+                    "txCount": 1,
+                })
+            })
+            .collect();
+        let parsed = mempool_histogram(&json!({
+            "txCount": MAX_HISTOGRAM_BUCKETS as u64,
+            "maxBlockTxs": 1,
+            "buckets": bounded,
+        }))
+        .expect("cap-sized histogram parses");
+        assert_eq!(parsed.buckets.len(), MAX_HISTOGRAM_BUCKETS);
+    }
+
     fn histogram(max_block_txs: u64, buckets: &[(u64, u64)]) -> MempoolHistogram {
         MempoolHistogram {
             tx_count: buckets.iter().map(|(_, count)| count).sum(),
@@ -869,6 +1039,109 @@ mod tests {
         assert_eq!(packed, 34 - 2, "no pending transaction is dropped");
         assert_eq!(last.fee_min_grains, 10);
         assert_eq!(last.fee_max_grains, 400);
+    }
+
+    #[test]
+    fn hostile_huge_counts_saturate_the_merged_tail_instead_of_wrapping() {
+        // Two near-u64::MAX buckets with a 1-tx capacity: before the fix the
+        // tail merge used an unchecked `+=`, which panics under debug
+        // overflow checks and silently WRAPS to a small dishonest number in
+        // release builds. The merged tail must saturate instead.
+        let hostile = MempoolHistogram {
+            tx_count: u64::MAX, // parser-consistent field is irrelevant here
+            max_block_txs: 1,
+            buckets: vec![
+                HistogramBucket {
+                    fee_rate_grains: 9_000,
+                    tx_count: u64::MAX - 2,
+                },
+                HistogramBucket {
+                    fee_rate_grains: 10,
+                    tx_count: u64::MAX - 2,
+                },
+            ],
+        };
+        let projected = projected_blocks(&hostile);
+        assert_eq!(projected.len(), MAX_PROJECTED_BLOCKS);
+        let last = projected.last().expect("merged tail");
+        assert_eq!(last.tx_count, u64::MAX, "saturated, never wrapped");
+        assert_eq!(last.fee_min_grains, 10);
+        assert_eq!(last.fee_max_grains, 9_000);
+        // The deeper backlog packing shares the same saturating merge.
+        let backlog = backlog_blocks(&hostile);
+        assert_eq!(backlog.len(), MAX_BACKLOG_BLOCKS);
+        assert_eq!(backlog.last().expect("merged tail").tx_count, u64::MAX);
+    }
+
+    #[test]
+    fn backlog_packs_deeper_than_the_strip_and_conserves_every_transaction() {
+        // 50 pending, capacity 2: forming takes 2, so 24 full blocks remain.
+        // The strip caps at 6 tiles (tail merged); the backlog renders all.
+        let fifty = histogram(2, &[(400, 44), (10, 6)]);
+        assert_eq!(projected_blocks(&fifty).len(), MAX_PROJECTED_BLOCKS);
+        let backlog = backlog_blocks(&fifty);
+        assert_eq!(backlog.len(), 24);
+        let packed: u64 = backlog.iter().map(|block| block.tx_count).sum();
+        assert_eq!(packed, 50 - 2, "no pending transaction is dropped");
+        // The low-tip bucket lands in the deepest blocks with its real rate.
+        assert_eq!(backlog.last().expect("deepest block").fee_min_grains, 10);
+        assert_eq!(backlog.first().expect("nearest block").fee_min_grains, 400);
+
+        // Beyond the deeper cap the tail still merges into the last block.
+        let deeper = histogram(1, &[(400, MAX_BACKLOG_BLOCKS as u64 + 10)]);
+        let merged = backlog_blocks(&deeper);
+        assert_eq!(merged.len(), MAX_BACKLOG_BLOCKS);
+        let packed: u64 = merged.iter().map(|block| block.tx_count).sum();
+        assert_eq!(packed, MAX_BACKLOG_BLOCKS as u64 + 10 - 1);
+
+        // One bucket exactly filling the forming block: nothing behind it.
+        assert_eq!(backlog_blocks(&histogram(8, &[(7_000, 8)])), Vec::new());
+        // Empty mempool and zero capacity stay defensively empty here too
+        // (the parser already rejects a zero capacity as malformed).
+        assert_eq!(backlog_blocks(&histogram(4, &[])), Vec::new());
+        assert_eq!(backlog_blocks(&histogram(0, &[(7_000, 5)])), Vec::new());
+        // A single bucket larger than a whole block spans blocks with its
+        // one real rate as both range ends.
+        let spanning = backlog_blocks(&histogram(3, &[(5_000, 10)]));
+        assert_eq!(spanning.len(), 3); // 10 − 3 forming = 7 → 3, 3, 1
+        assert_eq!(
+            spanning
+                .iter()
+                .map(|block| block.tx_count)
+                .collect::<Vec<_>>(),
+            vec![3, 3, 1]
+        );
+        assert!(spanning
+            .iter()
+            .all(|block| block.fee_min_grains == 5_000 && block.fee_max_grains == 5_000));
+    }
+
+    #[test]
+    fn backlog_depth_is_exact_arithmetic_independent_of_the_render_cap() {
+        // Everything fits in the forming block: depth zero.
+        assert_eq!(backlog_depth(&histogram(8, &[(7_000, 8)])), 0);
+        assert_eq!(backlog_depth(&histogram(8, &[])), 0);
+        // One transaction over: one block deep.
+        assert_eq!(backlog_depth(&histogram(8, &[(7_000, 9)])), 1);
+        // Exact multiples and remainders.
+        assert_eq!(backlog_depth(&histogram(2, &[(400, 44), (10, 6)])), 24);
+        assert_eq!(backlog_depth(&histogram(2, &[(400, 44), (10, 7)])), 25);
+        // Far beyond the render cap the depth stays exact, not clamped —
+        // the merged display tail never rounds the headline figure down.
+        let deep = histogram(1, &[(400, 1_000)]);
+        assert_eq!(backlog_depth(&deep), 999);
+        assert_eq!(backlog_blocks(&deep).len(), MAX_BACKLOG_BLOCKS);
+        // Defensive zero-capacity guard (parser rejects this upstream).
+        assert_eq!(backlog_depth(&histogram(0, &[(7_000, 5)])), 0);
+        // Saturating on hostile counts.
+        assert_eq!(
+            backlog_depth(&MempoolHistogram {
+                tx_count: u64::MAX,
+                max_block_txs: 1,
+                buckets: Vec::new(),
+            }),
+            u64::MAX - 1
+        );
     }
 
     #[test]
