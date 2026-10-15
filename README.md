@@ -241,3 +241,8 @@ A second integration test launches that same engine against a bounded local
 SOV 0.1.99 JSON-RPC mock. It verifies the direct block-template, peer telemetry,
 coinbase request, compact target, trailing nonce, accepted sealed-block hash,
 and submission acknowledgement contracts without allocating RandomX memory.
+RPC regressions also exercise trickled headers/bodies against an absolute call
+deadline, complete replies on sockets that stay open, response size limits,
+HTTP status and JSON-RPC ID validation, and real-engine reconnect after an HTTP
+failure. The deadline covers socket operations; operating-system hostname
+resolution remains blocking.

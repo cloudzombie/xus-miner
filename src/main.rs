@@ -4,6 +4,7 @@ mod blockflow;
 mod diag;
 mod gui;
 mod pow;
+mod rpc;
 // RandomX exposes a C API. Keep the required unsafe ownership proof isolated
 // to one small module; unsafe code remains denied everywhere else.
 #[allow(unsafe_code)]
@@ -30,12 +31,6 @@ use wire::{template_id_for_blob, validate_account_id, BlockHeaderWire};
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_BLOB_BYTES: usize = 1024 * 1024;
-// A maximum-size template is hex-encoded in JSON (2 bytes per blob byte).
-// Keep ample room for the remaining RPC fields without allowing a configured
-// or malicious node to grow the miner's response buffer without bound.
-const MAX_RPC_BODY_BYTES: usize = MAX_BLOB_BYTES * 2 + 256 * 1024;
-const MAX_RPC_HEADER_BYTES: usize = 32 * 1024;
-const MAX_RPC_RESPONSE_BYTES: usize = MAX_RPC_HEADER_BYTES + MAX_RPC_BODY_BYTES;
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 const BYTES_PER_MIB: f64 = 1_048_576.0;
 pub(crate) const RANDOMX_DATASET_GIB: f64 = 2.3;
@@ -1067,73 +1062,13 @@ fn rpc_call_with_timeout(
     read_timeout: Duration,
 ) -> io::Result<Value> {
     let address = endpoint_address(endpoint);
-    let connect_timeout = read_timeout.min(Duration::from_secs(10));
-    let mut stream = connect_with_timeout(address, connect_timeout).map_err(|e| {
+    rpc::call(address, method, params, read_timeout).map_err(|e| {
         if e.kind() == io::ErrorKind::ConnectionRefused {
             io::Error::new(e.kind(), format!(
-                "SOV node refused {address}. On SOV Station enable ‘Expose node RPC on LAN’, then restart its node ({e})"
+                "SOV node refused {address}. Check that SOV Station's node is running and the RPC address and port are correct. If connecting from another machine, enable ‘Expose node RPC on LAN’ in SOV Station, restart its node, and allow the RPC port through its firewall ({e})"
             ))
         } else { e }
-    })?;
-    stream.set_read_timeout(Some(read_timeout))?;
-    stream.set_write_timeout(Some(read_timeout.min(DIRECT_RPC_TIMEOUT)))?;
-    let request = json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params});
-    let body = request.to_string();
-    let host = address.split(':').next().unwrap_or("sov-node");
-    write!(stream,
-        "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(), body)?;
-    stream.flush()?;
-    let response = read_bounded_rpc_response(&mut stream)?;
-    let split = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "node returned malformed HTTP")
-        })?;
-    if split > MAX_RPC_HEADER_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("node RPC HTTP headers exceed the {MAX_RPC_HEADER_BYTES}-byte safety limit"),
-        ));
-    }
-    let body = &response[split + 4..];
-    if body.len() > MAX_RPC_BODY_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("node RPC body exceeds the {MAX_RPC_BODY_BYTES}-byte safety limit"),
-        ));
-    }
-    let value: Value = serde_json::from_slice(body).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("node returned invalid JSON: {e}"),
-        )
-    })?;
-    if !value.get("error").is_none_or(Value::is_null) {
-        return Err(io::Error::other(format!(
-            "node RPC {method} failed: {}",
-            value["error"]
-        )));
-    }
-    value
-        .get("result")
-        .cloned()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "node RPC reply has no result"))
-}
-
-fn read_bounded_rpc_response<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
-    let mut response = Vec::new();
-    reader
-        .take((MAX_RPC_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut response)?;
-    if response.len() > MAX_RPC_RESPONSE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("node RPC response exceeds the {MAX_RPC_RESPONSE_BYTES}-byte safety limit"),
-        ));
-    }
-    Ok(response)
+    })
 }
 
 fn requested_coinbase(user: &str) -> Option<&str> {
@@ -1766,9 +1701,10 @@ fn connect(pool: &str) -> io::Result<TcpStream> {
 
 fn connect_with_timeout(pool: &str, timeout: Duration) -> io::Result<TcpStream> {
     let address = pool_address(pool);
+    let deadline = Instant::now() + timeout;
     let mut last = None;
     for socket in address.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&socket, timeout) {
+        match TcpStream::connect_timeout(&socket, rpc::remaining(deadline)?) {
             Ok(stream) => return Ok(stream),
             Err(error) => last = Some(error),
         }
@@ -2432,20 +2368,157 @@ mod tests {
         })
     }
 
-    #[test]
-    fn direct_rpc_response_reader_is_strictly_bounded() {
-        let exact = vec![b'x'; MAX_RPC_RESPONSE_BYTES];
-        assert_eq!(
-            read_bounded_rpc_response(&mut io::Cursor::new(exact))
-                .unwrap()
-                .len(),
-            MAX_RPC_RESPONSE_BYTES
-        );
+    fn with_rpc_server(serve: impl FnOnce(TcpStream) + Send + 'static, check: impl FnOnce(String)) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(length) = line.strip_prefix("Content-Length:") {
+                    content_length = length.trim().parse().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; content_length]).unwrap();
+            serve(stream);
+        });
+        check(format!("rpc://{address}"));
+        server.join().unwrap();
+    }
 
-        let oversized = vec![b'x'; MAX_RPC_RESPONSE_BYTES + 1];
-        let error = read_bounded_rpc_response(&mut io::Cursor::new(oversized)).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("safety limit"));
+    #[test]
+    fn direct_rpc_completes_a_length_delimited_reply_before_socket_close() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        with_rpc_server(
+            move |mut stream| {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"height":42}}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                // Stay open until the client has returned, with a bounded
+                // escape so a regression cannot hang the test suite.
+                let _ = release_rx.recv_timeout(Duration::from_secs(4));
+            },
+            |endpoint| {
+                let result = rpc_call_with_timeout(
+                    &endpoint,
+                    "sov_health",
+                    json!({}),
+                    Duration::from_secs(2),
+                );
+                let _ = release_tx.send(());
+                assert_eq!(result.unwrap(), json!({"height":42}));
+            },
+        );
+    }
+
+    #[test]
+    fn direct_rpc_deadline_cannot_be_extended_by_trickled_headers_or_body() {
+        for (drip_body, length_delimited) in [(false, true), (true, true), (true, false)] {
+            with_rpc_server(
+                move |mut stream| {
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"height":42}}"#;
+                    let response = if length_delimited {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\n\r\n{body}")
+                    };
+                    let bytes = if drip_body {
+                        let split = response.find("\r\n\r\n").unwrap() + 4;
+                        stream.write_all(&response.as_bytes()[..split]).unwrap();
+                        body.as_bytes()
+                    } else {
+                        response.as_bytes()
+                    };
+                    for byte in bytes {
+                        if stream.write_all(&[*byte]).is_err() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(40));
+                    }
+                },
+                |endpoint| {
+                    let started = Instant::now();
+                    let result = rpc_call_with_timeout(
+                        &endpoint,
+                        "sov_health",
+                        json!({}),
+                        Duration::from_millis(200),
+                    );
+                    assert!(
+                        started.elapsed() < Duration::from_millis(900),
+                        "trickled response extended the call deadline: {:?}",
+                        started.elapsed()
+                    );
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn direct_rpc_silent_node_returns_a_portable_timeout_error() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        with_rpc_server(
+            move |_stream| {
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            },
+            |endpoint| {
+                let started = Instant::now();
+                let result = rpc_call_with_timeout(
+                    &endpoint,
+                    "sov_health",
+                    json!({}),
+                    Duration::from_millis(200),
+                );
+                let _ = release_tx.send(());
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+                assert!(started.elapsed() < Duration::from_secs(2));
+            },
+        );
+    }
+
+    #[test]
+    fn direct_rpc_rejects_http_errors_and_mismatched_reply_ids() {
+        for (status, id) in [("503 Service Unavailable", 1), ("200 OK", 99)] {
+            with_rpc_server(
+                move |mut stream| {
+                    let body =
+                        json!({"jsonrpc":"2.0", "id":id, "result":{"height":42}}).to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                },
+                |endpoint| {
+                    let error = rpc_call_with_timeout(
+                        &endpoint,
+                        "sov_health",
+                        json!({}),
+                        Duration::from_secs(2),
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                },
+            );
+        }
     }
 
     #[test]

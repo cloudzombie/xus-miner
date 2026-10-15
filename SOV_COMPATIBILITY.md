@@ -101,8 +101,20 @@ target to match it exactly. Direct template blobs are bounded, the PoW key must
 be exactly 32 bytes, and SOV 0.1.99's `versionBits = 3` signaling vector is
 covered by a fixed regression test. Complete direct-RPC replies are also
 strictly bounded (including headers and the hex-expanded template), and required
-node calls fail the session after five seconds instead of leaving stale work
-presented as live indefinitely.
+node calls share a five-second deadline across address connection attempts,
+request writes, and response reads. Progress on a trickled header or body does
+not reset that deadline. Hostname resolution still uses the operating system's
+blocking resolver; use an IP endpoint when a DNS-independent deadline is needed.
+Responses with `Content-Length` complete as soon as that many bytes arrive,
+without waiting for the node to close the connection. Close-delimited HTTP/1.0
+and HTTP/1.1 replies remain supported under the same read deadline.
+
+The transport checks the HTTP success status, bounded headers, unambiguous
+decimal `Content-Length`, and the JSON-RPC `2.0` envelope with the exact numeric
+request ID before using any result. Duplicate lengths, truncated bodies,
+unsupported transfer/content encodings, and mismatched response IDs fail closed.
+Chunked and compressed responses remain unsupported. Required-call failures
+clear installed work and reconnect; optional enrichment continues to fail soft.
 
 For a node on another machine, SOV Station must expose RPC on the LAN and the
 host firewall must allow the chosen port. Station's internal mining toggle is
