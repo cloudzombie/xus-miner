@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.8
 
 - Update the locked GUI dependency `webbrowser` from 1.2.1 to 1.2.2 to fix
   RUSTSEC-2026-0257 (Unix `BROWSER` argument injection). Remove its now-unused
