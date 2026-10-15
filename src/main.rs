@@ -2500,12 +2500,14 @@ mod tests {
                 move |mut stream| {
                     let body =
                         json!({"jsonrpc":"2.0", "id":id, "result":{"height":42}}).to_string();
-                    write!(
-                        stream,
+                    // Send this small reply in one buffer. Formatting directly
+                    // into TCP emits separate writes; after reading a 503 the
+                    // client correctly closes before those tail writes finish.
+                    let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
                         body.len()
-                    )
-                    .unwrap();
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
                 },
                 |endpoint| {
                     let error = rpc_call_with_timeout(

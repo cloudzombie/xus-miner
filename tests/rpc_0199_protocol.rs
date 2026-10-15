@@ -1326,12 +1326,14 @@ fn http_failure_cannot_install_work_and_the_real_engine_reconnects() {
                 // Even plausible health JSON inside an HTTP failure must not
                 // authenticate the node or advance to template installation.
                 let body = reply.to_string();
-                write!(
-                    stream,
+                // The client may close as soon as it reads the failure status.
+                // Buffer this small reply before writing to avoid a mock-server
+                // tail-write race with that intentional early disconnect.
+                let response = format!(
                     "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
-                )
-                .unwrap();
+                );
+                stream.write_all(response.as_bytes()).unwrap();
             } else {
                 write_http_json(&mut stream, &reply).unwrap();
             }
