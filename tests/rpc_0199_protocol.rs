@@ -1290,6 +1290,93 @@ fn stderr_snapshot(stderr_log: &Arc<Mutex<String>>) -> String {
         .clone()
 }
 
+#[test]
+fn http_failure_cannot_install_work_and_the_real_engine_reconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery RPC server");
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("rpc://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let fixture = TemplateFixture::sov_0_1_99();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        for (index, method) in ["sov_health", "sov_health", "sov_getBlockTemplate"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    other => panic!("expected recovery connection: {other:?}"),
+                }
+            };
+            let request = read_http_json(&mut stream).unwrap();
+            assert_eq!(request["method"], method);
+            let result = if index == 2 {
+                fixture.response.clone()
+            } else {
+                json!({"height":HEIGHT - 1, "mempool":2})
+            };
+            let reply = json!({"jsonrpc":"2.0", "id":request["id"], "result":result});
+            if index == 0 {
+                // Even plausible health JSON inside an HTTP failure must not
+                // authenticate the node or advance to template installation.
+                let body = reply.to_string();
+                // The client may close as soon as it reads the failure status.
+                // Buffer this small reply before writing to avoid a mock-server
+                // tail-write race with that intentional early disconnect.
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else {
+                write_http_json(&mut stream, &reply).unwrap();
+            }
+        }
+    });
+    let miner = spawn_headless_miner(&endpoint);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_failure = false;
+    let mut saw_reconnect = false;
+    let mut saw_job = false;
+    while Instant::now() < deadline && !saw_job {
+        let Ok(event) = miner.telemetry_rx.recv_timeout(Duration::from_millis(250)) else {
+            continue;
+        };
+        match event["event"].as_str() {
+            Some("session_error") => {
+                assert!(event["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("HTTP status 503"));
+                saw_failure = true;
+            }
+            Some("connecting") if saw_failure => saw_reconnect = true,
+            Some("node_connected") => assert!(
+                saw_failure && saw_reconnect,
+                "HTTP failure was accepted as live health: {event}"
+            ),
+            Some("job") => {
+                assert!(saw_failure && saw_reconnect);
+                assert_eq!(event["height"], HEIGHT);
+                saw_job = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_job,
+        "engine failed to recover: {}",
+        stderr_snapshot(&miner.stderr_log)
+    );
+    server.join().unwrap();
+}
+
 /// Wait (condition + deadline, never a bare sleep) until the miner's stderr
 /// contains `needle`; returns the full captured stderr.
 fn wait_for_stderr(stderr_log: &Arc<Mutex<String>>, needle: &str, timeout: Duration) -> String {

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.8
+
+- Update the locked GUI dependency `webbrowser` from 1.2.1 to 1.2.2 to fix
+  RUSTSEC-2026-0257 (Unix `BROWSER` argument injection). Remove its now-unused
+  `core-foundation` 0.10.1 dependency; all other package versions are unchanged.
+- Direct RPC now uses a shared socket deadline across connection attempts,
+  writes, and reads. A node sending a byte at a time can no longer keep a
+  required call alive indefinitely. Operating-system DNS resolution remains
+  blocking; IP endpoints avoid that limitation.
+- Length-delimited HTTP replies finish without waiting for socket closure.
+  HTTP failures, mismatched JSON-RPC IDs/versions, ambiguous Content-Length,
+  truncated bodies, and oversized headers/bodies are rejected before their
+  results can become mining work or dashboard data.
+- Regression coverage includes slow headers and bodies, a node that keeps
+  its socket open, malformed framing, exact size boundaries, and a real
+  headless-engine reconnect after an HTTP 503 with plausible health JSON.
+
 ## 0.1.7
 
 - **Multi-block mempool backlog view** (the release centerpiece): a new GUI
