@@ -2,8 +2,10 @@
 
 `xus-miner` is a standalone native desktop and headless CPU miner for SOV/XUS.
 It connects directly to a SOV Station/node JSON-RPC endpoint (normally port
-`8645`) or, optionally, to a `sov-stratum` pool/bridge. It does not run a node,
-hold a wallet seed, or decide consensus.
+`8645`) or, optionally, to a `sov-stratum` pool/bridge. It does not run a node
+or decide consensus. Direct solo mining does not use a wallet seed. Pool mode
+can hold a payout seed locally so this miner signs the transfers for a block
+it finds; that seed is never sent to the pool and never written to logs.
 
 This is an independent repository. It is not part of the SOV workspace and has
 no local path into chaincode. See [CHAINCODE_BOUNDARY.md](CHAINCODE_BOUNDARY.md)
@@ -105,7 +107,8 @@ The GUI provides:
 - automatic start preflight against live available RAM, with a conservative
   OS/application reserve and a non-persistent manual fallback only when the
   native memory probe is unavailable;
-- settings persistence without ever saving the Stratum password.
+- settings persistence without ever saving the Stratum password or a payout seed
+  (a seed-file path may be saved; the seed bytes are not);
 
 The GUI passes the password to its child engine over standard input instead of
 exposing it in process arguments. Closing the window requests child termination
@@ -130,9 +133,13 @@ The GUI makes reward routing explicit:
   request templates using a public account controlled by your SOV Station
   wallet. The wallet retains the spending keys; neither the bridge nor miner
   needs them.
-- **External pool / contributor** does not imply payment. The current bridge
-  logs per-session shares but has no automatic payout implementation, and a
-  Stratum worker label is not a payout address.
+- **External pool / contributor** pays through miner-signed transfers. Log in
+  as your payout account (`account` or `account/worker`). When the pool pushes
+  a `payout` notice, the miner signs those transfers locally and sends
+  `payout_txs` before a block is sealed, because the header already commits to
+  the transaction root. The pool checks the signatures and relays them. It
+  never receives the seed. A worker label alone is not a payout address. An
+  empty share window needs no transfers; the finder keeps the coinbase.
 
 Direct mining requires an updated node supporting `sov_getBlockTemplate` and
 `sov_submitBlock`. In direct mode the User field is sent as the public coinbase
@@ -149,9 +156,17 @@ Passing `--headless` preserves the terminal and cloud-server workflow:
 ./target/release/xus-miner \
   --headless \
   --pool 127.0.0.1:3333 \
-  --user <public-account-or-worker-label> \
+  --user <payout-account-or-account/worker> \
+  --seed-file ~/.xus-miner/payout.seed \
   --workers 1
 ```
+
+`--seed-file` is a mode-`0600` file containing the 32-byte Ed25519 seed as 64
+hex characters. `--seed-hex` accepts the same seed on the command line; the
+process list can show it, so prefer the file. With either flag and the default
+user `xus-miner`, the Stratum login is the seed's implicit account. An explicit
+implicit account must be that same id. The seed is used only to sign `payout`
+transfers. It is not written to the socket, the diagnostic log, or stderr.
 
 Start the existing bridge against a synchronized SOV node before starting the
 miner:
@@ -185,8 +200,10 @@ Every line names the miner version, operating system, and architecture, the
 startup header records detected CPU features, and a panic writes its full
 backtrace to the file before the process exits. Set `XUS_MINER_LOG=debug` for
 verbose engine-lifecycle detail when reporting a problem; the default level is
-`info`. Credentials are never written: the Stratum password stays on stdin and
-GUI log lines are redacted before they are mirrored.
+`info`. Credentials are never written: the Stratum password stays on stdin, a payout
+seed is scrubbed if it would otherwise reach a diagnostic line, and GUI log
+lines are redacted before they are mirrored. The GUI can remember a seed-file
+path. It does not store the seed.
 
 ## Current constraints
 
@@ -200,9 +217,11 @@ GUI log lines are redacted before they are mirrored.
   full dataset. RandomX initialization is blocked when the live RAM preflight
   cannot preserve the larger of 1.5 GiB or 10% of installed RAM (capped at
   4 GiB).
-- The current bridge records shares but has no PPLNS payout implementation. Its
-  configured coinbase account receives the block. A public operator must not
-  promise automatic or trustless payouts until that layer exists.
+- Pool payouts follow the non-custodial sharechain in
+  [SOV PR #55](https://github.com/cloudzombie/sov/pull/55). The finder signs
+  ordinary transfers for the rest of the PPLNS window. The pool does not hold
+  a key. A block is payable only when those transfers are already in the
+  template, so the miner signs a `payout` notice as soon as it arrives.
 - This is a correctness-first reference miner, not yet an XMRig-performance
   replacement.
 - No application can honestly guarantee that an operating system, native

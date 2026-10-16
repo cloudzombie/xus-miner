@@ -1,8 +1,10 @@
 # Security policy
 
-The supported code is the latest commit on `main`. XUS Miner never needs a
-wallet seed, private key, SOV repository token, node database, or writable SOV
-checkout. Do not provide any of those when reporting an issue.
+The supported code is the latest commit on `main`. Direct solo mining needs no
+wallet seed. Pool payout signing can use a miner-local seed (`--seed-hex` or
+`--seed-file`); that seed is not sent to the pool and is not written to logs.
+XUS Miner never needs a node private key, SOV repository token, node database,
+or writable SOV checkout. Do not include a payout seed when reporting an issue.
 
 Report suspected vulnerabilities through GitHub's private vulnerability
 reporting for `cloudzombie/xus-miner`. Include the platform, miner version,

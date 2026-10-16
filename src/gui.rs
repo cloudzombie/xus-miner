@@ -121,7 +121,7 @@ impl RewardRoute {
     fn summary(self) -> &'static str {
         match self {
             Self::OwnedBridge => "Bridge coinbase (operator asserted)",
-            Self::ExternalPool => "No automatic payout verified",
+            Self::ExternalPool => "PPLNS payouts signed locally",
         }
     }
 }
@@ -132,6 +132,8 @@ struct Settings {
     pool: String,
     user: String,
     password: String,
+    /// Path to a hex payout seed. The seed itself is never stored here.
+    seed_file: String,
     workers: u64,
     reconnect_secs: u64,
     report_secs: u64,
@@ -144,6 +146,7 @@ impl Default for Settings {
             pool: DEFAULT_POOL.into(),
             user: DEFAULT_USER.into(),
             password: "x".into(),
+            seed_file: String::new(),
             workers: 1,
             reconnect_secs: 5,
             report_secs: 2,
@@ -163,6 +166,11 @@ impl Settings {
         if let Some(user) = value.get("user").and_then(Value::as_str) {
             settings.user = user.to_owned();
         }
+        if let Some(seed_file) = value.get("seed_file").and_then(Value::as_str) {
+            if !crate::payout::path_embeds_seed(seed_file) {
+                settings.seed_file = seed_file.to_owned();
+            }
+        }
         if let Some(workers) = value.get("workers").and_then(Value::as_u64) {
             settings.workers = workers.clamp(1, 64);
         }
@@ -180,6 +188,11 @@ impl Settings {
             "reward_route": self.reward_route.persisted(),
             "pool": sanitize_endpoint(self.pool.trim()),
             "user": self.user.trim(),
+            "seed_file": if crate::payout::path_embeds_seed(&self.seed_file) {
+                ""
+            } else {
+                self.seed_file.trim()
+            },
             "workers": self.workers,
             "reconnect_secs": self.reconnect_secs,
             "report_secs": self.report_secs,
@@ -199,6 +212,18 @@ impl Settings {
         }
         if self.password.len() > 4_096 {
             return Err("Stratum password is unexpectedly large.".into());
+        }
+        let seed_file = self.seed_file.trim();
+        if !seed_file.is_empty() {
+            if seed_file.len() > 4_096 {
+                return Err("Seed file path is unexpectedly long.".into());
+            }
+            if seed_file.contains(['\n', '\r', '\0']) {
+                return Err("Seed file path cannot contain a line break.".into());
+            }
+            if crate::payout::path_embeds_seed(seed_file) {
+                return Err("Seed file path must name a file, not the seed itself.".into());
+            }
         }
         if !(1..=64).contains(&self.workers) {
             return Err("Worker count must be between 1 and 64.".into());
@@ -1789,6 +1814,10 @@ impl MinerApp {
             .arg(self.settings.reconnect_secs.to_string())
             .arg("--report-secs")
             .arg(self.settings.report_secs.to_string());
+        let seed_file = self.settings.seed_file.trim();
+        if !seed_file.is_empty() && !crate::payout::path_embeds_seed(seed_file) {
+            command.arg("--seed-file").arg(seed_file);
+        }
         if self.light_randomx_recovery {
             command.arg("--randomx-light");
         }
@@ -2888,6 +2917,30 @@ impl MinerApp {
                     self.stable_hashing_since = None;
                 }
             }
+            Some("payout_submitted") => {
+                let transfers = value.get("transfers").and_then(Value::as_u64).unwrap_or(0);
+                self.push_log(
+                    format!("Signed {transfers} pool payout transfer(s) locally."),
+                    false,
+                );
+            }
+            Some("payout_result") => {
+                if value.get("ok").and_then(Value::as_bool) == Some(true) {
+                    self.push_log("Pool accepted the signed payout transfers.", false);
+                } else {
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("pool refused the signed payout");
+                    self.push_log(self.redact_sensitive_text(message), true);
+                }
+            }
+            Some("payout_unsigned") => {
+                self.push_log(
+                    "Pool asked for payout transfers, but no seed file is set, so this miner did not sign.",
+                    true,
+                );
+            }
             Some("share") => {
                 self.submitted = value
                     .get("submitted")
@@ -3288,7 +3341,7 @@ impl MinerApp {
                 GREEN,
             ),
             RewardRoute::ExternalPool => (
-                "Current SOV Stratum has no automatic payout layer. A worker label does not earn XUS by itself.",
+                "Pool payouts are transfers you sign locally. Set a seed file (mode 0600) and log in as that seed's account. The seed is not saved here and is not sent to the pool. Without it, this miner can hash but cannot sign the window.",
                 AMBER,
             ),
             }
@@ -3321,7 +3374,7 @@ impl MinerApp {
                 .desired_width(240.0),
         )
         .on_hover_text(
-            "Direct node: public coinbase account, or xus-miner to use the node-configured account. Stratum: worker label.",
+            "Direct node: public coinbase account, or xus-miner to use the node-configured account. Stratum: payout account, or account/worker. With a seed file and the default user, the engine logs in as the seed's account.",
         );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -3348,6 +3401,23 @@ impl MinerApp {
             } else {
                 "Password is passed over stdin and never saved."
             })
+            .size(10.0)
+            .color(MUTED),
+        );
+        ui.add_space(8.0);
+        ui.add_enabled(
+            !running,
+            egui::TextEdit::singleline(&mut self.settings.seed_file)
+                .hint_text("Optional payout seed file")
+                .desired_width(240.0),
+        )
+        .on_hover_text(
+            "Path to a hex file containing the 32-byte payout seed. The engine reads it. The seed is not written into settings, logs, or the pool connection.",
+        );
+        ui.label(
+            RichText::new(
+                "Pool payouts only. Leave empty to hash without signing. The file should be mode 0600.",
+            )
             .size(10.0)
             .color(MUTED),
         );
@@ -4584,9 +4654,13 @@ impl eframe::App for MinerApp {
                     self.controls(ui);
                     ui.add_space(22.0);
                     ui.label(
-                        RichText::new("No wallet seed or private key is used.")
-                            .size(10.0)
-                            .color(GREEN),
+                        RichText::new(if self.settings.seed_file.trim().is_empty() {
+                            "No payout seed is stored in this window."
+                        } else {
+                            "Payout seed stays in the file you named. It is not saved here or sent to the pool."
+                        })
+                        .size(10.0)
+                        .color(GREEN),
                     );
                     ui.label(
                         RichText::new(format!("xus-miner v{}", crate::VERSION))
@@ -6769,6 +6843,19 @@ mod tests {
         assert!(!encoded.contains("endpoint-secret"));
         assert!(!encoded.contains("operator:"));
         assert!(encoded.contains("http://127.0.0.1:8645"));
+
+        let seed = "ab".repeat(32);
+        let mut leaked = settings.clone();
+        leaked.seed_file = seed.clone();
+        let encoded = leaked.persisted_json().to_string();
+        assert!(!encoded.contains(&seed));
+        let loaded = Settings::from_json(&json!({"seed_file": seed}));
+        assert!(loaded.seed_file.is_empty());
+        leaked.seed_file = "/home/miner/.xus-miner/payout.seed".into();
+        assert!(leaked
+            .persisted_json()
+            .to_string()
+            .contains("/home/miner/.xus-miner/payout.seed"));
     }
 
     #[cfg(unix)]
@@ -7022,6 +7109,19 @@ mod tests {
             .iter()
             .any(|arg| arg == "--parent-pipe-watchdog"));
         assert!(!command_args.iter().any(|arg| arg == &app.settings.password));
+        assert!(!command_args.iter().any(|arg| arg == "--seed-file"));
+        let seed = "cd".repeat(32);
+        app.settings.seed_file = seed.clone();
+        assert!(!args(&app).iter().any(|arg| arg == "--seed-file"));
+        assert!(!args(&app).iter().any(|arg| arg.contains(&seed)));
+        app.settings.seed_file = "/home/miner/.xus-miner/payout.seed".into();
+        let seeded = args(&app);
+        let seed_flag = seeded.iter().position(|arg| arg == "--seed-file").unwrap();
+        assert_eq!(
+            seeded.get(seed_flag + 1).map(String::as_str),
+            Some("/home/miner/.xus-miner/payout.seed")
+        );
+        assert!(!seeded.iter().any(|arg| arg.contains(&seed)));
 
         assert!(!command_args.iter().any(|arg| arg == "--randomx-light"));
         app.light_randomx_recovery = true;

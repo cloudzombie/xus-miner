@@ -15,8 +15,10 @@ path = "src/main.rs"
 # bundled fonts, and X11 only. eframe still requires its clipboard/link support;
 # that unavoidable surface is tracked by Cargo.lock and the RustSec gate.
 eframe = { version = "=0.35.0", default-features = false, features = ["default_fonts", "glow", "x11"] }
+bech32 = "=0.11.1"
 blake3 = "=1.8.5"
 borsh = { version = "=1.8.0", features = ["derive"] }
+ed25519-dalek = "=2.2.0"
 hex = "=0.4.3"
 # Supplies the checksummed cross-platform RandomX C library. The miner bypasses
 # this crate's unchecked VM constructor through src/randomx_native.rs.

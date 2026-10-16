@@ -10,8 +10,9 @@
 //! This module is plain safe Rust: no signal handlers, no FFI, and no new
 //! unsafe surface. Verbosity is controlled by `XUS_MINER_LOG`
 //! (`error`|`warn`|`info`|`debug`; default `info`). Credentials are never
-//! logged: the Stratum password arrives on stdin and no call site passes it
-//! here.
+//! logged: the Stratum password arrives on stdin, and a payout seed is
+//! registered only so any later line can be scrubbed. No call site passes
+//! either secret to the logger.
 
 use std::backtrace::Backtrace;
 use std::env;
@@ -65,6 +66,57 @@ struct Logger {
 }
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
+static SECRETS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn secret_list() -> &'static Mutex<Vec<String>> {
+    SECRETS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Remember `secret` so later diagnostic lines replace it with `[REDACTED]`.
+///
+/// The copy is held only for that comparison. Callers must not log `secret`
+/// themselves, including in the argument to this function.
+pub(crate) fn protect_secret(secret: &str) {
+    if secret.len() < 16 {
+        return;
+    }
+    let mut secrets = secret_list()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !secrets.iter().any(|existing| existing == secret) {
+        secrets.push(secret.to_owned());
+    }
+}
+
+/// True when `text` contains a registered payout seed.
+pub(crate) fn exposes_secret(text: &str) -> bool {
+    let secrets = secret_list()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    secrets
+        .iter()
+        .any(|secret| !secret.is_empty() && text.contains(secret.as_str()))
+}
+
+/// Replace every registered secret in `message`.
+pub(crate) fn scrub(message: &str) -> String {
+    let secrets = secret_list()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !secrets
+        .iter()
+        .any(|secret| !secret.is_empty() && message.contains(secret.as_str()))
+    {
+        return message.to_owned();
+    }
+    let mut cleaned = message.to_owned();
+    for secret in secrets.iter() {
+        if !secret.is_empty() {
+            cleaned = cleaned.replace(secret.as_str(), "[REDACTED]");
+        }
+    }
+    cleaned
+}
 
 /// One stable identity token per line so a pasted log is diagnosable without
 /// asking the reporter for their platform.
@@ -235,6 +287,7 @@ fn write_line(logger: &Logger, level: Level, message: &str) {
         // handle itself is still valid and every write is a full line.
         poisoned.into_inner()
     });
+    let message = scrub(message);
     let line = format!(
         "[{}] [{}] [{}] {message}\n",
         now_utc(),
@@ -401,6 +454,19 @@ mod tests {
             describe_randomx_flags((1 << 3) | (1 << 1) | (1 << 6)),
             "0x4a=HARD_AES|JIT|ARGON2_AVX2"
         );
+    }
+
+    #[test]
+    fn scrub_removes_a_registered_secret_and_does_not_log_it() {
+        let secret = "payout-seed-redaction-token-0123456789abcdef";
+        protect_secret(secret);
+        assert!(exposes_secret(&format!("seed={secret}")));
+        assert_eq!(
+            scrub(&format!("seed={secret} tail")),
+            "seed=[REDACTED] tail"
+        );
+        let public = scrub("public account 8ce53d0a");
+        assert!(!public.contains(secret));
     }
 
     #[test]

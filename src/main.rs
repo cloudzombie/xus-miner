@@ -3,6 +3,7 @@
 mod blockflow;
 mod diag;
 mod gui;
+mod payout;
 mod pow;
 mod rpc;
 // RandomX exposes a C API. Keep the required unsafe ownership proof isolated
@@ -42,6 +43,9 @@ const DIRECT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const WORK_BATCH: u64 = 256;
 const LOGIN_ID: u64 = 1;
 const KEEPALIVE_ID: u64 = 2;
+/// `payout_txs` request ids stay below share submissions so a payout reply is
+/// never counted as an accepted or rejected share.
+const FIRST_PAYOUT_ID: u64 = 100;
 const FIRST_SUBMIT_ID: u64 = 1_000;
 #[cfg(target_os = "macos")]
 const MACOS_MEMORY_PRESSURE_PATH: &str = "/usr/bin/memory_pressure";
@@ -340,6 +344,9 @@ struct Config {
     reconnect_secs: u64,
     report_secs: u64,
     randomx_light: bool,
+    /// Local key for pool `payout` notices. Absent unless the operator passed
+    /// `--seed-hex` or `--seed-file`. Never serialized and never logged.
+    payout: Option<payout::PayoutSigner>,
 }
 
 impl Default for Config {
@@ -354,6 +361,7 @@ impl Default for Config {
             reconnect_secs: 5,
             report_secs: 10,
             randomx_light: false,
+            payout: None,
         }
     }
 }
@@ -368,6 +376,11 @@ fn usage() -> &'static str {
        --user <label>           Public account/worker label [xus-miner]\n\
        --password <value>       Stratum password [x]\n\
        --password-stdin         Read the Stratum password from standard input\n\
+       --seed-hex <hex>         32-byte payout seed as hex. Signs pool transfers\n\
+                                locally. Visible in the process list; prefer\n\
+                                --seed-file on a shared machine\n\
+       --seed-file <path>       Hex seed file (mode 0600). Signs pool transfers\n\
+                                locally. The seed is never sent or logged\n\
        --workers <n>            Mining threads [1; one ~2.3 GiB dataset is shared]\n\
        --randomx-light          Portable low-memory RandomX recovery (slower)\n\
        --confirm-randomx-memory Confirm required RAM only if the OS scan is unavailable\n\
@@ -375,7 +388,9 @@ fn usage() -> &'static str {
        --report-secs <n>        Hashrate reporting interval [10]\n\
        --version                Print the exact application/release version\n\
        --help                   Show this help\n\n\
-     No wallet seed or private key is used by this program."
+     A payout seed is optional. It stays on this machine and signs the pool\n\
+     transfers for a block this miner finds. Direct solo mining does not need\n\
+     it. The seed is never sent to the pool or written to logs."
 }
 
 fn parse_u64(flag: &str, raw: &str, min: u64, max: u64) -> u64 {
@@ -396,6 +411,7 @@ where
 {
     let mut cfg = Config::default();
     let mut args = args.into_iter();
+    let mut saw_seed = false;
     while let Some(flag) = args.next() {
         let value = |flag: &str, args: &mut I::IntoIter| {
             args.next().unwrap_or_else(|| {
@@ -407,6 +423,37 @@ where
             "--pool" => cfg.pool = value("--pool", &mut args),
             "--user" => cfg.user = value("--user", &mut args),
             "--password" => cfg.password = value("--password", &mut args),
+            "--seed-hex" => {
+                if saw_seed {
+                    eprintln!("error: pass only one of --seed-hex or --seed-file");
+                    process::exit(2);
+                }
+                saw_seed = true;
+                let mut raw = value("--seed-hex", &mut args);
+                cfg.payout = Some(
+                    payout::PayoutSigner::from_hex(&raw).unwrap_or_else(|error| {
+                        eprintln!("error: {error}");
+                        process::exit(2);
+                    }),
+                );
+                payout::wipe_secret_string(&mut raw);
+            }
+            "--seed-file" => {
+                if saw_seed {
+                    eprintln!("error: pass only one of --seed-hex or --seed-file");
+                    process::exit(2);
+                }
+                saw_seed = true;
+                let path = value("--seed-file", &mut args);
+                cfg.payout = Some(
+                    payout::PayoutSigner::from_file(std::path::Path::new(&path)).unwrap_or_else(
+                        |error| {
+                            eprintln!("error: {error}");
+                            process::exit(2);
+                        },
+                    ),
+                );
+            }
             "--workers" => {
                 cfg.workers = parse_u64("--workers", &value("--workers", &mut args), 1, 64)
             }
@@ -937,6 +984,12 @@ impl Connection {
 
 fn write_json(connection: &Connection, value: &Value) -> io::Result<()> {
     let mut payload = value.to_string();
+    if diag::exposes_secret(&payload) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to write a pool message that contains the payout seed",
+        ));
+    }
     payload.push('\n');
     if payload.len() > MAX_LINE_BYTES {
         return Err(io::Error::new(
@@ -983,20 +1036,40 @@ fn install_job_value(
     Ok(())
 }
 
+struct PayoutSession<'a> {
+    signer: Option<&'a payout::PayoutSigner>,
+    login_account: &'a str,
+    signed_fp: &'a mut String,
+    next_payout_id: &'a mut u64,
+    warned_unsigned: &'a mut bool,
+}
+
 fn handle_message(
     state: &State,
     connection: &Connection,
     message: &Value,
     memory_gate: &mut RandomxMemoryGate,
+    payout_session: &mut PayoutSession<'_>,
 ) -> io::Result<()> {
-    if message.get("method").and_then(Value::as_str) == Some("job") {
-        let params = message
-            .get("params")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "job push has no params"))?;
-        return install_job_value(state, params, memory_gate);
+    match message.get("method").and_then(Value::as_str) {
+        Some("job") => {
+            let params = message.get("params").ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "job push has no params")
+            })?;
+            return install_job_value(state, params, memory_gate);
+        }
+        Some("payout") => {
+            handle_payout_notice(state, connection, message, payout_session);
+            return Ok(());
+        }
+        _ => {}
     }
 
     let id = message.get("id").and_then(Value::as_u64);
+    if id.is_some_and(|id| (FIRST_PAYOUT_ID..FIRST_SUBMIT_ID).contains(&id)) {
+        handle_payout_reply(state, message, payout_session);
+        return Ok(());
+    }
     if id == Some(LOGIN_ID) {
         if !message.get("error").is_none_or(Value::is_null) {
             return Err(io::Error::new(
@@ -1028,6 +1101,111 @@ fn handle_message(
         }));
     }
     Ok(())
+}
+
+fn handle_payout_notice(
+    state: &State,
+    connection: &Connection,
+    message: &Value,
+    session: &mut PayoutSession<'_>,
+) {
+    let Some(params) = message.get("params") else {
+        say_payout("pool payout notice has no params");
+        return;
+    };
+    let Some(signer) = session.signer else {
+        let pending = params
+            .get("transfers")
+            .and_then(Value::as_array)
+            .is_some_and(|transfers| !transfers.is_empty())
+            && params.get("satisfied").and_then(Value::as_bool) != Some(true);
+        if pending && !*session.warned_unsigned {
+            *session.warned_unsigned = true;
+            say_payout(
+                "pool asked for payout transfers but this miner has no --seed-hex or --seed-file, so they were not signed",
+            );
+            state.emit(json!({
+                "event": "payout_unsigned",
+                "message": "no local payout seed",
+            }));
+        }
+        return;
+    };
+    match payout::decide_payout(signer, session.login_account, params) {
+        Ok(payout::PayoutAction::Ignore { reason }) => {
+            if reason == "account" {
+                say_payout(
+                    "pool payout notice is for a different account; this miner did not sign it",
+                );
+            }
+        }
+        Ok(payout::PayoutAction::Submit(submission)) => {
+            if *session.signed_fp == submission.fingerprint {
+                return;
+            }
+            let request_id = next_payout_id(session.next_payout_id);
+            let request = json!({
+                "id": request_id,
+                "jsonrpc": "2.0",
+                "method": "payout_txs",
+                "params": {"txs": submission.txs},
+            });
+            if diag::exposes_secret(&request.to_string()) {
+                say_payout("refusing to send a payout request that contains the seed");
+                return;
+            }
+            match write_json(connection, &request) {
+                Ok(()) => {
+                    *session.signed_fp = submission.fingerprint;
+                    say_payout(&format!(
+                        "signed {} payout transfer(s) for {} and sent payout_txs",
+                        submission.transfers, submission.account
+                    ));
+                    state.emit(json!({
+                        "event": "payout_submitted",
+                        "transfers": submission.transfers,
+                        "account": submission.account,
+                    }));
+                }
+                Err(error) => say_payout(&format!("could not send payout_txs: {error}")),
+            }
+        }
+        Err(error) => say_payout(&format!("payout notice was not signed: {error}")),
+    }
+}
+
+fn next_payout_id(next: &mut u64) -> u64 {
+    let id = *next;
+    *next = if id + 1 >= FIRST_SUBMIT_ID {
+        FIRST_PAYOUT_ID
+    } else {
+        id + 1
+    };
+    id
+}
+
+fn handle_payout_reply(state: &State, message: &Value, session: &mut PayoutSession<'_>) {
+    if message.get("error").is_none_or(Value::is_null) {
+        say_payout("pool accepted the signed payout transfers");
+        state.emit(json!({"event": "payout_result", "ok": true}));
+    } else {
+        session.signed_fp.clear();
+        let detail = diag::scrub(&message["error"].to_string());
+        say_payout(&format!(
+            "pool refused the signed payout transfers: {detail}"
+        ));
+        state.emit(json!({
+            "event": "payout_result",
+            "ok": false,
+            "message": detail,
+        }));
+    }
+}
+
+fn say_payout(message: &str) {
+    let clean = diag::scrub(message);
+    eprintln!("payout: {clean}");
+    diag::info(&format!("payout: {clean}"));
 }
 
 fn pool_address(raw: &str) -> &str {
@@ -1761,11 +1939,30 @@ fn run_session(
         }),
     )?;
 
+    let login_account = payout::login_account(&cfg.user);
+    let mut signed_fp = String::new();
+    let mut next_payout_id = FIRST_PAYOUT_ID;
+    let mut warned_unsigned = false;
     let result = (|| {
         let mut reader = BufReader::new(stream);
         loop {
             match read_json_line(&mut reader) {
-                Ok(Some(message)) => handle_message(state, &connection, &message, memory_gate)?,
+                Ok(Some(message)) => {
+                    let mut payout_session = PayoutSession {
+                        signer: cfg.payout.as_ref(),
+                        login_account: &login_account,
+                        signed_fp: &mut signed_fp,
+                        next_payout_id: &mut next_payout_id,
+                        warned_unsigned: &mut warned_unsigned,
+                    };
+                    handle_message(
+                        state,
+                        &connection,
+                        &message,
+                        memory_gate,
+                        &mut payout_session,
+                    )?
+                }
                 Ok(None) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -2163,6 +2360,14 @@ fn run_headless(
         return Err("parent-pipe watchdog requires JSON event output".into());
     }
     randomx_native::configure_runtime_mode(cfg.randomx_light)?;
+    if let Some(signer) = &cfg.payout {
+        signer.protect_logs();
+        let direct = is_direct_rpc(&cfg.pool);
+        diag::info(&format!(
+            "payout signing enabled for implicit account {}; direct-node={}",
+            signer.implicit_account, direct
+        ));
+    }
     let randomx_backend = if cfg.randomx_light {
         "light-recovery"
     } else {
@@ -2281,6 +2486,16 @@ fn main() {
         )
     });
     let mut cfg = parse_args_from(raw);
+    if let Some(signer) = &cfg.payout {
+        signer.protect_logs();
+        match payout::apply_payout_login(&cfg.user, signer) {
+            Ok(user) => cfg.user = user,
+            Err(error) => {
+                eprintln!("error: {}", diag::scrub(&error));
+                process::exit(2);
+            }
+        }
+    }
     if password_stdin {
         let mut password = String::new();
         io::stdin()
@@ -2318,6 +2533,20 @@ mod tests {
 
         let light = parse_args_from(["--randomx-light".to_owned()]);
         assert!(light.randomx_light);
+        assert!(light.payout.is_none());
+    }
+
+    #[test]
+    fn seed_hex_enables_a_signer_whose_debug_form_hides_the_seed() {
+        let seed = "11".repeat(32);
+        let cfg = parse_args_from(["--seed-hex".into(), seed.clone()]);
+        let signer = cfg.payout.as_ref().expect("seed flag installs a signer");
+        assert_eq!(signer.implicit_account, payout::VECTOR_IMPLICIT_ACCOUNT);
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains(&seed));
+        assert!(!rendered.contains("17, 17, 17"));
+        let login = payout::apply_payout_login("xus-miner", signer).unwrap();
+        assert_eq!(login, payout::VECTOR_IMPLICIT_ACCOUNT);
     }
 
     fn valid_job() -> Value {
