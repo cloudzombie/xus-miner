@@ -1,5 +1,7 @@
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -336,4 +338,265 @@ fn external_process_logs_in_hashes_and_submits_a_valid_share() {
     let reconnected_submit = read_submit_for(&mut reader, "reconnected-job");
     assert_valid_submit(&reconnected_submit, "reconnected-job", &reconnected_blob);
     accept_share(&mut stream, &reconnected_submit);
+}
+
+#[test]
+fn seed_flag_errors_do_not_echo_the_seed() {
+    let seed = "11".repeat(32);
+    let conflict = Command::new(env!("CARGO_BIN_EXE_xus-miner"))
+        .args(["--headless", "--seed-hex", &seed, "--seed-file", "also-set"])
+        .output()
+        .expect("spawn miner");
+    assert!(!conflict.status.success());
+    let conflict_err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(conflict_err.contains("only one of --seed-hex or --seed-file"));
+    assert!(!conflict_err.contains(&seed), "{conflict_err}");
+
+    let malformed = "ab".repeat(40);
+    let rejected = Command::new(env!("CARGO_BIN_EXE_xus-miner"))
+        .args(["--headless", "--seed-hex", &malformed])
+        .output()
+        .expect("spawn miner");
+    assert!(!rejected.status.success());
+    let rejected_err = String::from_utf8_lossy(&rejected.stderr);
+    assert!(rejected_err.contains("64 hex characters"));
+    assert!(!rejected_err.contains(&malformed), "{rejected_err}");
+}
+
+#[test]
+fn seed_file_signs_a_payout_notice_without_leaking_the_seed() {
+    let seed_hex = "11".repeat(32);
+    let account = "8ce53d0a623b12aac68d7a18ba9c31af1b11f56352e73959c0b484d06d10dfb7";
+    let directory = std::env::temp_dir().join(format!(
+        "xus-miner-payout-{}-{}",
+        std::process::id(),
+        "protocol"
+    ));
+    let _cleanup = TempDir(directory.clone());
+    fs::create_dir_all(&directory).expect("create seed directory");
+    let seed_path = directory.join("seed");
+    let seed_path_arg = seed_path.to_string_lossy().into_owned();
+    {
+        let mut file = fs::File::create(&seed_path).expect("create seed file");
+        writeln!(file, "{seed_hex}").expect("write seed file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600)).expect("mode 0600");
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock pool");
+    let address = listener.local_addr().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xus-miner"))
+        .args([
+            "--headless",
+            "--json-events",
+            "--pool",
+            &address.to_string(),
+            "--user",
+            account,
+            "--seed-file",
+            &seed_path_arg,
+            "--workers",
+            "1",
+            "--reconnect-secs",
+            "30",
+            "--report-secs",
+            "60",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn miner");
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    let (out_tx, out_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if out_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let (err_tx, err_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if err_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut miner = ChildGuard(child);
+
+    let (mut stream, _) = listener.accept().expect("accept miner");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let login = read_message(&mut reader);
+    let login_line = login.to_string();
+    assert_eq!(login["method"], json!("login"));
+    assert_eq!(login["params"]["login"], json!(account));
+    assert!(!login_line.contains(&seed_hex), "{login_line}");
+
+    let blob = vec![0u8; 64];
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "error": Value::Null,
+            "result": {
+                "id": "session",
+                "job": job("payout-job", 2, &blob),
+                "status": "OK"
+            }
+        })
+    )
+    .unwrap();
+    let notice = json!({
+        "jsonrpc": "2.0",
+        "method": "payout",
+        "params": {
+            "account": account,
+            "satisfied": false,
+            "rewardGrains": "1250000000",
+            "transfers": [{"to": "bob.sov", "amount": "42"}],
+            "nextNonce": 7,
+            "signingDomain": Value::Null
+        }
+    });
+    writeln!(stream, "{notice}").unwrap();
+    stream.flush().unwrap();
+
+    let payout = read_method(&mut reader, "payout_txs");
+    let payout_line = payout.to_string();
+    assert!(!payout_line.contains(&seed_hex), "{payout_line}");
+    assert_eq!(payout["params"]["txs"].as_array().unwrap().len(), 1);
+    let tx = &payout["params"]["txs"][0];
+    assert_eq!(tx["transaction"]["signer"], json!(account));
+    assert_eq!(tx["transaction"]["nonce"], json!(7));
+    assert_eq!(tx["transaction"]["action"]["type"], json!("transfer"));
+    assert_eq!(tx["transaction"]["action"]["to"], json!("bob.sov"));
+    assert_eq!(tx["transaction"]["action"]["amount"], json!("42"));
+
+    let signing = SigningKey::from_bytes(&[0x11; 32]);
+    let public = signing.verifying_key().to_bytes();
+    assert_eq!(
+        tx["transaction"]["public_key"],
+        json!(format!("0x{}", hex::encode(public)))
+    );
+    let signature =
+        hex::decode(tx["signature"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+    let preimage = pool_transfer_preimage(account, &public, 7, "bob.sov", 42);
+    let parsed = Signature::from_slice(&signature).unwrap();
+    VerifyingKey::from_bytes(&public)
+        .unwrap()
+        .verify_strict(&preimage, &parsed)
+        .expect("payout signature must match the pool preimage");
+
+    writeln!(stream, "{notice}").unwrap();
+    stream.flush().unwrap();
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.contains("payout_txs") {
+                    panic!("duplicate payout notice was signed again: {line}");
+                }
+                assert!(!line.contains(&seed_hex), "{line}");
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(error) => panic!("read after duplicate notice: {error}"),
+        }
+    }
+
+    drop(reader);
+    drop(stream);
+    let _ = miner.0.kill();
+    let _ = miner.0.wait();
+    let mut logs = String::new();
+    let log_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < log_deadline {
+        let mut progressed = false;
+        if let Ok(line) = out_rx.try_recv() {
+            logs.push_str(&line);
+            logs.push('\n');
+            progressed = true;
+        }
+        if let Ok(line) = err_rx.try_recv() {
+            logs.push_str(&line);
+            logs.push('\n');
+            progressed = true;
+        }
+        if !progressed {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(
+        logs.contains("payout_submitted") || logs.contains("signed 1 payout"),
+        "miner did not report the signature: {logs}"
+    );
+    assert!(!logs.contains(&seed_hex), "{logs}");
+}
+
+fn read_method(reader: &mut BufReader<std::net::TcpStream>, method: &str) -> Value {
+    for _ in 0..10_000 {
+        let message = read_message(reader);
+        if message["method"] == json!(method) {
+            return message;
+        }
+    }
+    panic!("miner never sent {method}");
+}
+
+/// The Borsh transfer body the pool verifies, built independently of the miner.
+fn pool_transfer_preimage(
+    signer: &str,
+    public: &[u8; 32],
+    nonce: u64,
+    to: &str,
+    amount: u128,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let put = |out: &mut Vec<u8>, value: &str| {
+        let bytes = value.as_bytes();
+        out.extend_from_slice(&(u32::try_from(bytes.len()).unwrap()).to_le_bytes());
+        out.extend_from_slice(bytes);
+    };
+    put(&mut out, signer);
+    out.push(0);
+    out.extend_from_slice(public);
+    out.extend_from_slice(&nonce.to_le_bytes());
+    out.push(0);
+    put(&mut out, to);
+    out.extend_from_slice(&amount.to_le_bytes());
+    out
+}
+
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }

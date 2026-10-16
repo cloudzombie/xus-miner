@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Pool mode can sign non-custodial payouts locally. `--seed-hex` or
+  `--seed-file` signs the transfers in a Stratum `payout` notice and submits
+  them as `payout_txs` before a found block is sealed. The seed is not sent
+  on the socket and is scrubbed from diagnostic logs. This follows the pool
+  contract in [SOV PR #55](https://github.com/cloudzombie/sov/pull/55).
+
 ## 0.1.8
 
 - Update the locked GUI dependency `webbrowser` from 1.2.1 to 1.2.2 to fix

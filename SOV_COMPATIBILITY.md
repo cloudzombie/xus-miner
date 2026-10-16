@@ -1,7 +1,8 @@
 # SOV compatibility requirements
 
 XUS Miner is an external network client. It requires no writable SOV checkout,
-node database, wallet file, seed phrase, or private key.
+node database, node wallet file, or node seed phrase. An optional miner-local
+payout seed signs pool transfers and is never sent to the node or the pool.
 
 ## Compile-time boundary
 
@@ -123,9 +124,35 @@ independent of this external miner.
 ## Stratum contract
 
 Pool mode uses newline-delimited JSON over TCP with `login`, `job`, `submit`,
-and `keepalived` messages. A job must provide a full 32-byte share target,
-eight-byte trailing nonce location, supported algorithm, height, and RandomX
-seed when applicable.
+`keepalived`, and, on a non-custodial pool, `payout` / `payout_txs`. A job
+must provide a full 32-byte share target, eight-byte trailing nonce location,
+supported algorithm, height, and RandomX seed when applicable.
+
+A pool that pays the PPLNS window pushes a notification:
+
+```json
+{"jsonrpc":"2.0","method":"payout","params":{
+  "account":"<login account>",
+  "satisfied":false,
+  "transfers":[{"to":"<account>","amount":"<grains>"}],
+  "nextNonce":0,
+  "signingDomain":null
+}}
+```
+
+`signingDomain`, when present, is `{"chainId":"<name>","genesis":"<64 hex>"}`.
+`satisfied: true` or an empty `transfers` array means there is nothing to sign.
+The miner answers with a request whose transactions are the Borsh transfer
+body (signer, Ed25519 key, nonce, recipient, amount), signed under the domain
+when one was supplied:
+
+```json
+{"id":100,"jsonrpc":"2.0","method":"payout_txs","params":{"txs":[]}}
+```
+
+The pool binds those transactions to the session login. The seed that produced
+the signatures is not part of either message. This is the contract in
+[SOV PR #55](https://github.com/cloudzombie/sov/pull/55).
 
 A variable-difficulty share target is not a consensus block target. Block ETA
 and round probability remain unavailable unless the bridge separately supplies
